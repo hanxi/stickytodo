@@ -1,0 +1,22 @@
+# 仓库根 .gitignore
+# 子目录还有各自的 .gitignore（如 server/.gitignore），此处只处理跨模块 / 工具类产物。
+
+# --- macOS / 编辑器 / IDE ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Xcode 用户级派生 / 用户数据 ---
+# 工程目录下的用户数据（xcuserdata）是 per-user 的，不应入库。
+# 注意：.gitignore 只对"尚未被追踪"的文件生效；如果历史上已 git add 过 xcuserdata，
+# 需额外执行 `git rm -r --cached path/to/xcuserdata` 把它从索引里移除一次。
+**/xcuserdata/
+# Xcode 默认 DerivedData 位于 ~/Library/Developer/Xcode/DerivedData/，不在仓库内；
+# 但若有人通过 File > Project Settings > Derived Data 改为 "Project Location"，
+# 就会在工程目录旁生成 DerivedData/ 目录，预防性忽略。
+DerivedData/
+
+.aone_copilot/
+data/
+dist/

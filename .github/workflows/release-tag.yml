@@ -1,0 +1,26 @@
+# Automatic production release on pushing a v* tag (e.g. v1.2.3).
+#
+# Delegates the entire build + publish pipeline to the reusable workflow
+# .github/workflows/_build-all.yml. The tag itself is the release identity;
+# the same tag name is used for artifact filenames.
+name: release-tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    uses: ./.github/workflows/_build-all.yml
+    with:
+      # GITHUB_REF_NAME is the tag name (e.g. "v1.2.3") for tag pushes.
+      version: ${{ github.ref_name }}
+      tag_name: ${{ github.ref_name }}
+      prerelease: false
+      docker_image: docker.io/hanxi/stickytodo
+      # A v* tag is a "stable" release by convention, so also update :latest.
+      tag_latest: true
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

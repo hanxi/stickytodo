@@ -1,0 +1,98 @@
+# Manual branch pre-release.
+#
+# Produces a "branch-<name>" pre-release containing the exact same artifact
+# set as release-tag.yml, so you can hand someone a DMG / binary built from
+# an arbitrary branch (for QA, hotfix rehearsals, demos, etc.).
+#
+# Because the release's identity is a tag, re-triggering this workflow with
+# the same branch must first delete the previous release + tag — otherwise
+# softprops/action-gh-release keeps appending to the old one.
+name: release-branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (defaults to the branch this workflow was dispatched from)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write   # needed for gh release delete / git tag push
+
+jobs:
+  # -----------------------------------------------------------------------
+  # 1. Delete the previous branch-<name> release + tag if they exist, so
+  #    the next job can create a fresh one with the same name.
+  # -----------------------------------------------------------------------
+  cleanup-old-release:
+    name: Delete previous branch-<name> release
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.resolve.outputs.branch }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to manipulate tags
+
+      - name: Resolve branch & tag names
+        id: resolve
+        env:
+          INPUT_BRANCH: ${{ inputs.branch }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Fall back to the dispatched ref when no explicit branch given.
+          branch="${INPUT_BRANCH:-$REF_NAME}"
+          # Sanitise slashes — git tags can't contain them.
+          tag="branch-${branch//\//-}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Will (re)build $branch → release tag $tag"
+
+      - name: Delete previous release (if any)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # Case 1: modern gh (≥ 2.28) — one-shot delete of release + tag.
+          # '|| true' makes the "not-found" first-run case a no-op.
+          if gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null; then
+            echo "Deleted release $TAG (incl. tag) via gh --cleanup-tag."
+            exit 0
+          fi
+
+          # Case 2: release may still exist but older gh lacks --cleanup-tag.
+          # Try deleting release first, then delete the underlying tag by hand.
+          gh release delete "$TAG" --yes 2>/dev/null && \
+            echo "Deleted release $TAG via gh (no cleanup-tag)." || \
+            echo "No existing release named $TAG (or delete failed harmlessly)."
+
+          # Case 3: no release existed but a stale tag might still be pushed.
+          # Ensure local index knows about remote tags before trying to delete.
+          git fetch --tags --force origin 2>/dev/null || true
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git push --delete origin "$TAG" 2>/dev/null && \
+              echo "Deleted remote tag $TAG." || \
+              echo "Could not delete remote tag $TAG (maybe already gone)."
+          else
+            echo "No local ref for tag $TAG — nothing more to clean up."
+          fi
+
+  # -----------------------------------------------------------------------
+  # 2. Run the reusable build pipeline on the requested branch.
+  # -----------------------------------------------------------------------
+  build-and-publish:
+    needs: cleanup-old-release
+    uses: ./.github/workflows/_build-all.yml
+    with:
+      version: ${{ needs.cleanup-old-release.outputs.tag }}
+      tag_name: ${{ needs.cleanup-old-release.outputs.tag }}
+      prerelease: true
+      docker_image: docker.io/hanxi/stickytodo
+      # Never overwrite :latest from a branch build.
+      tag_latest: false
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

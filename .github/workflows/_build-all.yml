@@ -1,0 +1,287 @@
+# Reusable workflow that builds every stickytodo release artifact and, when
+# requested, publishes them as a GitHub Release.
+#
+# Callers: .github/workflows/release-tag.yml (for v* tags) and
+# .github/workflows/release-branch.yml (for manual branch pre-releases).
+#
+# Jobs (fan-out):
+#   build-web      → web/dist artifact     (ubuntu-latest)
+#   build-server   → 7 cross-compiled bins (ubuntu-latest, needs build-web)
+#   build-mac-dmg  → universal .dmg        (macos-14,     needs build-web)
+#   build-docker   → multi-arch image push (ubuntu-latest, needs build-web)
+#   publish-release → gh release upload    (ubuntu-latest, needs all above)
+#
+# Inputs let the caller pick the artifact version string, the git tag the
+# release will be attached to, and whether the release is a pre-release.
+name: build-all
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Semantic version baked into artifact filenames (e.g. v1.2.3 or branch-main)'
+        required: true
+        type: string
+      tag_name:
+        description: 'Git tag the GitHub Release will be bound to'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark the release as pre-release'
+        required: false
+        type: boolean
+        default: false
+      docker_image:
+        description: 'Docker image name (e.g. docker.io/hanxi/stickytodo). Empty = skip docker push.'
+        required: false
+        type: string
+        default: 'docker.io/hanxi/stickytodo'
+      tag_latest:
+        description: 'Also push :latest tag to the Docker registry'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: write   # required for softprops/action-gh-release to upload assets
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. Build the web SPA once. Cached artifact is consumed by server + mac.
+  # -------------------------------------------------------------------------
+  build-web:
+    name: Build web (SPA → server/internal/webui/dist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/web/package-lock.json
+
+      - name: Build web
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash scripts/package-web.sh
+
+      # The embed target lives at server/internal/webui/dist/ — upload it so
+      # the server + mac jobs can download and embed without re-building.
+      - name: Upload web dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: server/internal/webui/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 2. Cross-compile the 7 server binaries via scripts/package-server.sh.
+  # -------------------------------------------------------------------------
+  build-server:
+    name: Build server binaries (7 platforms)
+    runs-on: ubuntu-latest
+    needs: build-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Download web dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/internal/webui/dist/
+
+      - name: Package server binaries
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash scripts/package-server.sh
+
+      - name: Upload server binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-bins
+          path: |
+            dist/server/stickytodo-server-*
+            dist/server/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 3. Mac universal DMG. Must run on macOS for xcodebuild + codesign.
+  # -------------------------------------------------------------------------
+  build-mac-dmg:
+    name: Build macOS universal DMG
+    runs-on: macos-14
+    needs: build-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download web dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/internal/webui/dist/
+
+      # create-dmg gives us a prettier Applications-symlink DMG. If brew fails
+      # the script transparently falls back to hdiutil.
+      - name: Install create-dmg
+        run: brew install create-dmg || true
+
+      - name: Package mac client
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash scripts/package-mac-client.sh
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: |
+            dist/mac-client/stickytodo-*-macos-universal.dmg
+            dist/mac-client/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 4. Detect DOCKERHUB_USERNAME up-front in a tiny dedicated job so we can
+  #    branch on it using `if: needs.detect-docker-creds.outputs.have == ...`.
+  #    GitHub Actions does NOT evaluate `secrets.*` inside a job-level `if:`,
+  #    and we want the expensive QEMU-based multi-arch build to be skipped
+  #    entirely (not run with push=false) when no credentials are available —
+  #    otherwise every branch-dispatch from a fork wastes ~10 min of CI time
+  #    emulating armv7 for an image that is never saved anywhere.
+  # -------------------------------------------------------------------------
+  detect-docker-creds:
+    name: Detect Docker Hub credentials
+    runs-on: ubuntu-latest
+    if: ${{ inputs.docker_image != '' }}
+    outputs:
+      have: ${{ steps.check.outputs.have }}
+    steps:
+      - name: Check DOCKERHUB_USERNAME
+        id: check
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub credentials available → build-docker will run."
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "DOCKERHUB_USERNAME absent → build-docker will be SKIPPED (not built, not pushed)."
+          fi
+
+  # -------------------------------------------------------------------------
+  # 5. Multi-arch Docker image — QEMU + buildx handle amd64/arm64/armv7.
+  #    Only runs when credentials exist (see detect-docker-creds).
+  # -------------------------------------------------------------------------
+  build-docker:
+    name: Build & push multi-arch Docker image
+    runs-on: ubuntu-latest
+    needs: [build-web, detect-docker-creds]
+    if: needs.detect-docker-creds.outputs.have == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download web dist
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/internal/webui/dist/
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker login (Docker Hub)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Compose tag list: always ${image}:${version}, optionally :latest.
+      - name: Compute tags
+        id: tags
+        run: |
+          {
+            echo "tags<<EOF"
+            echo "${{ inputs.docker_image }}:${{ inputs.version }}"
+            if [ "${{ inputs.tag_latest }}" = "true" ]; then
+              echo "${{ inputs.docker_image }}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VERSION=${{ inputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # -------------------------------------------------------------------------
+  # 5. Publish a GitHub Release with every artifact above attached.
+  # -------------------------------------------------------------------------
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    # build-docker is listed as a dependency only for ordering: when it's
+    # skipped (docker_image == '') the `always()`-based condition below
+    # still lets this job run. `success()` on server + mac remains required.
+    needs: [build-server, build-mac-dmg, build-docker]
+    if: |
+      always() &&
+      needs.build-server.result == 'success' &&
+      needs.build-mac-dmg.result == 'success' &&
+      (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download server binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: server-bins
+          path: dist/server/
+
+      - name: Download mac DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-dmg
+          path: dist/mac-client/
+
+      - name: List artifacts (sanity check)
+        run: |
+          echo "=== server/ ==="
+          ls -la dist/server/ || true
+          echo "=== mac-client/ ==="
+          ls -la dist/mac-client/ || true
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.tag_name }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/server/stickytodo-server-*
+            dist/server/SHA256SUMS
+            dist/mac-client/stickytodo-*-macos-universal.dmg
+            dist/mac-client/SHA256SUMS

@@ -1,0 +1,47 @@
+services:
+  todo-server:
+    # Build context = repo root (needed for COPY client/web/).
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+    image: stickytodo:${VERSION:-dev}
+    container_name: stickytodo
+    restart: unless-stopped
+    ports:
+      - "${TODO_HOST_PORT:-8080}:8080"
+    environment:
+      # Required: fail fast if missing.
+      TODO_USERNAME: ${TODO_USERNAME:?TODO_USERNAME is required}
+      TODO_PASSWORD: ${TODO_PASSWORD:?TODO_PASSWORD is required}
+      # NOTE: The JWT signing secret is NOT an env var anymore. On first boot the
+      # server creates a 32-byte random hex and stores it in SQLite's `app_secrets`
+      # table (see internal/repository/secret_repo.go). It persists across restarts
+      # because /data is bind-mounted to ./data on the host.
+      # Optional runtime knobs. Variable names must match internal/config exactly.
+      TODO_PORT: "8080"
+      TODO_DATA_DIR: "/data"
+      TODO_TOKEN_TTL: ${TODO_TOKEN_TTL:-24h}
+      TODO_VERBOSE: ${TODO_VERBOSE:-false}
+      TODO_GIN_MODE: ${TODO_GIN_MODE:-release}
+      TODO_CORS_ORIGINS: ${TODO_CORS_ORIGINS:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # NOTE: the distroless runtime runs as nonroot (uid=65532). The host
+      # ./data directory must therefore be writable by uid=65532, OR you can
+      # pre-create it with `mkdir -p data && chown -R 65532:65532 data`.
+      # Leaving it owned by the current user is fine on Docker Desktop for
+      # macOS/Windows because the file sharing layer translates ownership;
+      # on native Linux hosts you must set the uid explicitly.
+      - ./data:/data
+    # Inline healthcheck uses the exec form (no shell needed), invoking the
+    # binary's built-in -healthcheck subcommand. This works on distroless
+    # exactly like HEALTHCHECK in the Dockerfile; declared here as well so
+    # `docker compose ps` shows health status during local dev.
+    healthcheck:
+      test: ["CMD", "/app/todo-server", "-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

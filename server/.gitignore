@@ -1,0 +1,36 @@
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/todo-server
+/bin/
+/out/
+*.exe
+
+# Runtime data (SQLite + WAL/SHM)
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Web UI build artifacts synced by scripts/package-web.sh.
+# Keep the directory (and its .gitkeep) so go:embed always has a target,
+# but ignore every generated asset produced by Vite.
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+
+# Go tooling
+/vendor/
+coverage.out
+*.test
+*.prof
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
