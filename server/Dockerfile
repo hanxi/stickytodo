@@ -97,14 +97,4 @@ VOLUME ["/data"]
 
 EXPOSE 8080
 
-# Healthcheck calls the binary's own `-healthcheck` subcommand (implemented in
-# cmd/todo-server/main.go:runHealthcheck). This works on distroless because we
-# don't need a shell/wget/curl — the static binary is self-sufficient.
-#
-# interval=30s / timeout=3s / start-period=5s / retries=3 matches the defaults
-# we used previously with wget, so Docker's container health behavior is
-# unchanged from the caller's perspective.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/todo-server", "-healthcheck"]
-
 ENTRYPOINT ["/app/todo-server"]

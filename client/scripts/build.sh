@@ -18,7 +18,7 @@ set -euo pipefail
 # 切到仓库根（脚本自身位于 client/scripts）
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-PROJECT_DIR="${REPO_ROOT}/client/stickytodo"
+PROJECT_DIR="${REPO_ROOT}/client/mac"
 PROJECT_FILE="${PROJECT_DIR}/stickytodo.xcodeproj"
 SCHEME="stickytodo"
 CONFIG="${CONFIG:-Debug}"

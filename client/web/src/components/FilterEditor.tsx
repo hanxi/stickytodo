@@ -1,30 +1,38 @@
 import { useState } from 'react';
 import Modal from './Modal';
-import { useStickyStore } from '../store/stickyStore';
 import type { TodoFilter } from '../types/sticky';
 import { defaultFilter } from '../types/sticky';
 import { toISOFromLocalInput, toLocalInputFromISO } from '../lib/format';
 
 interface Props {
-  noteId: string;
+  /** 打开时的初始筛选条件（通常来自所属便签的 sticky.filter）。 */
+  initialFilter: TodoFilter;
+  /** 取消 / 关闭时调用，不保存。 */
   onClose: () => void;
+  /**
+   * 保存时调用，参数是最终生效的 filter（已自动把 page 重置为 1）。
+   * 调用方负责把这个 filter 写回服务端（通过 upsertSticky），本组件不关心持久化介质。
+   */
+  onSave: (filter: TodoFilter) => void;
 }
 
-export default function FilterEditor({ noteId, onClose }: Props) {
-  const note = useStickyStore((s) => s.stickies.find((n) => n.id === noteId));
-  const replaceFilter = useStickyStore((s) => s.replaceFilter);
-
-  const [draft, setDraft] = useState<TodoFilter>(
-    note ? { ...note.filter } : { ...defaultFilter },
-  );
+/**
+ * 便签筛选条件编辑器（Modal）。
+ *
+ * 与旧实现的区别：不再直接读写 stickyStore。所有写入由父组件通过 onSave 回调
+ * 委托给 upsertSticky mutation，保持"一个便签的所有写操作都经 mutation 走云端"
+ * 这条统一路径。
+ */
+export default function FilterEditor({ initialFilter, onClose, onSave }: Props) {
+  const [draft, setDraft] = useState<TodoFilter>(() => ({ ...initialFilter }));
 
   function update<K extends keyof TodoFilter>(key: K, value: TodoFilter[K]) {
     setDraft((d) => ({ ...d, [key]: value }));
   }
 
   function save() {
-    replaceFilter(noteId, { ...draft, page: 1 });
-    onClose();
+    // 任何筛选条件变更都把分页复位到第 1 页，避免 page 数超过新结果总页数导致空列表
+    onSave({ ...draft, page: 1 });
   }
 
   return (

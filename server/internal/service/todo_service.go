@@ -45,20 +45,28 @@ type ActionContext struct {
 
 // TodoService 业务层：协调 TodoRepo 与 AuditService。
 type TodoService struct {
-	repo  *repository.TodoRepo
-	audit *AuditService
-	now   func() time.Time
+	repo        *repository.TodoRepo
+	audit       *AuditService
+	broadcaster EventBroadcaster
+	now         func() time.Time
 }
 
 // NewTodoService 构造 TodoService。repo 与 audit 均不允许为 nil。
-func NewTodoService(repo *repository.TodoRepo, audit *AuditService) (*TodoService, error) {
+// broadcaster 可为 nil：此时内部会替换为 nopBroadcaster，等价于"不广播"
+// （用于单测 / 未启用 WS 的场景）。
+func NewTodoService(repo *repository.TodoRepo, audit *AuditService, broadcaster EventBroadcaster) (*TodoService, error) {
 	if repo == nil {
 		return nil, errors.New("todo-service: repo must not be nil")
 	}
 	if audit == nil {
 		return nil, errors.New("todo-service: audit must not be nil")
 	}
-	return &TodoService{repo: repo, audit: audit, now: time.Now}, nil
+	return &TodoService{
+		repo:        repo,
+		audit:       audit,
+		broadcaster: resolveBroadcaster(broadcaster),
+		now:         time.Now,
+	}, nil
 }
 
 // CreateInput 新建 TODO 的入参。仅 Title 必填。
@@ -104,6 +112,8 @@ func (s *TodoService) Create(ctx context.Context, in CreateInput, ac ActionConte
 	s.writeAudit(ctx, "create", ac, &t.ID, map[string]interface{}{
 		"after": todoSnapshot(t),
 	})
+	// 成功后广播事件：让所有 WS 订阅方（Web / macOS 其他客户端）即时感知新增
+	s.broadcaster.BroadcastTodoCreated(t)
 	return t, nil
 }
 
@@ -212,6 +222,7 @@ func (s *TodoService) Update(ctx context.Context, id uint, in UpdateInput, ac Ac
 	s.writeAudit(ctx, "update", ac, &id, map[string]interface{}{
 		"changed": changed,
 	})
+	s.broadcaster.BroadcastTodoUpdated(after)
 	return after, nil
 }
 
@@ -232,6 +243,8 @@ func (s *TodoService) Complete(ctx context.Context, id uint, ac ActionContext) (
 		"before": map[string]interface{}{"status": before.Status, "completed_at": before.CompletedAt},
 		"after":  map[string]interface{}{"status": after.Status, "completed_at": after.CompletedAt},
 	})
+	// Complete 语义上是一次状态变更，属于 updated 范畴，广播 todo.updated
+	s.broadcaster.BroadcastTodoUpdated(after)
 	return after, nil
 }
 
@@ -252,6 +265,7 @@ func (s *TodoService) Reopen(ctx context.Context, id uint, ac ActionContext) (*m
 		"before": map[string]interface{}{"status": before.Status, "completed_at": before.CompletedAt},
 		"after":  map[string]interface{}{"status": after.Status, "completed_at": after.CompletedAt},
 	})
+	s.broadcaster.BroadcastTodoUpdated(after)
 	return after, nil
 }
 
@@ -267,6 +281,8 @@ func (s *TodoService) Delete(ctx context.Context, id uint, ac ActionContext) err
 	s.writeAudit(ctx, "delete", ac, &id, map[string]interface{}{
 		"before": todoSnapshot(before),
 	})
+	// 删除事件 payload 只携带主键，客户端据此从本地 cache 移除对应项
+	s.broadcaster.BroadcastTodoDeleted(id)
 	return nil
 }
 
@@ -279,6 +295,12 @@ func (s *TodoService) Restore(ctx context.Context, id uint, ac ActionContext) (*
 	s.writeAudit(ctx, "restore", ac, &id, map[string]interface{}{
 		"after": todoSnapshot(after),
 	})
+	// Restore 按同步协议（implementation_plan.md）归入 todo.updated 事件：
+	// 广播 updated 会让订阅方基于 queryKey invalidate 触发重新 list，
+	// 此时被恢复的 todo 会重新出现在默认列表视图里。不用 created 语义是
+	// 为了让客户端事件处理保持"恢复走同一条 updated 通道"的简洁性，
+	// 同时严格对齐 REST → WS 事件的既定映射，避免客户端再分支处理。
+	s.broadcaster.BroadcastTodoUpdated(after)
 	return after, nil
 }
 

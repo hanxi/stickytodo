@@ -31,6 +31,28 @@ struct SettingsView: View {
     @State private var pingResult: PingResult?
 
     var body: some View {
+        TabView {
+            generalTab
+                .tabItem { Label("设置", systemImage: "gearshape") }
+
+            historyTab
+                .tabItem { Label("历史", systemImage: "clock.arrow.circlepath") }
+
+            aboutTab
+                .tabItem { Label("关于", systemImage: "info.circle") }
+        }
+        .frame(width: 520, height: 420)
+        .onAppear {
+            urlDraft = appState.serverBaseURL
+            if let name = appState.username { usernameDraft = name }
+        }
+    }
+
+    // MARK: - Tabs
+
+    /// 「设置」Tab：服务器 Base URL + 账号登录/登出。
+    @ViewBuilder
+    private var generalTab: some View {
         Form {
             Section("服务器") {
                 TextField("Base URL", text: $urlDraft, prompt: Text("例如 http://127.0.0.1:8080"))
@@ -95,18 +117,47 @@ struct SettingsView: View {
                     unauthenticatedBlock
                 }
             }
+        }
+        .formStyle(.grouped)
+        .padding()
+    }
 
+    /// 「历史」Tab：已登录时嵌入 HistoryView(global)；未登录时显示提示。
+    @ViewBuilder
+    private var historyTab: some View {
+        if appState.isAuthenticated {
+            HistoryView(
+                mode: .global,
+                apiClient: appState.apiClient,
+                embedded: true
+            )
+        } else {
+            VStack(spacing: 10) {
+                Spacer()
+                Image(systemName: "lock")
+                    .imageScale(.large)
+                    .foregroundStyle(.secondary)
+                Text("请先在「设置」Tab 登录后查看历史")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding()
+        }
+    }
+
+    /// 「关于」Tab：展示产品信息、版本号、链接、版权。
+    @ViewBuilder
+    private var aboutTab: some View {
+        Form {
             Section("关于") {
                 aboutBlock
             }
         }
         .formStyle(.grouped)
         .padding()
-        .frame(minWidth: 460, minHeight: 420)
-        .onAppear {
-            urlDraft = appState.serverBaseURL
-            if let name = appState.username { usernameDraft = name }
-        }
     }
 
     // MARK: - Authenticated block

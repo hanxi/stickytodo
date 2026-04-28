@@ -74,6 +74,36 @@ struct Endpoints {
         ])
     }
 
+    // MARK: Sticky Notes
+
+    /// `GET /api/sticky-notes`（列表）。
+    ///
+    /// 后端返回 `{"items": [...]}`，由 APIClient 解码为 `[StickyNoteDTO]` 后再
+    /// 映射为视图层 `[StickyNote]`。
+    static func stickyNotes(base: String) throws -> URL {
+        try make(base: base, path: "/api/sticky-notes")
+    }
+
+    /// `GET|PUT|DELETE /api/sticky-notes/:id`。
+    ///
+    /// 同一条 URL 承载 3 种方法：
+    ///   - GET 取单条（本客户端暂未用到，但保留入口便于未来主动刷新）
+    ///   - PUT 幂等 upsert（handler 端会兼容 create / update 两种语义）
+    ///   - DELETE 软删（后端返回 {"id":..., "deleted":true}）
+    ///
+    /// 参数：
+    ///   - id：客户端生成的 sticky id；必须是非空字符串。URL-path 段内
+    ///     特殊字符（如空格、`#`、`?`）会破坏路径解析，调用前通过
+    ///     `addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)`
+    ///     做百分号编码；编码失败时降级为原串，让后端用 400 拒绝错误输入，
+    ///     而不是在客户端静默抛错掩盖 bug。
+    static func stickyNote(base: String, id: String) throws -> URL {
+        let encoded = id.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? id
+        return try make(base: base, path: "/api/sticky-notes/\(encoded)")
+    }
+
     // MARK: Audit & Tags
 
     /// `/api/audit-logs` 全局审计列表。

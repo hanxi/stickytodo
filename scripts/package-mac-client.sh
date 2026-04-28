@@ -39,7 +39,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PROJECT_DIR="$REPO_ROOT/client/stickytodo"
+PROJECT_DIR="$REPO_ROOT/client/mac"
 PROJECT_FILE="$PROJECT_DIR/stickytodo.xcodeproj"
 SCHEME="stickytodo"
 OUT_DIR="$REPO_ROOT/dist/mac-client"

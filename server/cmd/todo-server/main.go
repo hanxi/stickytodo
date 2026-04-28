@@ -1,10 +1,11 @@
 // Package main 是 todo-server 的入口：加载配置 → 打开 DB → 装配 services/handlers → 启动 HTTP。
 //
-// 二进制支持两种运行模式：
+// 二进制支持以下运行模式 / 参数：
 //  1. 默认（无参数）：作为 HTTP server 启动。
-//  2. `-healthcheck`：作为单次健康探针运行——向本机 /health 发 GET 请求，2xx 退出 0，
-//     其他情况退出 1。用于 distroless 运行时的 Docker HEALTHCHECK（distroless 没有
-//     shell 或 wget/curl，只能调用静态二进制自身）。
+//  2. `-version`：打印由 -ldflags 注入的 main.version 并退出。
+//  3. `-port` / `-username` / `-password`：分别覆盖环境变量 TODO_PORT / TODO_USERNAME /
+//     TODO_PASSWORD；flag 非空时优先级高于环境变量，留空则完全回退到环境变量（或默认值）。
+//     覆盖通过 os.Setenv 注入，后续 config.Load 统一做校验，避免校验规则漂移。
 package main
 
 import (
@@ -28,19 +29,22 @@ import (
 	"github.com/hanxi/todo-server/internal/repository"
 	"github.com/hanxi/todo-server/internal/router"
 	"github.com/hanxi/todo-server/internal/service"
+	"github.com/hanxi/todo-server/internal/ws"
 )
 
 // version 可在编译时通过 -ldflags "-X main.version=xxx" 注入。
 var version = "dev"
 
 func main() {
-	// 先解析 flag —— healthcheck 模式不会进入正常的 server 启动流程。
-	// 使用独立的 FlagSet 以便在 healthcheck 模式下 usage 输出清晰。
+	// 使用独立的 FlagSet 以便 -help 输出清晰、便于测试。
 	fs := flag.NewFlagSet("todo-server", flag.ExitOnError)
-	healthcheckMode := fs.Bool("healthcheck", false,
-		"Probe http://127.0.0.1:${TODO_PORT}/health and exit 0 on 2xx, 1 otherwise. "+
-			"Used by Docker HEALTHCHECK in distroless runtimes.")
 	showVersion := fs.Bool("version", false, "Print version and exit.")
+	// 下述三个 flag 与对应的 TODO_* 环境变量等价；传入非空值时覆盖环境变量。
+	// 默认值保留空串以便区分"用户未指定"和"用户显式指定空串"——后者会被 trim 掉，
+	// 和未指定的效果一致，均走 config.Load 的环境变量/默认值逻辑。
+	portFlag := fs.String("port", "", "Override TODO_PORT (listening port, 1-65535).")
+	usernameFlag := fs.String("username", "", "Override TODO_USERNAME (single account username).")
+	passwordFlag := fs.String("password", "", "Override TODO_PASSWORD (single account password).")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		// flag.ExitOnError 已自动处理，这里不会走到
 		os.Exit(2)
@@ -51,9 +55,12 @@ func main() {
 		return
 	}
 
-	if *healthcheckMode {
-		os.Exit(runHealthcheck())
-	}
+	// CLI flag 优先级高于环境变量：非空的 flag 会覆盖同名 TODO_* 环境变量，
+	// 再交给 config.Load 统一走校验逻辑（端口范围、必填项、SafeString 打印等），
+	// 避免校验规则在 main.go 和 config.go 两处重复。
+	applyFlagOverride("TODO_PORT", *portFlag)
+	applyFlagOverride("TODO_USERNAME", *usernameFlag)
+	applyFlagOverride("TODO_PASSWORD", *passwordFlag)
 
 	logger := log.New(os.Stdout, "[todo-server] ", log.LstdFlags|log.Lmsgprefix)
 
@@ -82,6 +89,15 @@ func main() {
 	}
 	logger.Printf("jwt secret loaded (%d chars) from app_secrets table", len(jwtSecret))
 
+	// 构造 WebSocket Hub 与 broadcaster：
+	//   - Hub 维护所有已鉴权客户端连接，提供 Broadcast 扇出
+	//   - HubBroadcaster 实现 service.EventBroadcaster 语义接口，把
+	//     TodoService/StickyService 的业务事件翻译成 WS 事件帧
+	// Hub 必须先于 service 构造，才能作为依赖注入；顺序：Hub → services → router。
+	hub := ws.NewHub(logger)
+	go hub.Run() // 当前 Run() 是 no-op，保留 go 形式预留未来中心化派发扩展点
+	broadcaster := ws.NewHubBroadcaster(hub, logger)
+
 	// 构造 services
 	authSvc, err := service.NewAuthService(cfg.Username, cfg.Password, jwtSecret, cfg.TokenTTL)
 	if err != nil {
@@ -95,7 +111,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("new todo repo: %v", err)
 	}
-	todoSvc, err := service.NewTodoService(todoRepo, auditSvc)
+	todoSvc, err := service.NewTodoService(todoRepo, auditSvc, broadcaster)
 	if err != nil {
 		logger.Fatalf("new todo service: %v", err)
 	}
@@ -103,7 +119,7 @@ func main() {
 	if err != nil {
 		logger.Fatalf("new sticky repo: %v", err)
 	}
-	stickySvc, err := service.NewStickyService(stickyRepo, auditSvc)
+	stickySvc, err := service.NewStickyService(stickyRepo, auditSvc, broadcaster)
 	if err != nil {
 		logger.Fatalf("new sticky service: %v", err)
 	}
@@ -142,6 +158,7 @@ func main() {
 		AuditH:      auditH,
 		TagH:        tagH,
 		StickyH:     stickyH,
+		WSHub:       hub,
 		CorsOrigins: corsOrigins,
 		Logger:      logger,
 		Version:     version,
@@ -195,6 +212,27 @@ func main() {
 		exitCode = 1
 	}
 
+	// 关闭 WebSocket Hub。位置放在 srv.Shutdown 之后、db.Close 之前，
+	// 但必须清楚两个和直觉不符的事实：
+	//
+	// 1) srv.Shutdown 并**不会**等待已升级的 WebSocket 连接。gorilla/websocket
+	//    在 Upgrade 完成后会 Hijack 底层 TCP 连接，Gin 的 HandlerFunc 随即返回；
+	//    net/http.Server 从此不再感知这些连接。所以 srv.Shutdown 只能保证
+	//    "没有新的 HTTP 请求在处理中"，不代表"所有 WS 都已关"。
+	//
+	// 2) 即便如此，仍有竞态安全性保证——hub.Close 会把 Hub.closed 置为 true，
+	//    后续极少见的 in-flight upgrade（handler 已开始执行但还没 Register）
+	//    走到 Hub.Register 时会命中 closed 分支，直接 close 新 client，不会
+	//    泄漏或 panic（见 ws.Hub.Register 的 closed 守卫）。
+	//
+	// 3) Hub.Close 关闭所有已注册客户端的 send channel，writePump 据此写一个
+	//    CloseMessage 并退出。这些 goroutine 不会被这里 wait——进程即将退出，
+	//    runtime 会统一清理，有限的写超时（writeWait=10s）也保证不会卡住整个
+	//    shutdown 超过预期。
+	//
+	// 4) Broadcaster 是 Hub 的薄适配器，自身无状态，无需单独 Close。
+	hub.Close()
+
 	// 关闭底层 DB 连接（即使前面出错也要尝试）
 	if sqlDB, err := db.DB(); err == nil {
 		if closeErr := sqlDB.Close(); closeErr != nil {
@@ -212,38 +250,29 @@ func main() {
 	}
 }
 
-// runHealthcheck 作为独立子命令执行：发一次 GET 到本机 /health，
-// 2xx 返回 0，其他情况返回 1。
+// applyFlagOverride 把 CLI flag 值覆盖到同名环境变量上，实现"flag 优先级高于环境变量"。
 //
-// 为什么不用 curl/wget：distroless/static 运行时不包含任何 shell 或工具链，
-// Docker HEALTHCHECK 只能调用静态二进制——复用 server 自身最自然，
-// 且探针逻辑与 server /health 端点实现同步演进，不会漂移。
+// 语义：
+//   - value 为空串（包括全空白）视为"用户未传此 flag"，保留现有环境变量不动
+//   - value 非空时 TrimSpace 后调用 os.Setenv，后续 config.Load 读到的即为该值
 //
-// 超时上限 3s——Docker 默认 healthcheck timeout 是 30s，这里留足余量。
-// 探针只看 HTTP 状态码，不解析 body，避免与 /health 响应结构耦合。
-func runHealthcheck() int {
-	port := strings.TrimSpace(os.Getenv("TODO_PORT"))
-	if port == "" {
-		port = "8080"
+// 为什么选择"覆盖环境变量"而不是在 config.Load 之后再打补丁：
+//  1. config.Load 已经集中处理了校验（端口范围、必填、Trim 等），两种来源走同一条校验路径，
+//     避免校验逻辑在 main.go 和 config.go 两处漂移；
+//  2. 子进程与现有调试工具（如 TODO_VERBOSE=true 打印的 os.Environ）都能看到真实生效的值。
+//
+// os.Setenv 的错误只会在 key 含 '=' 或 NUL 时出现，这里 key 是硬编码常量，不会触发；
+// 但出于严谨仍打印到 stderr 并终止——忽略 Setenv 失败会导致后续 config.Load
+// 拿到旧值、与用户预期不一致，属于"静默错误"，必须避免。
+func applyFlagOverride(envKey, value string) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return
 	}
-	// 探测 127.0.0.1 —— healthcheck 由容器内同进程执行，loopback 最稳。
-	url := fmt.Sprintf("http://127.0.0.1:%s/health", port)
-
-	client := &http.Client{
-		Timeout: 3 * time.Second,
+	if err := os.Setenv(envKey, v); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to override %s via flag: %v\n", envKey, err)
+		os.Exit(2)
 	}
-	resp, err := client.Get(url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "healthcheck: GET %s failed: %v\n", url, err)
-		return 1
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return 0
-	}
-	fmt.Fprintf(os.Stderr, "healthcheck: GET %s returned %d\n", url, resp.StatusCode)
-	return 1
 }
 
 // parseCorsOrigins 解析逗号分隔的 origin 列表，去掉空白项。

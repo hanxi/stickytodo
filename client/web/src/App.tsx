@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { useAuthStore } from './store/authStore';
-import { useStickyStore } from './store/stickyStore';
 import { useUiStore } from './store/uiStore';
+import { useRealtimeSync } from './hooks/useRealtimeSync';
 import LoginView from './views/LoginView';
 import StickyBoard from './views/StickyBoard';
 import AppBar from './components/AppBar';
@@ -9,7 +9,6 @@ import AppBar from './components/AppBar';
 export default function App() {
   const token = useAuthStore((s) => s.token);
   const hydrateCheckExpiry = useAuthStore((s) => s.hydrateCheckExpiry);
-  const ensureDefault = useStickyStore((s) => s.ensureDefault);
   const darkMode = useUiStore((s) => s.darkMode);
 
   // 启动时检查 token 过期
@@ -17,12 +16,11 @@ export default function App() {
     hydrateCheckExpiry();
   }, [hydrateCheckExpiry]);
 
-  // 已登录确保至少一张便签
-  useEffect(() => {
-    if (token) {
-      ensureDefault();
-    }
-  }, [token, ensureDefault]);
+  // 挂载 WebSocket 实时同步：内部按 authStore.token 自动 connect/disconnect
+  useRealtimeSync();
+
+  // 注："登录后确保至少一张便签"的语义由 StickyBoard 的空状态页承担（提示用户新建），
+  // 不再在 App 层主动写一条默认便签——云端源的便签应完全由用户显式创建。
 
   // 同步深色模式到 <html class="dark">
   useEffect(() => {

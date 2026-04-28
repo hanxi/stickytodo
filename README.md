@@ -35,7 +35,7 @@
 ```bash
 docker run -d --name stickytodo -p 8080:8080 \
   -e TODO_USERNAME=admin \
-  -e TODO_PASSWORD=change-me \
+  -e TODO_PASSWORD=change-me-please \
   -v $(pwd)/data:/data \
   docker.io/hanxi/stickytodo:latest
 ```
@@ -57,7 +57,7 @@ docker compose up --build -d  # 数据持久化到 server/data/（compose 里是
 
 ```bash
 cd server
-export TODO_USERNAME=admin TODO_PASSWORD=change-me
+export TODO_USERNAME=admin TODO_PASSWORD=change-me-please  # 值与 .env.example 保持一致，便于跑 smoke.sh
 go run ./cmd/todo-server
 # 默认监听 :8080（0.0.0.0:8080），本机访问 http://127.0.0.1:8080/
 # 数据存于 ./data/todo.db（config.go 默认 TODO_DATA_DIR=./data）
@@ -81,7 +81,7 @@ chmod +x stickytodo-server-<version>-<os>-<arch>
 xattr -dr com.apple.quarantine stickytodo-server-<version>-darwin-<arch>
 
 # 4) 运行（数据默认落到当前工作目录的 ./data/，与 Docker 镜像默认 /data 不同）
-export TODO_USERNAME=admin TODO_PASSWORD=change-me
+export TODO_USERNAME=admin TODO_PASSWORD=change-me-please
 ./stickytodo-server-<version>-<os>-<arch>
 ```
 
@@ -100,7 +100,7 @@ Windows 直接双击 `.exe` 即可；`chmod +x` 和 `xattr` 两步仅 Unix 平�
 **B. 从源码运行**
 
 ```bash
-# 方法 1：Xcode 打开 client/stickytodo/stickytodo.xcodeproj 后 ⌘R
+# 方法 1：Xcode 打开 client/mac/stickytodo.xcodeproj 后 ⌘R
 # 方法 2：命令行一键构建
 ./client/scripts/build.sh
 open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
@@ -108,7 +108,7 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 
 **首次使用**：应用以菜单栏图标 `note.text` 常驻（无 Dock 图标）。点图标 → 「打开设置」（⌘,）→ 填服务端地址（如 `http://127.0.0.1:8080`）和账号密码 → 回到面板点「新建便签」（⌘N）。
 
-更多操作 / 快捷键见 [client/stickytodo/README.md](./client/stickytodo/README.md)。
+更多操作 / 快捷键见 [client/mac/README.md](./client/mac/README.md)。
 
 ## 配置项
 
@@ -130,7 +130,7 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 
 - [AGENTS.md](./AGENTS.md)：项目架构、模块边界、开发约定、构建发布链路
 - [server/README.md](./server/README.md)：后端 API 清单、配置、测试
-- [client/stickytodo/README.md](./client/stickytodo/README.md)：macOS 客户端架构、快捷键
+- [client/mac/README.md](./client/mac/README.md)：macOS 客户端架构、快捷键
 - [client/web/README.md](./client/web/README.md)：Web 客户端架构、本地开发、embed 约定
 - [docs/RELEASE.md](./docs/RELEASE.md)：本地打包命令、CI 发布流程、所需 secrets
 

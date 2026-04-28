@@ -35,13 +35,3 @@ services:
       # macOS/Windows because the file sharing layer translates ownership;
       # on native Linux hosts you must set the uid explicitly.
       - ./data:/data
-    # Inline healthcheck uses the exec form (no shell needed), invoking the
-    # binary's built-in -healthcheck subcommand. This works on distroless
-    # exactly like HEALTHCHECK in the Dockerfile; declared here as well so
-    # `docker compose ps` shows health status during local dev.
-    healthcheck:
-      test: ["CMD", "/app/todo-server", "-healthcheck"]
-      interval: 30s
-      timeout: 3s
-      retries: 3
-      start_period: 5s

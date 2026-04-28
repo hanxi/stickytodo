@@ -74,9 +74,12 @@ export interface AuditLog {
   actor: string;
   action: AuditAction | string;
   todo_id: number | null;
-  before: string | null;
-  after: string | null;
-  occurred_at: string;
+  // detail 为后端整块 JSON 序列化后的字符串，包含变更前后字段或登录元信息；
+  // 服务端未写入时为空串，这里保留非可选以与 Go struct 对齐。
+  detail: string;
+  ip: string;
+  user_agent: string;
+  created_at: string;
 }
 
 export interface AuditListResponse {

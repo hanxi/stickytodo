@@ -4,7 +4,9 @@
 //
 //  MenuBarExtra 点开后展示的主面板。两种状态：
 //    - 未登录：提示 + 打开设置按钮
-//    - 已登录：用户名、便签总数、"新建便签"、"全局历史"、"打开设置"、"登出"、"退出"
+//    - 已登录：用户名、便签总数、"新建便签"、"打开设置"、"登出"、"退出"
+//
+//  历史查看器已迁移到 Settings → 历史 Tab，不再在菜单栏面板中提供独立入口。
 //
 //  打开 Settings Scene 的方案（跨版本）：
 //    - macOS 14+：使用 SwiftUI 官方 `SettingsLink`。这是 macOS 14 引入的
@@ -19,10 +21,6 @@ import SwiftUI
 
 struct MenuBarContent: View {
     @EnvironmentObject private var appState: AppState
-
-    /// 全局历史查看器的展示开关。在 Menu 的 Button 里不能直接用 .sheet，
-    /// 因此开一个不可见辅助 window 的 workaround。这里用 `NSWindow` 直接弹出更简单。
-    @State private var showingGlobalHistory = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -40,10 +38,6 @@ struct MenuBarContent: View {
         }
         .padding(14)
         .frame(width: 300)
-        .sheet(isPresented: $showingGlobalHistory) {
-            HistoryView(mode: .global, apiClient: appState.apiClient)
-                .frame(minWidth: 520, minHeight: 420)
-        }
     }
 
     // MARK: - Sub-views
@@ -66,27 +60,36 @@ struct MenuBarContent: View {
 
     @ViewBuilder
     private var authenticatedBody: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("便签数量：\(appState.stickies.count)")
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            HStack {
-                Button {
-                    appState.addSticky()
-                } label: {
-                    Label("新建便签", systemImage: "plus.rectangle.on.rectangle")
+            // 主操作：新建便签。独占一行、全宽、`.bordered` 样式（与底部
+            // 「设置 / 登出 / 退出」视觉统一）。
+            //
+            // 为什么从 `.borderedProminent` 改为 `.bordered`：
+            //   `.borderedProminent` 在按下瞬间会切换到高亮填充 + 白色前景，
+            //   在浅色 / 深色模式交叉场景下会出现「文字变白对比度失衡」的观感。
+            //   `.bordered` 用半透明灰底 + 系统默认前景色，天然跟随模式反色。
+            Button {
+                // 新建便签：async API，失败只记日志（用户多数情况是网络抖动，
+                // 可再次点击按钮重试，无需打断 MenuBarExtra 面板流程）。
+                Task { @MainActor in
+                    do {
+                        _ = try await appState.addSticky()
+                    } catch {
+                        // MenuBarContent 没有独立 Logger；通过 print 落到系统日志，
+                        // AppState 的 addSticky 内部也会有 os.Logger 记录同一错误。
+                        print("[MenuBarContent] addSticky failed: \(error)")
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut("n", modifiers: [.command])
-
-                Button {
-                    showingGlobalHistory = true
-                } label: {
-                    Label("历史", systemImage: "clock.arrow.circlepath")
-                }
-                .buttonStyle(.bordered)
+            } label: {
+                Label("新建便签", systemImage: "plus.rectangle.on.rectangle")
+                    .frame(maxWidth: .infinity)
             }
+            .buttonStyle(.bordered)
+            .keyboardShortcut("n", modifiers: [.command])
         }
     }
 

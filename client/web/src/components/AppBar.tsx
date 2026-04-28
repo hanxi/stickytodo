@@ -1,16 +1,91 @@
 import { useState } from 'react';
 import { LogOut, Moon, Plus, Sun, History as HistoryIcon } from 'lucide-react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../store/authStore';
-import { useStickyStore } from '../store/stickyStore';
 import { useUiStore } from '../store/uiStore';
+import { api } from '../api/client';
+import { queryKeys } from '../api/queryKeys';
+import { DEFAULT_STICKY_COLOR, defaultFilter, type StickyView } from '../types/sticky';
 import HistoryView from './HistoryView';
+
+/**
+ * 生成新便签 id。优先 crypto.randomUUID（现代浏览器原生，格式符合后端
+ * [A-Za-z0-9_-]+ 正则），降级到基于时间戳和随机数的字符串，保证永不冲突
+ * 且满足 <=64 字符限制。
+ */
+function newStickyId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `sticky-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 export default function AppBar() {
   const username = useAuthStore((s) => s.username);
   const logout = useAuthStore((s) => s.logout);
-  const addSticky = useStickyStore((s) => s.addSticky);
   const darkMode = useUiStore((s) => s.darkMode);
   const setDarkMode = useUiStore((s) => s.setDarkMode);
+  const queryClient = useQueryClient();
+
+  // 新建便签：client 端预生成 UUID，直接走 upsertSticky（PUT）让后端幂等落盘。
+  //
+  // 乐观更新：onMutate 里提前把"占位"便签插入列表让用户立刻看到新卡片；
+  //   - onError: ctx.previous 整表回滚
+  //   - onSuccess: 用服务端返回的权威视图替换占位条目（补齐 createdAt/updatedAt）
+  //
+  // mutationFn 在闭包里生成 id，并通过 variables 传给生命周期钩子，保证
+  // onMutate 放入列表的占位 id 与 mutationFn 提交给服务端的 id 完全一致——
+  // 若生成两个不同 id，会出现"占位便签永远留在列表、服务端那条永远补不回来"。
+  const addStickyMutation = useMutation({
+    mutationFn: (vars: { id: string }) =>
+      api.upsertSticky({
+        id: vars.id,
+        title: '新便签',
+        bgColor: DEFAULT_STICKY_COLOR,
+        filter: { ...defaultFilter },
+      }),
+    onMutate: async (vars) => {
+      await queryClient.cancelQueries({ queryKey: queryKeys.stickies() });
+      const previous = queryClient.getQueryData<StickyView[]>(
+        queryKeys.stickies(),
+      );
+      // 占位视图：服务端时间戳暂时用本机时间；onSuccess 会用服务端权威值覆盖
+      const nowISO = new Date().toISOString();
+      const placeholder: StickyView = {
+        id: vars.id,
+        title: '新便签',
+        bgColor: DEFAULT_STICKY_COLOR,
+        filter: { ...defaultFilter },
+        createdAt: nowISO,
+        updatedAt: nowISO,
+      };
+      queryClient.setQueryData<StickyView[]>(queryKeys.stickies(), (prev) => {
+        if (!prev) return [placeholder];
+        // 极小概率：同 id 已存在（重试场景）——不重复加
+        if (prev.some((s) => s.id === placeholder.id)) return prev;
+        return [...prev, placeholder];
+      });
+      return { previous };
+    },
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.previous) {
+        queryClient.setQueryData(queryKeys.stickies(), ctx.previous);
+      }
+    },
+    onSuccess: (created) => {
+      // 用服务端权威视图替换占位条目（补齐 createdAt/updatedAt）。
+      // 若跨端的 WS 事件已经先一步触发 list refetch 把本条加进来，这里的
+      // findIndex 仍能命中并做一次幂等替换，不会产生重复。
+      queryClient.setQueryData<StickyView[]>(queryKeys.stickies(), (prev) => {
+        if (!prev) return [created];
+        const idx = prev.findIndex((s) => s.id === created.id);
+        if (idx === -1) return [...prev, created];
+        const next = prev.slice();
+        next[idx] = created;
+        return next;
+      });
+    },
+  });
 
   const [showHistory, setShowHistory] = useState(false);
 
@@ -34,8 +109,9 @@ export default function AppBar() {
         <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={() => addSticky()}
-            className="inline-flex items-center gap-1 rounded px-2 py-1 text-sm hover:bg-gray-100 dark:hover:bg-neutral-700"
+            onClick={() => addStickyMutation.mutate({ id: newStickyId() })}
+            disabled={addStickyMutation.isPending}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-sm hover:bg-gray-100 disabled:opacity-50 dark:hover:bg-neutral-700"
             title="新建便签"
           >
             <Plus size={16} /> 新建便签

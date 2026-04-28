@@ -2,49 +2,83 @@
 //  StickyNote.swift
 //  stickytodo
 //
-//  单个便签窗口的持久化数据：位置/大小、背景色、筛选条件、标题。
-//  存储格式需要能被 JSONEncoder / JSONDecoder 稳定往返（UserDefaults 存 Data），
-//  因此 CGRect 与 NSColor 都定义成显式的 Codable 辅助结构，不依赖平台
-//  默认的 NSKeyedArchiver。
+//  便签的云端数据模型（与后端 /api/sticky-notes DTO 对齐）。
+//
+//  设计变更（阶段"云端数据源重构"）：
+//    - id 从 UUID 改为 String：后端主键是字符串，由客户端生成；两端互通需要统一类型。
+//    - 移除 frame：窗口位置属于"本机 UI 偏好"，不应该跨设备同步（用户在 Mac 上摆的
+//      位置拿到 iPad 没意义）。位置改由独立的 FrameStore 持久化到本机 UserDefaults。
+//    - 新增 createdAt/updatedAt：服务端权威时间戳，客户端只读。
+//
+//  后端 DTO 约定（server/internal/model/models.go：StickyNote）：
+//    - id:         string, 主键
+//    - title:      string
+//    - frame:      string（JSON，服务端不关心内容，本客户端永远传 "{}"）
+//    - bg_color:   string（{red,green,blue,alpha} 的 JSON 序列化）
+//    - filter:     string（TodoFilter 的 JSON 序列化）
+//    - created_at: time.Time
+//    - updated_at: time.Time
+//
+//  客户端在 APIClient 里完成 string ↔ JSON 的双向编解码，上层视图直接看 StickyNote 值类型。
 //
 
 import AppKit
 import Foundation
 
-/// 一个便签。ID 在本地生成（UUID），永远不与服务端 Todo.id 混用。
+/// 一个便签的本地视图模型（已解码完 bg_color / filter）。
+///
+/// 注意："window frame" 不在这里——它由 FrameStore 按 sticky.id 独立保存。
 struct StickyNote: Codable, Equatable, Hashable, Identifiable, Sendable {
-    let id: UUID
-    /// 用户自定义便签标题；显示在窗口顶部，仅本地有意义。
+    /// 服务端主键（客户端生成的 UUID 字符串；必须匹配后端 `[A-Za-z0-9_-]+` 正则，≤64 字符）。
+    let id: String
+    /// 用户自定义便签标题；显示在窗口顶部。
     var title: String
-    /// 便签窗口在屏幕坐标系下的 frame。
-    var frame: CodableRect
-    /// 背景色。与系统主题无关，由用户显式选择。
+    /// 背景色。与系统主题无关，由用户显式选择；跨端同步。
     var bgColor: CodableRGBA
     /// 该便签的 TODO 筛选条件。
     var filter: TodoFilter
+    /// 服务端创建时间；客户端只读。可选，用于本地新建后尚未收到服务端响应时的占位。
+    var createdAt: Date?
+    /// 服务端最后更新时间；客户端只读。可选，理由同上。
+    var updatedAt: Date?
 
     init(
-        id: UUID = UUID(),
+        id: String,
         title: String = "新便签",
-        frame: CGRect = StickyNote.defaultFrame,
         bgColor: CodableRGBA = .defaultSticky,
-        filter: TodoFilter = TodoFilter()
+        filter: TodoFilter = TodoFilter(),
+        createdAt: Date? = nil,
+        updatedAt: Date? = nil
     ) {
         self.id = id
         self.title = title
-        self.frame = CodableRect(frame)
         self.bgColor = bgColor
         self.filter = filter
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
     }
 
-    /// 打开便签时如果没有缓存的 frame，用这个默认尺寸。屏幕坐标取 (100, 100) 作为起点。
+    /// 生成一个新的 sticky id。
+    ///
+    /// 使用 UUID v4 的字符串形式（含连字符，36 字符），满足：
+    ///   - 后端 `[A-Za-z0-9_-]+` 正则（连字符允许）
+    ///   - 后端 ≤64 字符限制（36 < 64）
+    ///   - 跨设备零冲突（UUID v4 空间 2^122）
+    static func newID() -> String {
+        UUID().uuidString
+    }
+
+    /// 打开便签时若 FrameStore 里没有缓存位置，用这个默认尺寸。
+    /// 屏幕坐标取 (100, 100) 作为起点；StickyWindowManager 会按便签数量叠加偏移。
     static let defaultFrame = CGRect(x: 100, y: 100, width: 300, height: 420)
 }
 
 // MARK: - CodableRect
 
 /// 可编解码的矩形：等价于 CGRect 但明确列出字段名。
-/// 不直接为 CGRect 添加 Codable extension，避免跨模块潜在冲突。
+///
+/// 继续保留此类型：虽然 StickyNote 不再携带 frame 字段，FrameStore 按 sticky id
+/// 存 `[String: CodableRect]` 时仍然依赖它把 CGRect 稳定 JSON 化。
 struct CodableRect: Codable, Equatable, Hashable, Sendable {
     var x: CGFloat
     var y: CGFloat
@@ -66,8 +100,13 @@ struct CodableRect: Codable, Equatable, Hashable, Sendable {
 // MARK: - CodableRGBA
 
 /// 可编解码的 sRGB 颜色。
+///
+/// 字段命名直接对齐后端 `bg_color` JSON 结构（`{red, green, blue, alpha}`，
+/// 各分量均为 0...1 的 Double），因此可以直接用 `JSONEncoder/JSONDecoder`
+/// 和后端完成互操作，无需额外映射。
+///
 /// 选择 sRGB 是因为：
-///   1. macOS 下 NSColor.withAlphaComponent/RGB accessors 只在 RGB 色彩空间里有定义；
+///   1. macOS 下 NSColor 的 RGB accessors 只在 RGB 色彩空间里有定义；
 ///   2. 跨不同显示器或不同主题，sRGB 的数值含义稳定一致。
 struct CodableRGBA: Codable, Equatable, Hashable, Sendable {
     /// 0...1 归一化分量。

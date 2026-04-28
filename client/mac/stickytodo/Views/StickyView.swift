@@ -26,9 +26,11 @@ struct StickyView: View {
     let onNewSticky: () -> Void
 
     /// 关闭便签回调（"更多"菜单里的"删除此便签"）。
-    let onCloseSticky: (UUID) -> Void
+    /// id 类型为 String：云端数据源重构后，sticky 主键改为客户端生成的 UUID 字符串。
+    let onCloseSticky: (String) -> Void
 
-    /// note 任何字段变更（title / filter / bgColor）回写到 AppState.stickies。
+    /// note 任何字段变更（title / filter / bgColor）回写到 AppState。
+    /// 由 App 层通过 appState.updateSticky（async）把变更落到服务端。
     let onNoteChange: (StickyNote) -> Void
 
     // MARK: - State
@@ -52,7 +54,7 @@ struct StickyView: View {
         initialNote: StickyNote,
         apiClient: APIClient,
         onNewSticky: @escaping () -> Void,
-        onCloseSticky: @escaping (UUID) -> Void,
+        onCloseSticky: @escaping (String) -> Void,
         onNoteChange: @escaping (StickyNote) -> Void
     ) {
         self.initialNote = initialNote

@@ -4,17 +4,18 @@ import { queryKeys } from '../api/queryKeys';
 import type { TodoFilter } from '../types/sticky';
 import TodoRow from './TodoRow';
 import DraftTodoRow from './DraftTodoRow';
-import { useStickyStore } from '../store/stickyStore';
 
 interface Props {
-  noteId: string;
   filter: TodoFilter;
   bgColor: string;
+  /**
+   * 修改当前便签筛选条件时的回调。典型触发点："加载更多"按钮把 page_size 调大。
+   * 调用方（StickyCard）应把这个变更通过 upsertSticky 同步到服务端。
+   */
+  onFilterChange: (next: TodoFilter) => void;
 }
 
-export default function TodoList({ noteId, filter, bgColor }: Props) {
-  const updateFilter = useStickyStore((s) => s.updateFilter);
-
+export default function TodoList({ filter, bgColor, onFilterChange }: Props) {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: queryKeys.todos(filter),
     queryFn: () => api.listTodos(filter),
@@ -46,7 +47,7 @@ export default function TodoList({ noteId, filter, bgColor }: Props) {
             type="button"
             className="rounded border border-black/10 px-2 py-1 text-xs hover:bg-black/5 dark:border-white/20 dark:hover:bg-white/5"
             onClick={() =>
-              updateFilter(noteId, { page_size: filter.page_size + 50 })
+              onFilterChange({ ...filter, page_size: filter.page_size + 50 })
             }
           >
             加载更多（{data.items.length}/{data.total}）

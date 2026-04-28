@@ -15,8 +15,9 @@
 		A1010101010101010101010F /* StickyNote.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101010F /* StickyNote.swift */; };
 		A10101010101010101010110 /* Endpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010110 /* Endpoints.swift */; };
 		A10101010101010101010111 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010111 /* APIClient.swift */; };
-		A10101010101010101010112 /* StickyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010112 /* StickyStore.swift */; };
 		A10101010101010101010113 /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010113 /* KeychainStore.swift */; };
+		A1010101010101010101011F /* FrameStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011F /* FrameStore.swift */; };
+		A10101010101010101010120 /* RealtimeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010120 /* RealtimeClient.swift */; };
 		A10101010101010101010114 /* StickyWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010114 /* StickyWindowController.swift */; };
 		A10101010101010101010115 /* StickyWindowManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010115 /* StickyWindowManager.swift */; };
 		A10101010101010101010116 /* StickyViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010116 /* StickyViewModel.swift */; };
@@ -39,8 +40,9 @@
 		B1010101010101010101010F /* StickyNote.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyNote.swift; sourceTree = "<group>"; };
 		B10101010101010101010110 /* Endpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Endpoints.swift; sourceTree = "<group>"; };
 		B10101010101010101010111 /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
-		B10101010101010101010112 /* StickyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyStore.swift; sourceTree = "<group>"; };
 		B10101010101010101010113 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		B1010101010101010101011F /* FrameStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameStore.swift; sourceTree = "<group>"; };
+		B10101010101010101010120 /* RealtimeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeClient.swift; sourceTree = "<group>"; };
 		B10101010101010101010114 /* StickyWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyWindowController.swift; sourceTree = "<group>"; };
 		B10101010101010101010115 /* StickyWindowManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyWindowManager.swift; sourceTree = "<group>"; };
 		B10101010101010101010116 /* StickyViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyViewModel.swift; sourceTree = "<group>"; };
@@ -116,6 +118,7 @@
 			children = (
 				B10101010101010101010110 /* Endpoints.swift */,
 				B10101010101010101010111 /* APIClient.swift */,
+				B10101010101010101010120 /* RealtimeClient.swift */,
 			);
 			path = Networking;
 			sourceTree = "<group>";
@@ -123,8 +126,8 @@
 		D0000000000000000000000F /* Storage */ = {
 			isa = PBXGroup;
 			children = (
-				B10101010101010101010112 /* StickyStore.swift */,
 				B10101010101010101010113 /* KeychainStore.swift */,
+				B1010101010101010101011F /* FrameStore.swift */,
 			);
 			path = Storage;
 			sourceTree = "<group>";
@@ -230,8 +233,9 @@
 				A1010101010101010101010F /* StickyNote.swift in Sources */,
 				A10101010101010101010110 /* Endpoints.swift in Sources */,
 				A10101010101010101010111 /* APIClient.swift in Sources */,
-				A10101010101010101010112 /* StickyStore.swift in Sources */,
 				A10101010101010101010113 /* KeychainStore.swift in Sources */,
+				A1010101010101010101011F /* FrameStore.swift in Sources */,
+				A10101010101010101010120 /* RealtimeClient.swift in Sources */,
 				A10101010101010101010114 /* StickyWindowController.swift in Sources */,
 				A10101010101010101010115 /* StickyWindowManager.swift in Sources */,
 				A10101010101010101010116 /* StickyViewModel.swift in Sources */,

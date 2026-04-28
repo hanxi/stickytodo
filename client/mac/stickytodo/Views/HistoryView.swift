@@ -23,6 +23,17 @@ struct HistoryView: View {
     /// API 客户端。所有调用方必须显式注入，确保历史视图始终可加载。
     let apiClient: APIClient
 
+    /// 是否作为子视图嵌入（例如嵌在 Settings 的 TabView 里）。
+    /// - `false`（默认）：以独立 sheet 形式展示，顶部渲染「关闭」按钮，用 `dismiss` 关闭。
+    /// - `true`：嵌入模式，顶部不渲染「关闭」按钮（由外层容器负责生命周期）。
+    let embedded: Bool
+
+    init(mode: Mode, apiClient: APIClient, embedded: Bool = false) {
+        self.mode = mode
+        self.apiClient = apiClient
+        self.embedded = embedded
+    }
+
     @Environment(\.dismiss) private var dismiss
 
     @State private var items: [AuditLog] = []
@@ -49,8 +60,10 @@ struct HistoryView: View {
     @ViewBuilder
     private var header: some View {
         HStack {
-            Button("关闭") { dismiss() }
-                .keyboardShortcut(.cancelAction)
+            if !embedded {
+                Button("关闭") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
             Spacer()
             Text(title).font(.headline)
             Spacer()

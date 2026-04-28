@@ -10,7 +10,13 @@ import type {
   TodoListResponse,
   UpdateTodoRequest,
 } from '../types/api';
-import type { TodoFilter } from '../types/sticky';
+import type {
+  StickyNoteDTO,
+  StickyView,
+  TodoFilter,
+  UpsertStickyRequest,
+} from '../types/sticky';
+import { dtoToView, viewToUpsertRequest } from '../lib/stickyCodec';
 
 /**
  * 后端返回 {"error": "..."} 时抛出的结构化错误。
@@ -146,4 +152,61 @@ export const api = {
   },
 
   listTags: () => request<TagListResponse>('/api/tags'),
+
+  // ---------- Sticky Notes ----------
+  //
+  // 后端路由（见 server/internal/router/router.go）：
+  //   GET    /api/sticky-notes        → 返回 { items: StickyNoteDTO[] }
+  //   GET    /api/sticky-notes/:id    → 返回 StickyNoteDTO
+  //   PUT    /api/sticky-notes/:id    → body=UpsertStickyRequest，返回 StickyNoteDTO
+  //   DELETE /api/sticky-notes/:id    → 返回 { id, deleted: true }
+  //
+  // 这一层职责：把 DTO ↔ StickyView 的转换收口，上层组件只感知 StickyView。
+  // 删除接口不返回 view（调用方只需要知道删没删成功），直接用 200 即可。
+
+  listStickies: async (): Promise<StickyView[]> => {
+    const resp = await request<{ items: StickyNoteDTO[] }>('/api/sticky-notes');
+    // 后端即使无数据也会返回 items:[]（见 handler.List），这里不做 null 兜底以暴露协议变更
+    return resp.items.map(dtoToView);
+  },
+
+  getSticky: async (id: string): Promise<StickyView> => {
+    const dto = await request<StickyNoteDTO>(
+      `/api/sticky-notes/${encodeURIComponent(id)}`,
+    );
+    return dtoToView(dto);
+  },
+
+  /**
+   * 幂等 upsert。入参是 StickyView 的"可写子集"（id + title + bgColor + filter），
+   * 内部负责序列化成 UpsertStickyRequest 再 PUT。
+   *
+   * 服务端会用自己的时间戳覆写 created_at/updated_at，所以出参以服务端为准。
+   */
+  upsertSticky: async (input: {
+    id: string;
+    title: string;
+    bgColor: string;
+    filter: TodoFilter;
+  }): Promise<StickyView> => {
+    const body: UpsertStickyRequest = viewToUpsertRequest({
+      title: input.title,
+      bgColor: input.bgColor,
+      filter: input.filter,
+    });
+    const dto = await request<StickyNoteDTO>(
+      `/api/sticky-notes/${encodeURIComponent(input.id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      },
+    );
+    return dtoToView(dto);
+  },
+
+  deleteSticky: (id: string) =>
+    request<{ id: string; deleted: boolean }>(
+      `/api/sticky-notes/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
 };

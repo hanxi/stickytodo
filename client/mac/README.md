@@ -7,24 +7,25 @@
 - **菜单栏常驻**：`LSUIElement=YES`，无 Dock 图标；点击菜单栏 `note.text` 图标展开面板。
 - **多便签**：每条便签一个独立 NSWindow，`.floating` 层级置顶，支持拖动、缩放、换色。
 - **独立筛选**：每个便签持有自己的 `TodoFilter`（状态 / 标签 / 关键词 / 截止时间 / 已删除可见性 / 分页），互不影响。
-- **本地持久化**：
-  - 便签位置 / 大小 / 颜色 / 标题 / 筛选 → UserDefaults（key = `stickytodo.stickies`），300ms 去抖落盘 + `NSApplication.willTerminateNotification` 回调里 flush 以保证退出不丢数据。
+- **云端数据源 + 本地缓存**：
+  - 便签内容（标题 / 颜色 / 筛选）→ 服务端 `/api/sticky-notes`（唯一数据源），登录后通过 `listStickies` 全量拉取，后续变更通过 WebSocket 事件实时同步。
+  - 便签窗口位置 → 本机 UserDefaults（key = `stickytodo.frames`，由 `FrameStore` 管理），属于纯本机 UI 偏好，不跨设备同步。
   - 登录 token → Keychain（`kSecAttrAccessible = kSecAttrAccessibleAfterFirstUnlock`），重启即保持登录。
 - **全局历史**：菜单栏面板「历史」按钮查看所有操作审计；单条 TODO 行尾部的 `⋯`（`ellipsis.circle` 图标）按钮展开菜单后选「历史」即可查看该条的变更轨迹。
 
 ## 目录结构
 
 ```
-client/stickytodo/
+client/mac/
 ├── stickytodo.xcodeproj/        # Xcode 工程
 └── stickytodo/                  # 源码
-    ├── StickyTodoApp.swift      # @main 入口 + MenuBarExtra + Settings + StickyWindowBridge
-    ├── AppState.swift           # 全局状态（认证 + 便签 + APIClient + Keychain/StickyStore）
+    ├── StickyTodoApp.swift      # @main 入口 + MenuBarExtra + Settings + StickyWindowBridge（Combine sink 订阅 AppState）
+    ├── AppState.swift           # 全局状态（认证 + 云端便签列表 + APIClient + RealtimeClient + FrameStore）
     ├── Info.plist               # LSUIElement=YES 等
     ├── stickytodo.entitlements  # App Sandbox / network.client / files.user-selected.read-only
     ├── Models/                  # 数据模型（Todo / AuditLog / Filter / StickyNote）
-    ├── Networking/              # Endpoints（URL 构造）+ APIClient（async/await，含 Login/Health DTO）
-    ├── Storage/                 # StickyStore（UserDefaults）+ KeychainStore（Security）
+    ├── Networking/              # Endpoints（URL 构造）+ APIClient（async/await）+ RealtimeClient（WebSocket）
+    ├── Storage/                 # KeychainStore（JWT）+ FrameStore（本机窗口位置 UserDefaults）
     ├── Windows/                 # StickyWindowController（NSWindow 壳）+ StickyWindowManager（diff 同步）
     └── Views/                   # StickyView / TodoRow / FilterEditor / HistoryView
                                  # MenuBarContent / SettingsView / StickyViewModel
@@ -42,14 +43,14 @@ client/stickytodo/
 
 ### 方式一：Xcode
 
-1. 打开 `client/stickytodo/stickytodo.xcodeproj`
+1. 打开 `client/mac/stickytodo.xcodeproj`
 2. 选择 **My Mac** 作为目标，按 **⌘R** 运行
 3. App 启动后菜单栏出现 `note.text` 图标
 
 ### 方式二：xcodebuild 命令行
 
 ```bash
-cd client/stickytodo
+cd client/mac
 # Debug 构建：使用 Xcode 的 "Sign to run locally" 临时签名（CODE_SIGN_IDENTITY="-"），
 # 仅能在本机运行，发布时需要换成 Developer ID / App Store 正式签名。
 xcodebuild \

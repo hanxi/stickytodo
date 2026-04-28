@@ -12,10 +12,15 @@ import (
 
 // Config 保存服务端运行时配置。所有字段均从环境变量加载。
 //
-// 注意：JWT 签名密钥不在此结构里——它由 server 启动时从 SQLite 的 app_secrets 表
-// 读取；若不存在则自动生成 32 字节随机值并持久化，详见
-// internal/repository/secret_repo.go#GetOrCreateJWTSecret。这样可以避免用户
-// 手动管理密钥，同时保证 token 跨重启有效。
+// 注意：
+//   - JWT 签名密钥不在此结构里——它由 server 启动时从 SQLite 的 app_secrets 表
+//     读取；若不存在则自动生成 32 字节随机值并持久化，详见
+//     internal/repository/secret_repo.go#GetOrCreateJWTSecret。这样可以避免用户
+//     手动管理密钥，同时保证 token 跨重启有效。
+//   - `TODO_PORT` / `TODO_USERNAME` / `TODO_PASSWORD` 支持通过 CLI flag
+//     `-port` / `-username` / `-password` 覆盖；flag 在 cmd/todo-server/main.go
+//     里通过 os.Setenv 写回同名环境变量后再调用 Load，因此这里看到的仍是
+//     "从环境变量读取"，但最终生效值可能来自 flag（flag 优先级更高）。
 type Config struct {
 	// Port 监听端口，环境变量 TODO_PORT，默认 "8080"。必须是 1-65535 的整数。
 	Port string

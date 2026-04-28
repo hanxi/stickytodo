@@ -42,20 +42,28 @@ var stickyIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // StickyService 业务层：协调 StickyRepo 与 AuditService。
 type StickyService struct {
-	repo  *repository.StickyRepo
-	audit *AuditService
-	now   func() time.Time
+	repo        *repository.StickyRepo
+	audit       *AuditService
+	broadcaster EventBroadcaster
+	now         func() time.Time
 }
 
 // NewStickyService 构造 StickyService。repo 与 audit 均不允许为 nil。
-func NewStickyService(repo *repository.StickyRepo, audit *AuditService) (*StickyService, error) {
+// broadcaster 可为 nil：此时内部会替换为 nopBroadcaster，等价于"不广播"
+// （用于单测 / 未启用 WS 的场景）。
+func NewStickyService(repo *repository.StickyRepo, audit *AuditService, broadcaster EventBroadcaster) (*StickyService, error) {
 	if repo == nil {
 		return nil, errors.New("sticky-service: repo must not be nil")
 	}
 	if audit == nil {
 		return nil, errors.New("sticky-service: audit must not be nil")
 	}
-	return &StickyService{repo: repo, audit: audit, now: time.Now}, nil
+	return &StickyService{
+		repo:        repo,
+		audit:       audit,
+		broadcaster: resolveBroadcaster(broadcaster),
+		now:         time.Now,
+	}, nil
 }
 
 // List 返回所有便签（按 updated_at DESC 排序，见 Repo 层）。
@@ -148,6 +156,9 @@ func (s *StickyService) Upsert(ctx context.Context, in UpsertStickyInput, ac Act
 		"sticky_id": after.ID,
 		"after":     stickySnapshot(after),
 	})
+	// 广播便签 upsert 事件：PUT 语义下客户端不区分 created/updated，
+	// 订阅方按 id 做 upsert 即可（见 ws/adapter.go BroadcastStickyUpserted）
+	s.broadcaster.BroadcastStickyUpserted(after)
 	return after, nil
 }
 
@@ -172,6 +183,8 @@ func (s *StickyService) Delete(ctx context.Context, id string, ac ActionContext)
 		detail["before"] = stickySnapshot(before)
 	}
 	s.writeAudit(ctx, "sticky_delete", ac, detail)
+	// 广播删除事件，payload 仅带 id；订阅方据此从本地 cache 移除
+	s.broadcaster.BroadcastStickyDeleted(id)
 	return nil
 }
 

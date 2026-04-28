@@ -27,37 +27,42 @@ final class StickyWindowController {
 
     // MARK: - 回调
 
-    /// 窗口 frame 变化（用户拖动/改尺寸）回调；manager 据此更新 AppState。
-    var onFrameChange: ((UUID, CGRect) -> Void)?
+    /// 窗口 frame 变化（用户拖动/改尺寸）回调；manager 据此写入 FrameStore。
+    /// 云端数据源重构后，id 改用字符串（与 StickyNote.id 对齐）。
+    var onFrameChange: ((String, CGRect) -> Void)?
 
-    /// 窗口被关闭（用户点红灯）回调；manager 据此从 AppState.stickies 删除。
-    var onClose: ((UUID) -> Void)?
+    /// 窗口被关闭（用户点红灯 / × 按钮）回调；manager 据此从 AppState.stickies 删除。
+    var onClose: ((String) -> Void)?
 
     // MARK: - 只读属性
 
     /// 当前管理的便签 ID。
-    let stickyID: UUID
+    let stickyID: String
 
     // MARK: - 初始化
 
     /// - Parameters:
     ///   - note: 初始 StickyNote 快照。
-    ///   - contentBuilder: 根据当前 note 构造 SwiftUI 视图；每次 update(note:) 会
-    ///     重新调用以刷新 hosting view 的 rootView。阶段十一只传占位视图；
-    ///     阶段十二由调用方注入 StickyView。
+    ///   - initialFrame: 窗口的初始屏幕坐标。调用方（WindowManager）决定来源：
+    ///     FrameStore 缓存命中 → 还原上次位置；未命中 → defaultFrame + 偏移。
+    ///     note 本身不再携带 frame（见 "云端数据源重构"）。
+    ///   - contentBuilder: 根据当前 note 构造 SwiftUI 视图；rootView 只在 init 时
+    ///     构造一次，update(note:) 不重建（见 update 方法的注释）。
     init(
         note: StickyNote,
+        initialFrame: CGRect,
         contentBuilder: @escaping @MainActor (StickyNote) -> AnyView
     ) {
         self.stickyID = note.id
         self.contentBuilder = contentBuilder
         self.currentNote = note
+        self.lastReportedFrame = initialFrame
 
         // 使用 borderless 无标题栏窗口，配合 fullSizeContentView 让 SwiftUI 渲染占满全窗。
         // 必须用 StickyNSWindow 子类，否则 borderless 窗口默认 canBecomeKey == false，
         // 会导致便签内的 TextField / 标题输入框无法获得焦点。
         let window = StickyNSWindow(
-            contentRect: note.frame.cgRect,
+            contentRect: initialFrame,
             styleMask: [.borderless, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -129,17 +134,13 @@ final class StickyWindowController {
     ///
     ///   作为权衡：外部路径（例如 MenuBarContent 删除一个便签）只会触发 manager
     ///   的 remove，不会修改"现有便签"的字段；所以 rootView 不需要响应外部字段
-    ///   变化。frame 变化由 SwiftUI 外部（NSWindow）承载，不影响 rootView 内容。
+    ///   变化。
+    ///
+    ///   云端数据源重构后，StickyNote 不再携带 frame，所以本方法只需留个空壳
+    ///   保持 API 形态（便于未来扩展 `windowLevel` / `alphaValue` 之类的外部驱动
+    ///   字段）。标题由 StickyView 内部 UI 自绘。
     func update(note: StickyNote) {
         currentNote = note
-
-        // 去标题栏后 window.title 不再显示，无需再写入；标题由便签内 UI（StickyView titleBar）承担。
-
-        let newFrame = note.frame.cgRect
-        if !Self.frameRoughlyEqual(window.frame, newFrame) {
-            // display=true 立即绘制，animate=false 避免便签窗反复抖动。
-            window.setFrame(newFrame, display: true, animate: false)
-        }
     }
 
     // MARK: - Private
@@ -148,6 +149,11 @@ final class StickyWindowController {
     private let hostingView: NSHostingView<AnyView>
     private let contentBuilder: @MainActor (StickyNote) -> AnyView
     private var currentNote: StickyNote
+
+    /// 上一次向外回调时的 frame 快照，用于抑制亚像素级别的噪声重复回调。
+    /// 由 init 赋为 initialFrame（窗口首次显示的位置），之后每次 emitFrameChange
+    /// 成功发出事件后更新。
+    private var lastReportedFrame: CGRect
 
     /// 标记"当前 close 由代码触发"，避免 willClose 回调把便签又删一次。
     private var isClosingProgrammatically = false
@@ -208,12 +214,13 @@ final class StickyWindowController {
         }
     }
 
-    private func emitFrameChange(id: UUID) {
+    private func emitFrameChange(id: String) {
         let newFrame = window.frame
-        // 与 currentNote 差异小于阈值不回调，减少写盘频率。
-        if Self.frameRoughlyEqual(currentNote.frame.cgRect, newFrame) {
+        // 与最近一次已上报的 frame 差异小于阈值不回调，减少写盘频率。
+        if Self.frameRoughlyEqual(lastReportedFrame, newFrame) {
             return
         }
+        lastReportedFrame = newFrame
         onFrameChange?(id, newFrame)
     }
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/hanxi/todo-server/internal/middleware"
 	"github.com/hanxi/todo-server/internal/service"
 	"github.com/hanxi/todo-server/internal/webui"
+	"github.com/hanxi/todo-server/internal/ws"
 )
 
 // Deps 汇聚所有需要注入路由层的服务与 handler 依赖。
@@ -26,6 +27,7 @@ type Deps struct {
 	AuditH      *handler.AuditHandler
 	TagH        *handler.TagHandler
 	StickyH     *handler.StickyHandler
+	WSHub       *ws.Hub     // WebSocket 连接中枢；/api/ws 路由依赖它完成广播
 	CorsOrigins []string    // 允许的 CORS origin；空切片表示不注入 CORS 中间件
 	Logger      *log.Logger // 用于 Gin access log；nil 则回退 gin.DefaultWriter
 	Version     string      // 注入到 /health 响应里，便于运维排查；为空则返回 "unknown"
@@ -41,6 +43,9 @@ func (d *Deps) Validate() error {
 	}
 	if d.AuthH == nil || d.TodoH == nil || d.AuditH == nil || d.TagH == nil || d.StickyH == nil {
 		return errors.New("router: handlers not initialized")
+	}
+	if d.WSHub == nil {
+		return errors.New("router: ws hub not initialized")
 	}
 	return nil
 }
@@ -77,6 +82,12 @@ func Build(deps *Deps) (*gin.Engine, error) {
 		})
 	})
 	r.POST("/api/login", deps.AuthH.Login)
+
+	// WebSocket 实时事件通道：故意**不**挂在 authed group 下。
+	// 浏览器的 WebSocket API 无法在 upgrade 请求上附加 Authorization header，
+	// 所以鉴权走"首帧 auth 协议"（见 ws/handler.go 与 ws/client.go.authenticate）。
+	// CSP 中 connect-src 'self' 已经允许同源 WS 升级，无需额外调整。
+	r.GET("/api/ws", ws.Handler(deps.WSHub, deps.Auth, deps.CorsOrigins, deps.Logger))
 
 	// 鉴权接口
 	authed := r.Group("/api")
