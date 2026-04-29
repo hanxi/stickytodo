@@ -14,13 +14,22 @@
 # How it works:
 #   peter-evans/dockerhub-description calls Docker Hub's
 #   `PATCH /v2/repositories/{namespace}/{repo}/` with `full_description` set
-#   to the README body. It needs a PAT (DOCKERHUB_TOKEN) that has at least
-#   "Public Repo Read + Write" scope on the target repo.
+#   to the README body. Docker Hub classifies this PATCH under repo admin
+#   permission (NOT plain Read+Write), so the PAT used here MUST have at
+#   least "Read, Write, Delete" scope (new UI) / "Admin" scope (old UI) on
+#   the target repo. A Write-only token will return HTTP 403 Forbidden even
+#   though login succeeds — that's the symptom we saw in the very first run.
 #
-# Secrets:
-#   Reuses DOCKERHUB_USERNAME / DOCKERHUB_TOKEN already used by
-#   _build-all.yml's build-docker job. If either is missing (e.g. on a fork),
-#   the job is skipped cleanly instead of failing red.
+# Secrets (reuses the same pair as _build-all.yml's build-docker job):
+#   * DOCKERHUB_USERNAME — Docker Hub account that owns hanxi/stickytodo.
+#   * DOCKERHUB_TOKEN    — PAT with admin scope ("Read, Write, Delete" in
+#                          the new UI, "Admin" in the old UI). The same
+#                          token is used to push images in build-docker;
+#                          a plain Read+Write token will work for image
+#                          push but NOT for this README PATCH — it must
+#                          be upgraded to admin for both jobs to succeed.
+#   If DOCKERHUB_USERNAME is missing (e.g. on a fork), the job is skipped
+#   cleanly instead of failing red.
 #
 # Target repo:
 #   `hanxi/stickytodo` — matches the image name `docker.io/hanxi/stickytodo`
@@ -78,10 +87,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Extract a short description (≤100 chars, Hub's hard limit) from the
-      # first non-empty paragraph under the H1. If README doesn't have a
-      # usable intro line we skip the short_description param entirely so
-      # the action only updates full_description and leaves short alone.
+      # Extract a short description (≤100 BYTES, Hub's hard limit — not chars!)
+      # from the first non-empty paragraph under the H1. README first lines
+      # may contain CJK characters which are 3 bytes each in UTF-8, so char
+      # truncation (${var:0:97}) lets the result overflow the byte limit and
+      # the upstream action prints a warning + truncates again. We trim by
+      # byte here so the action receives a value it won't need to touch.
+      #
+      # If README doesn't yield a usable intro line we emit an empty output
+      # and skip the short-description param entirely downstream — leaves
+      # whatever was previously set on Docker Hub untouched.
       - name: Derive short description from README
         id: short
         run: |
@@ -94,14 +109,23 @@ jobs:
               print; exit
             }
           ' README.md || true)"
-          # Trim + truncate to 100 chars (Docker Hub limit).
+          # Trim surrounding whitespace + collapse inner runs.
           line="$(printf '%s' "$line" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
-          if [ ${#line} -gt 100 ]; then
-            line="${line:0:97}..."
+          # Byte-safe truncation: keep at most 100 bytes, and if we cut we
+          # step back up to 3 bytes to avoid splitting a UTF-8 codepoint,
+          # then append "..." (3 ASCII bytes → total still ≤100).
+          byte_len=$(printf '%s' "$line" | wc -c | tr -d ' ')
+          if [ "$byte_len" -gt 100 ]; then
+            # Reserve 3 bytes for the ellipsis.
+            truncated="$(printf '%s' "$line" | head -c 97)"
+            # If head -c landed mid-codepoint, iconv will drop the partial
+            # trailing bytes; //IGNORE keeps everything else.
+            truncated="$(printf '%s' "$truncated" | iconv -f UTF-8 -t UTF-8//IGNORE)"
+            line="${truncated}..."
           fi
           if [ -n "$line" ]; then
             echo "short=$line" >> "$GITHUB_OUTPUT"
-            echo "Derived short description: $line"
+            echo "Derived short description ($(printf '%s' "$line" | wc -c | tr -d ' ') bytes): $line"
           else
             echo "short=" >> "$GITHUB_OUTPUT"
             echo "No suitable intro line found; will leave short description unchanged."
@@ -111,6 +135,11 @@ jobs:
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
+          # DOCKERHUB_TOKEN must have admin scope on hanxi/stickytodo —
+          # a plain Read+Write token yields HTTP 403 on
+          # PATCH /v2/repositories/... (see file header for the full
+          # explanation). The same token is consumed by build-docker for
+          # image push, so upgrading it here also benefits that job.
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           # Must match the image name pushed by _build-all.yml's build-docker
           # job (docker.io/hanxi/stickytodo). Keep these in sync.
