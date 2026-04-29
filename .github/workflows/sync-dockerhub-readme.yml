@@ -1,0 +1,122 @@
+# Sync the top-level README.md to the Docker Hub repository description.
+#
+# Why this exists:
+#   Docker Hub's repository page has its own "Overview" body (aka
+#   `full_description`) that is NOT automatically populated from the linked
+#   GitHub repo. Users who `docker pull hanxi/stickytodo` land on that page
+#   first, so it should stay in sync with the canonical README.md.
+#
+# When it runs:
+#   * push to `main` that touches README.md  → auto sync
+#   * workflow_dispatch                       → manual re-sync (useful after
+#     rotating the Docker Hub token, or to backfill when the action was added)
+#
+# How it works:
+#   peter-evans/dockerhub-description calls Docker Hub's
+#   `PATCH /v2/repositories/{namespace}/{repo}/` with `full_description` set
+#   to the README body. It needs a PAT (DOCKERHUB_TOKEN) that has at least
+#   "Public Repo Read + Write" scope on the target repo.
+#
+# Secrets:
+#   Reuses DOCKERHUB_USERNAME / DOCKERHUB_TOKEN already used by
+#   _build-all.yml's build-docker job. If either is missing (e.g. on a fork),
+#   the job is skipped cleanly instead of failing red.
+#
+# Target repo:
+#   `hanxi/stickytodo` — matches the image name `docker.io/hanxi/stickytodo`
+#   pushed by release-tag.yml / release-branch.yml.
+
+name: sync-dockerhub-readme
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'README.md'
+      - '.github/workflows/sync-dockerhub-readme.yml'
+  workflow_dispatch:
+
+# Read-only on repo contents; this workflow never pushes back to git.
+permissions:
+  contents: read
+
+# Serialize runs so two quick README pushes don't race on the Hub API.
+concurrency:
+  group: sync-dockerhub-readme
+  cancel-in-progress: false
+
+jobs:
+  # Tiny guard job: `secrets.*` can't be evaluated inside `if:` on the main
+  # job, so we surface a boolean here and gate the real job on its output.
+  # Mirrors the detect-docker-creds pattern in _build-all.yml.
+  detect-docker-creds:
+    name: Detect Docker Hub credentials
+    runs-on: ubuntu-latest
+    outputs:
+      have: ${{ steps.check.outputs.have }}
+    steps:
+      - name: Check DOCKERHUB_USERNAME
+        id: check
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -n "${DOCKERHUB_USERNAME:-}" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub credentials available → README sync will run."
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "DOCKERHUB_USERNAME absent → README sync will be SKIPPED."
+          fi
+
+  sync:
+    name: Push README to Docker Hub
+    needs: detect-docker-creds
+    if: needs.detect-docker-creds.outputs.have == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Extract a short description (≤100 chars, Hub's hard limit) from the
+      # first non-empty paragraph under the H1. If README doesn't have a
+      # usable intro line we skip the short_description param entirely so
+      # the action only updates full_description and leaves short alone.
+      - name: Derive short description from README
+        id: short
+        run: |
+          set -euo pipefail
+          # First non-blank, non-heading, non-badge line after the H1.
+          line="$(awk '
+            BEGIN { seen_h1 = 0 }
+            /^# / && !seen_h1 { seen_h1 = 1; next }
+            seen_h1 && NF > 0 && $0 !~ /^#/ && $0 !~ /^!\[/ && $0 !~ /^\[!\[/ {
+              print; exit
+            }
+          ' README.md || true)"
+          # Trim + truncate to 100 chars (Docker Hub limit).
+          line="$(printf '%s' "$line" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
+          if [ ${#line} -gt 100 ]; then
+            line="${line:0:97}..."
+          fi
+          if [ -n "$line" ]; then
+            echo "short=$line" >> "$GITHUB_OUTPUT"
+            echo "Derived short description: $line"
+          else
+            echo "short=" >> "$GITHUB_OUTPUT"
+            echo "No suitable intro line found; will leave short description unchanged."
+          fi
+
+      - name: Sync README to Docker Hub
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          # Must match the image name pushed by _build-all.yml's build-docker
+          # job (docker.io/hanxi/stickytodo). Keep these in sync.
+          repository: hanxi/stickytodo
+          readme-filepath: ./README.md
+          # Only set short-description when we actually derived one, so the
+          # action leaves the existing value alone on empty input.
+          short-description: ${{ steps.short.outputs.short }}
+          enable-url-completion: true
