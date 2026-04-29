@@ -1,6 +1,26 @@
 # stickytodo
 
+[![GitHub License](https://img.shields.io/github/license/hanxi/stickytodo)](https://github.com/hanxi/stickytodo/blob/main/LICENSE)
+[![GitHub Release](https://img.shields.io/github/v/release/hanxi/stickytodo)](https://github.com/hanxi/stickytodo/releases)
+[![Docker Image Version](https://img.shields.io/docker/v/hanxi/stickytodo?sort=date&label=docker%20image)](https://hub.docker.com/r/hanxi/stickytodo)
+[![Docker Pulls](https://img.shields.io/docker/pulls/hanxi/stickytodo)](https://hub.docker.com/r/hanxi/stickytodo)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/hanxi/stickytodo?filename=server%2Fgo.mod)](https://github.com/hanxi/stickytodo/blob/main/server/go.mod)
+[![GitHub Stars](https://img.shields.io/github/stars/hanxi/stickytodo?style=flat)](https://github.com/hanxi/stickytodo/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/hanxi/stickytodo?style=flat)](https://github.com/hanxi/stickytodo/network/members)
+[![GitHub Issues](https://img.shields.io/github/issues/hanxi/stickytodo)](https://github.com/hanxi/stickytodo/issues)
+[![GitHub last commit](https://img.shields.io/github/last-commit/hanxi/stickytodo)](https://github.com/hanxi/stickytodo/commits/main)
+[![Daily Visitors](https://api.visitorbadge.io/api/daily?path=hanxi%2Fstickytodo&label=daily%20visitor&countColor=%232ccce4&style=flat)](https://visitorbadge.io/status?path=hanxi%2Fstickytodo)
+[![Total Visitors](https://api.visitorbadge.io/api/visitors?path=hanxi%2Fstickytodo&label=total%20visitor&countColor=%232ccce4&style=flat)](https://visitorbadge.io/status?path=hanxi%2Fstickytodo)
+
 一个自托管的多便签 TODO 工具：单账号 JWT 鉴权、浏览器即开即用、macOS 原生菜单栏客户端。
+
+<p align="center">
+  <a href="https://github.com/hanxi/stickytodo">🏠 GitHub</a> •
+  <a href="https://hub.docker.com/r/hanxi/stickytodo">🐳 Docker Hub</a> •
+  <a href="https://github.com/hanxi/stickytodo/releases">📦 Releases</a> •
+  <a href="./AGENTS.md">📖 架构文档</a> •
+  <a href="https://github.com/hanxi/stickytodo/issues">💬 Issues</a>
+</p>
 
 - GitHub：`github.com/hanxi/stickytodo`
 - Docker：`docker.io/hanxi/stickytodo`
