@@ -33,6 +33,18 @@ struct TodoRow: View {
     /// 降低待办密集时的视觉噪声，贴近原生 Notes.app / Reminders.app 的体验。
     @State private var isHovering = false
 
+    /// 是否跳过"删除待办"的二次确认 Alert。
+    ///
+    /// 默认 false（首次删除仍弹 Alert，保留安全网）。Alert 中提供"删除并不再提示"按钮，
+    /// 点击后把此值写入 UserDefaults，之后再点"删除"会直接走 softDelete。
+    ///
+    /// 设计与便签对齐（见 `StickyView.skipDeleteConfirm`）：
+    ///   - 使用独立 key `todo.skipDeleteConfirm`，与便签 `sticky.skipDeleteConfirm` 分离，
+    ///     让用户能够分别控制两种资源的确认策略（待办支持回收恢复，风险更低，用户更可能关）
+    ///   - 待办删除走软删（`viewModel.softDelete`），"仅已删除"筛选下仍可恢复，实际损失极低
+    ///   - 用户想重新开启提示可在 SettingsView 的「通用」区切换 Toggle
+    @AppStorage("todo.skipDeleteConfirm") private var skipDeleteConfirm = false
+
     // MARK: - 就地编辑态
 
     /// 进入标题编辑态。单击标题文字触发；Text 与 TextField 之间的切换由此标记驱动。
@@ -80,9 +92,22 @@ struct TodoRow: View {
         .onHover { hovering in
             isHovering = hovering
         }
+        // 删除待办二次确认：菜单「删除」点击后弹出（仅在 skipDeleteConfirm=false 时）。
+        // 确认后调 viewModel.softDelete（软删，"仅已删除"筛选下仍可恢复）。
+        //
+        // Alert 提供三个按钮（与便签 StickyView 的删除确认对齐）：
+        //   - 取消：关闭 Alert
+        //   - 删除：本次删除，下次仍会弹
+        //   - 删除并不再提示：本次删除 + 把 skipDeleteConfirm 写入 UserDefaults，之后直接删
+        // 使用"第三个按钮"而不是"Toggle 勾选框"的原因：SwiftUI .alert 的 actions 只能放
+        // Button/TextField，不支持 Toggle；保持与 StickyView 同一交互模式也让用户心智一致。
         .alert("确认删除", isPresented: $showingDeleteConfirm) {
             Button("取消", role: .cancel) { }
             Button("删除", role: .destructive) {
+                Task { await viewModel.softDelete(id: todo.id) }
+            }
+            Button("删除并不再提示") {
+                skipDeleteConfirm = true
                 Task { await viewModel.softDelete(id: todo.id) }
             }
         } message: {
@@ -294,7 +319,14 @@ struct TodoRow: View {
                     Label("编辑", systemImage: "pencil")
                 }
                 Button(role: .destructive) {
-                    showingDeleteConfirm = true
+                    // skipDeleteConfirm=true（用户选过"删除并不再提示"或在设置里关了开关）
+                    // 时直接走 softDelete，不再弹 Alert；默认行为仍是弹二次确认。
+                    // 与 StickyView 标题栏 trash 按钮的判断对齐。
+                    if skipDeleteConfirm {
+                        Task { await viewModel.softDelete(id: todo.id) }
+                    } else {
+                        showingDeleteConfirm = true
+                    }
                 } label: {
                     Label("删除", systemImage: "trash")
                 }

@@ -36,10 +36,18 @@ struct SettingsView: View {
     // 不在这里单独起新 key 是为了避免双 key 同义造成状态分裂——StickyView 是该偏好的唯一
     // 消费点，`@AppStorage` 直接指向同一个 UserDefaults 条目，两处视图会自动同步。
     //
-    // UI 侧用 `showDeleteConfirmBinding`（计算属性，下面定义）把"跳过=true / 弹窗=false"
+    // UI 侧用 `showStickyDeleteConfirmBinding`（计算属性，下面定义）把"跳过=true / 弹窗=false"
     // 反转成面向用户的"弹窗=true / 跳过=false"，让 Toggle 的正向语义（打开=弹提示）
     // 更符合直觉。
-    @AppStorage("sticky.skipDeleteConfirm") private var skipDeleteConfirm = false
+    @AppStorage("sticky.skipDeleteConfirm") private var skipStickyDeleteConfirm = false
+
+    // 「删除待办前弹出确认」偏好。
+    //
+    // key 与便签分离（`todo.skipDeleteConfirm`），让用户能分别控制两种资源的确认策略——
+    // 待办走软删且可从"仅已删除"筛选恢复，风险明显低于便签（便签删除是云端硬删不可恢复），
+    // 很多用户更倾向把待办的提示关掉、但保留便签的提示。两套 key 完全独立不共享状态。
+    // 真值消费点在 TodoRow（同名 @AppStorage），两处视图自动同步。
+    @AppStorage("todo.skipDeleteConfirm") private var skipTodoDeleteConfirm = false
 
     var body: some View {
         TabView {
@@ -130,10 +138,19 @@ struct SettingsView: View {
             }
 
             Section("通用") {
-                Toggle(isOn: showDeleteConfirmBinding) {
+                Toggle(isOn: showStickyDeleteConfirmBinding) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("删除便签前弹出确认")
                         Text("关闭后，便签标题栏的删除按钮将直接执行删除，不再二次确认。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Toggle(isOn: showTodoDeleteConfirmBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("删除待办前弹出确认")
+                        Text("关闭后，待办菜单里的删除将直接执行软删。软删仍可通过\"仅已删除\"筛选恢复。")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -145,15 +162,25 @@ struct SettingsView: View {
         .padding()
     }
 
-    /// 面向 UI 的正向绑定：`true` = 删除时弹确认，`false` = 直接删除。
+    /// 便签：面向 UI 的正向绑定：`true` = 删除时弹确认，`false` = 直接删除。
     ///
-    /// 底层存储 `skipDeleteConfirm` 是反向语义（"跳过确认=true"），在这里做一次反转：
-    /// `get { !skipDeleteConfirm } / set { skipDeleteConfirm = !newValue }`。
+    /// 底层存储 `skipStickyDeleteConfirm` 是反向语义（"跳过确认=true"），在这里做一次反转：
+    /// `get { !skipStickyDeleteConfirm } / set { skipStickyDeleteConfirm = !newValue }`。
     /// 这样 Toggle 的视觉态（"开=弹提示"）和用户语义一致，且完全不需要改 StickyView 端。
-    private var showDeleteConfirmBinding: Binding<Bool> {
+    private var showStickyDeleteConfirmBinding: Binding<Bool> {
         Binding(
-            get: { !skipDeleteConfirm },
-            set: { skipDeleteConfirm = !$0 }
+            get: { !skipStickyDeleteConfirm },
+            set: { skipStickyDeleteConfirm = !$0 }
+        )
+    }
+
+    /// 待办：面向 UI 的正向绑定。与便签那套完全同构——只是 key 不同（`todo.skipDeleteConfirm`），
+    /// 这样两项偏好彼此独立、互不影响。TodoRow 的 @AppStorage 消费同一个 key，Toggle 切换会
+    /// 通过 UserDefaults 自动广播到所有打开的待办行。
+    private var showTodoDeleteConfirmBinding: Binding<Bool> {
+        Binding(
+            get: { !skipTodoDeleteConfirm },
+            set: { skipTodoDeleteConfirm = !$0 }
         )
     }
 
