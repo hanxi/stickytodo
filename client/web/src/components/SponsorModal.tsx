@@ -63,7 +63,7 @@ export default function SponsorModal({ open, onClose }: SponsorModalProps) {
         <img
           src="sponsor-qrcode.png"
           alt="赞赏码"
-          className="h-48 w-48 rounded border border-gray-200 dark:border-neutral-700"
+          className="h-64 w-64 rounded border border-gray-200 dark:border-neutral-700"
         />
       </div>
     </Modal>

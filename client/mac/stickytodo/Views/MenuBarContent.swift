@@ -4,7 +4,18 @@
 //
 //  MenuBarExtra 点开后展示的主面板。两种状态：
 //    - 未登录：提示 + 打开设置按钮
-//    - 已登录：用户名、便签总数、"新建便签"、"打开设置"、"登出"、"退出"
+//    - 已登录：用户名、便签总数、一行并排的「新建便签 + 设置」、底部「赞赏 / 登出 / 退出」
+//
+//  布局演进：
+//    - 最早：footerRow = [设置] [赞赏] [登出]  spacer  [退出]，4 个中文按钮
+//      挤在 300pt 宽的面板里，容易触发 SwiftUI 对某个 Label 做 `…` 截断。
+//    - 中间：把面板加宽到 340pt 让 4 个按钮都排开。够用但偏宽，菜单栏面板
+//      整体观感偏大。
+//    - 当前：把「设置」上移到 `authenticatedBody` 里，与「新建便签」并排共享
+//      一行（各自 `frame(maxWidth: .infinity)` 等分宽度）。footerRow 因此
+//      只剩 3 个按钮（赞赏 / 登出 / 退出），空间充裕，面板宽度回到 300pt。
+//      语义上也更合理：「新建便签」和「打开设置」都是高频主操作，放同一层级；
+//      footerRow 留给赞赏 + 账号/进程级的操作（登出 / 退出）。
 //
 //  历史查看器已迁移到 Settings → 历史 Tab，不再在菜单栏面板中提供独立入口。
 //
@@ -69,31 +80,46 @@ struct MenuBarContent: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            // 主操作：新建便签。独占一行、全宽、`.bordered` 样式（与底部
-            // 「设置 / 登出 / 退出」视觉统一）。
+            // 主操作行：「新建便签 + 设置」并排，各占一半宽度。
             //
-            // 为什么从 `.borderedProminent` 改为 `.bordered`：
-            //   `.borderedProminent` 在按下瞬间会切换到高亮填充 + 白色前景，
-            //   在浅色 / 深色模式交叉场景下会出现「文字变白对比度失衡」的观感。
-            //   `.bordered` 用半透明灰底 + 系统默认前景色，天然跟随模式反色。
-            Button {
-                // 新建便签：async API，失败只记日志（用户多数情况是网络抖动，
-                // 可再次点击按钮重试，无需打断 MenuBarExtra 面板流程）。
-                Task { @MainActor in
-                    do {
-                        _ = try await appState.addSticky()
-                    } catch {
-                        // MenuBarContent 没有独立 Logger；通过 print 落到系统日志，
-                        // AppState 的 addSticky 内部也会有 os.Logger 记录同一错误。
-                        print("[MenuBarContent] addSticky failed: \(error)")
+            // 为什么把「设置」从 footerRow 移上来：
+            //   历史上 footerRow 挤着 [设置] [赞赏] [登出] [退出] 四个中文按钮，
+            //   300pt 面板宽度下容易触发 SwiftUI 对某个 Label 做 `…` 截断。把
+            //   「设置」上移后 footerRow 只剩 3 个，空间充裕不再需要 fixedSize 挣扎。
+            //
+            // 样式统一用 `.bordered`（非 prominent）：
+            //   `.borderedProminent` 按下瞬间会切到高亮填充 + 白色前景，在浅/深
+            //   模式交叉下观感失衡。`.bordered` 用半透明灰底 + 系统默认前景色，
+            //   天然跟随模式反色。新建便签 / 设置 / 赞赏 / 登出 / 退出 全行统一。
+            HStack(spacing: 8) {
+                Button {
+                    // 新建便签：async API，失败只记日志（用户多数情况是网络抖动，
+                    // 可再次点击按钮重试，无需打断 MenuBarExtra 面板流程）。
+                    Task { @MainActor in
+                        do {
+                            _ = try await appState.addSticky()
+                        } catch {
+                            // MenuBarContent 没有独立 Logger；通过 print 落到系统日志，
+                            // AppState 的 addSticky 内部也会有 os.Logger 记录同一错误。
+                            print("[MenuBarContent] addSticky failed: \(error)")
+                        }
                     }
+                } label: {
+                    Label("新建便签", systemImage: "plus.rectangle.on.rectangle")
+                        .frame(maxWidth: .infinity)
                 }
-            } label: {
-                Label("新建便签", systemImage: "plus.rectangle.on.rectangle")
-                    .frame(maxWidth: .infinity)
+                .buttonStyle(.bordered)
+                .keyboardShortcut("n", modifiers: [.command])
+
+                // 设置按钮：占据右半宽度，与「新建便签」等分。`prominent: false`
+                // 对应 `.bordered`，与左侧按钮样式一致。
+                settingsButton(
+                    title: "设置",
+                    systemImage: "gearshape",
+                    prominent: false
+                )
+                .frame(maxWidth: .infinity)
             }
-            .buttonStyle(.bordered)
-            .keyboardShortcut("n", modifiers: [.command])
         }
     }
 
@@ -114,26 +140,38 @@ struct MenuBarContent: View {
 
     @ViewBuilder
     private var footerRow: some View {
-        HStack(spacing: 6) {
-            settingsButton(
-                title: "设置",
-                systemImage: "gearshape",
-                prominent: false
-            )
-
-            // 「赞赏」按钮。放在「设置」右边、「登出」左边；登录 / 未登录
-            // 两种状态都展示，因为赞赏入口不应依赖登录态。
-            //
-            // 视觉上用 `.tint(.pink)` 和 Web 端 `text-pink-600` 对齐，
-            // `.bordered` 保持和相邻按钮一致（避免 `.borderedProminent`
-            // 在深/浅色切换下的对比度波动，§authenticatedBody 已有说明）。
+        // footerRow 按钮：已登录 3 个 `[赞赏] [登出] [退出]`、未登录 2 个
+        // `[赞赏] [退出]`。「设置」已在 `authenticatedBody` 里与「新建便签」
+        // 并排，不再出现在这里。
+        //
+        // 为什么用 `frame(maxWidth: .infinity)` 等分宽度而不是 `fixedSize() + Spacer`：
+        //   之前一版写的是 `[赞赏] [登出]  ~Spacer~  [退出]`，视觉上前两个
+        //   挨得紧、退出被推到最右，三个按钮之间的间距肉眼就不均匀。改成
+        //   每个按钮 `frame(maxWidth: .infinity)` 等分 HStack 宽度，三个
+        //   按钮块等宽、间距完全一致，也与上面 `[新建便签] [设置]` 等分行
+        //   的风格统一，整体观感更规整。
+        //
+        // 视觉纪律（§authenticatedBody 有详述）：
+        //   footerRow 的按钮都是裸 `.bordered`（半透明灰底 + 系统默认前景），
+        //   整行视觉统一。**不要**在「赞赏」按钮上叠 `.tint(.pink)`——macOS
+        //   26 SDK 上 `.bordered + .tint(.pink)` 会把整个按钮渲染成粉红色
+        //   填充块（等价 `.borderedProminent` 的观感），与相邻的灰色按钮
+        //   严重割裂。正确做法：按钮底色保持默认，只把 **爱心图标** 染成粉色。
+        //   `.foregroundStyle(.pink)` 作用在 `Image` 上只染图标，不影响
+        //   Label 的 Text（Text 继承 Button 的默认前景色）。
+        HStack(spacing: 8) {
             Button {
                 showSponsor.toggle()
             } label: {
-                Label("赞赏", systemImage: "heart.fill")
+                Label {
+                    Text("赞赏")
+                } icon: {
+                    Image(systemName: "heart.fill")
+                        .foregroundStyle(.pink)
+                }
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .tint(.pink)
             .popover(isPresented: $showSponsor, arrowEdge: .bottom) {
                 SponsorPopover(standalone: true)
             }
@@ -143,16 +181,16 @@ struct MenuBarContent: View {
                     appState.logout()
                 } label: {
                     Label("登出", systemImage: "rectangle.portrait.and.arrow.right")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             }
-
-            Spacer()
 
             Button(role: .destructive) {
                 NSApplication.shared.terminate(nil)
             } label: {
                 Label("退出", systemImage: "power")
+                    .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .keyboardShortcut("q", modifiers: [.command])
