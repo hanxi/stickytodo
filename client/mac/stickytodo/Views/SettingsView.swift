@@ -183,12 +183,20 @@ struct SettingsView: View {
         }
     }
 
-    /// 「关于」Tab：展示产品信息、版本号、链接、版权。
+    /// 「关于」Tab：展示产品信息、版本号、链接、版权 + 支持项目入口。
+    ///
+    /// 「支持项目」Section 复用 `SponsorPopover(standalone: false)`，
+    /// 和 MenuBarContent 的爱心按钮 popover 共用一份视图代码，保证视觉与
+    /// 文案一致。`standalone: false` 让内部去掉独立 popover 的外边距和
+    /// 标题，交由外层 Section 渲染。
     @ViewBuilder
     private var aboutTab: some View {
         Form {
             Section("关于") {
                 aboutBlock
+            }
+            Section("支持项目") {
+                SponsorPopover(standalone: false)
             }
         }
         .formStyle(.grouped)

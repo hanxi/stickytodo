@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { LogOut, Moon, Plus, Sun, History as HistoryIcon } from 'lucide-react';
+import { LogOut, Moon, Plus, Sun, History as HistoryIcon, Heart } from 'lucide-react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../store/authStore';
 import { useUiStore } from '../store/uiStore';
@@ -7,6 +7,7 @@ import { api } from '../api/client';
 import { queryKeys } from '../api/queryKeys';
 import { DEFAULT_STICKY_COLOR, defaultFilter, type StickyView } from '../types/sticky';
 import HistoryView from './HistoryView';
+import SponsorModal from './SponsorModal';
 
 /**
  * 生成新便签 id。优先 crypto.randomUUID（现代浏览器原生，格式符合后端
@@ -88,6 +89,7 @@ export default function AppBar() {
   });
 
   const [showHistory, setShowHistory] = useState(false);
+  const [showSponsor, setShowSponsor] = useState(false);
 
   // 系统/手动两段切换；点击按钮时：system → dark → light → system
   const nextDark =
@@ -133,6 +135,14 @@ export default function AppBar() {
             {darkMode === 'dark' ? <Moon size={16} /> : <Sun size={16} />}
             <span className="hidden sm:inline">{darkLabel}</span>
           </button>
+          <button
+            type="button"
+            onClick={() => setShowSponsor(true)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-sm text-pink-600 hover:bg-pink-50 dark:text-pink-400 dark:hover:bg-pink-900/30"
+            title="赞赏支持"
+          >
+            <Heart size={16} /> 赞赏
+          </button>
           <div className="mx-2 h-5 w-px bg-gray-200 dark:bg-neutral-700" />
           <span className="hidden px-1 text-xs text-gray-500 sm:inline dark:text-gray-400">
             {username}
@@ -153,6 +163,7 @@ export default function AppBar() {
           onClose={() => setShowHistory(false)}
         />
       ) : null}
+      <SponsorModal open={showSponsor} onClose={() => setShowSponsor(false)} />
     </>
   );
 }

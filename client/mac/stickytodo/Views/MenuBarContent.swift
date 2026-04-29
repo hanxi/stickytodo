@@ -22,6 +22,10 @@ import SwiftUI
 struct MenuBarContent: View {
     @EnvironmentObject private var appState: AppState
 
+    /// 「赞赏」按钮弹出的 popover 可见性。爱心按钮在 footerRow，
+    /// 登录 / 未登录两种状态下都展示——赞赏入口与登录态无关。
+    @State private var showSponsor: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             headerRow
@@ -116,6 +120,23 @@ struct MenuBarContent: View {
                 systemImage: "gearshape",
                 prominent: false
             )
+
+            // 「赞赏」按钮。放在「设置」右边、「登出」左边；登录 / 未登录
+            // 两种状态都展示，因为赞赏入口不应依赖登录态。
+            //
+            // 视觉上用 `.tint(.pink)` 和 Web 端 `text-pink-600` 对齐，
+            // `.bordered` 保持和相邻按钮一致（避免 `.borderedProminent`
+            // 在深/浅色切换下的对比度波动，§authenticatedBody 已有说明）。
+            Button {
+                showSponsor.toggle()
+            } label: {
+                Label("赞赏", systemImage: "heart.fill")
+            }
+            .buttonStyle(.bordered)
+            .tint(.pink)
+            .popover(isPresented: $showSponsor, arrowEdge: .bottom) {
+                SponsorPopover(standalone: true)
+            }
 
             if appState.isAuthenticated {
                 Button(role: .destructive) {
