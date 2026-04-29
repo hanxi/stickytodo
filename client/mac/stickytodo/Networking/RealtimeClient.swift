@@ -419,10 +419,13 @@ final class RealtimeClient {
                 guard let task, task.state == .running else { return }
                 // sendPing 的 completion 只打日志；失败会反映在下一次 receive 的 error 上
                 task.sendPing { [weak self] error in
-                    if let error {
-                        Task { @MainActor in
-                            self?.logger.warning("ping failed: \(error.localizedDescription, privacy: .public)")
-                        }
+                    guard let error else { return }
+                    // 把 weak self 先绑定到本地不可变常量，避免在下面的 Task { @MainActor } 并发闭包里
+                    // 再次捕获外层 completion 闭包的可变 self（Swift 会报
+                    // "reference to captured var 'self' in concurrently-executing code"）。
+                    guard let strongSelf = self else { return }
+                    Task { @MainActor in
+                        strongSelf.logger.warning("ping failed: \(error.localizedDescription, privacy: .public)")
                     }
                 }
             }

@@ -16,16 +16,29 @@
 
 ```
 server/
-├── cmd/todo-server/main.go            # 入口：加载配置→打开 DB→路由→HTTP 优雅停机
+├── cmd/todo-server/main.go            # 入口：加载配置→打开 DB→组装 Deps→路由→HTTP 优雅停机
 ├── internal/
 │   ├── config/                        # env 解析与校验
-│   ├── model/                         # GORM 模型 + Open(AutoMigrate + WAL)
+│   ├── model/                         # GORM 模型（Todo / AuditLog / AppSecret / StickyNote）
+│   │                                  # + Open(AutoMigrate + WAL + busy_timeout + FK)
 │   ├── repository/                    # 持久层（字段白名单 + 显式 NULL 排序）
-│   ├── service/                       # auth / todo / audit 业务
-│   ├── middleware/                    # JWT 鉴权中间件
+│   ├── service/                       # auth / todo / audit / sticky 业务；
+│   │                                  # broadcaster.go 定义 EventBroadcaster interface
+│   │                                  # （nopBroadcaster 默认实现，ws.HubBroadcaster 生产实现）
+│   ├── middleware/                    # JWT 鉴权中间件（仅 auth.go）
 │   ├── handler/                       # HTTP 处理器
-│   └── router/                        # 路由与中间件装配
-├── scripts/smoke.sh                   # 真机 smoke 脚本（不依赖 jq）
+│   ├── router/                        # 路由与中间件装配（Deps + Build + corsMiddleware）
+│   ├── webui/                         # //go:embed all:dist + SPA fallback + CSP/安全头
+│   └── ws/                            # WebSocket 实时事件广播：
+│                                      # event.go（5 种事件类型常量 + close code 4401/4400）
+│                                      # hub.go（广播中枢，不做事件缓冲）
+│                                      # client.go（单连接读写 pump、ping/pong）
+│                                      # handler.go（/api/ws 的 gin.HandlerFunc + CheckOrigin）
+│                                      # adapter.go（HubBroadcaster 实现 service.EventBroadcaster）
+├── scripts/
+│   ├── smoke.sh                       # 36 步端到端冒烟；不依赖 jq，Step 33-36 跑 WebSocket 回归
+│   └── ws-probe/main.go               # WebSocket 回归探针（smoke 启动时 go build 到 mktemp）；
+│                                      # 4 种模式：no-auth / bad-token / auth-ready / wait-event
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example

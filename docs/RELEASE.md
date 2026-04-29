@@ -61,9 +61,12 @@ For hotfix rehearsals / QA hand-offs, trigger `release-branch.yml` from the Acti
 
 The workflow:
 
-1. Deletes any prior `branch-<name>` release **and** the underlying git tag (`gh release delete --cleanup-tag`).
-2. Re-runs the full `_build-all` pipeline with `prerelease: true` and a tag named `branch-<name>` (slashes in branch names are replaced with `-`).
-3. Pushes the Docker image as `docker.io/hanxi/stickytodo:branch-<name>` but **does not** update `:latest`.
+1. Deletes any prior `branch-<name>` release **and** the underlying git tag via a **3-stage fallback** in `cleanup-old-release` (see `release-branch.yml`):
+   - Stage 1 (modern `gh` ≥ 2.28): `gh release delete "$TAG" --yes --cleanup-tag` — one-shot delete of release + tag.
+   - Stage 2 (older `gh` without `--cleanup-tag`): `gh release delete "$TAG" --yes` to drop the release, then `git push --delete origin "$TAG"` to drop the tag separately.
+   - Stage 3 (first-ever run — neither release nor tag exists): each command is guarded with `|| true` / explicit `rev-parse` checks so the job still exits 0.
+2. Re-runs the full `_build-all` pipeline with `prerelease: true` and a tag named `branch-<name>` (slashes in branch names are sanitised to `-` by the bash substitution `branch-${branch//\//-}` because git tag refs can't contain `/` at arbitrary positions).
+3. Pushes the Docker image as `docker.io/hanxi/stickytodo:branch-<name>` but **does not** update `:latest` (enforced by `tag_latest: false` in the caller's `with:` block).
 
 ### Reusable workflow
 
@@ -74,7 +77,7 @@ The workflow:
 | `version`      | yes | —               | Baked into filenames + Docker tag |
 | `tag_name`     | yes | —               | Git tag the GitHub Release is bound to |
 | `prerelease`   | no  | `false`         | Marks the release as pre-release |
-| `docker_image` | no  | `docker.io/hanxi/stickytodo` | Set to empty string to skip the Docker job |
+| `docker_image` | no  | `docker.io/hanxi/stickytodo` | Set to empty string to skip the Docker job (the `detect-docker-creds` job itself is guarded by `if: inputs.docker_image != ''`, so an empty value short-circuits the whole docker path) |
 | `tag_latest`   | no  | `false`         | Also push `:latest` (only used by tag releases) |
 
 ## Required secrets
@@ -85,6 +88,15 @@ Set these in the repo's *Settings → Secrets and variables → Actions*:
 |---|---|
 | `DOCKERHUB_USERNAME` | Docker Hub login for `docker/login-action`. Leave unset to skip Docker push. |
 | `DOCKERHUB_TOKEN`    | Docker Hub access token (preferably a scoped one with `Read, Write, Delete` on `hanxi/stickytodo`). |
+
+### How the Docker job is skipped
+
+There are **two independent skip paths** — either one alone is enough to keep the image out of the registry:
+
+1. **Input-driven** (`docker_image == ''`): the caller of `_build-all.yml` passes an empty string → the `detect-docker-creds` job's job-level `if:` evaluates false → job never runs → downstream `build-docker` (which requires `needs.detect-docker-creds.outputs.have == 'true'`) is also skipped.
+2. **Secret-driven** (`DOCKERHUB_USERNAME` empty): `detect-docker-creds` runs, its inline bash emits `have=false` → `build-docker` sees `have != 'true'` and is skipped.
+
+`publish-release` uses `needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped'`, so in either skip path the GitHub Release still gets published with the server binaries + DMG attached — just without a Docker push.
 
 `GITHUB_TOKEN` is provided automatically and has `contents: write` via the `permissions:` block.
 

@@ -44,36 +44,42 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 │   ├── cmd/todo-server/       # main 入口（支持 -port / -username / -password / -version flag）
 │   ├── internal/
 │   │   ├── config/            # 环境变量解析
-│   │   ├── model/             # GORM 模型 + DB 初始化（driver 在此切换）
+│   │   ├── model/             # GORM 模型（Todo/AuditLog/AppSecret/StickyNote）+ DB 初始化（driver 在此切换）
 │   │   ├── repository/        # 数据访问层（只与 *gorm.DB 打交道）
-│   │   ├── service/           # 业务逻辑（鉴权、TODO、审计、便签）
+│   │   ├── service/           # 业务逻辑（鉴权、TODO、审计、便签）；
+│   │   │                      # broadcaster.go 定义 EventBroadcaster interface（nopBroadcaster 默认实现 + ws.HubBroadcaster 生产实现）
 │   │   ├── handler/           # Gin HTTP handler（薄层 DTO 映射）
 │   │   ├── middleware/        # 仅 auth.go（JWT）；CORS 实现在 router.go 本地函数里
 │   │   ├── router/            # 路由装配，/app 挂载 webui.Handler
-│   │   └── webui/             # go:embed dist/ → http.Handler
-│   ├── scripts/smoke.sh       # 32 步端到端冒烟脚本
+│   │   ├── webui/             # go:embed dist/ → http.Handler
+│   │   └── ws/                # WebSocket 实时事件广播：event.go / hub.go / client.go / handler.go / adapter.go
+│   ├── scripts/
+│   │   ├── smoke.sh           # 36 步端到端冒烟脚本（Step 33-36 是 WS 回归）
+│   │   └── ws-probe/main.go   # smoke.sh 启动时 go build 出来的临时 WS 探针二进制
 │   ├── Dockerfile             # 多阶段构建：web → go → distroless
 │   ├── docker-compose.yml
 │   └── .env.example
 ├── client/
 │   ├── mac/                   # macOS SwiftUI 客户端（stickytodo.xcodeproj）
 │   │   └── stickytodo/
-│   │       ├── StickyTodoApp.swift  # @main
-│   │       ├── AppState.swift       # 全局状态（登录态、API Client）
-│   │       ├── Models/              # DTO (与后端 JSON 对齐)
-│   │       ├── Networking/          # APIClient + Endpoints
-│   │       ├── Storage/             # KeychainStore (JWT)、FrameStore (窗口位置 UserDefaults)
-│   │       ├── Windows/             # 每便签一个 NSWindow 的窗口管理
-│   │       └── Views/               # SwiftUI 视图
+│   │       ├── StickyTodoApp.swift  # @main；同文件内定义 StickyWindowBridge（Combine sink 订阅 AppState）
+│   │       ├── AppState.swift       # @MainActor 全局状态：认证 + 云端 stickies + APIClient + RealtimeClient + FrameStore；WS 事件路由
+│   │       ├── Models/              # DTO（Todo / AuditLog / StickyNote / Filter；与后端 JSON 对齐）
+│   │       ├── Networking/          # APIClient（REST）+ Endpoints + RealtimeClient（/api/ws）
+│   │       ├── Storage/             # KeychainStore（JWT）+ FrameStore（窗口位置 UserDefaults key "stickytodo.frames"）
+│   │       ├── Windows/             # StickyWindowController + StickyWindowManager（每便签一 NSWindow）
+│   │       └── Views/               # 9 个文件：MenuBarContent / SettingsView（3 Tab）/ StickyView / StickyViewModel /
+│   │                                # TodoRow / DraftTodoRow / FilterEditor / HistoryView / WindowDragHandle
 │   ├── web/                   # React + Vite + Tailwind + Zustand + TanStack Query
 │   │   ├── src/
-│   │   │   ├── api/           # client.ts (fetch 封装) + queryKeys.ts
-│   │   │   ├── store/         # authStore / stickyStore / uiStore (Zustand)
-│   │   │   ├── types/         # 与后端对齐的 TypeScript DTO
-│   │   │   ├── lib/           # 格式化、色彩工具
-│   │   │   ├── components/    # AppBar / StickyCard / TodoList / …
-│   │   │   └── views/         # StickyBoard
-│   │   └── vite.config.ts     # base='/app/', dev proxy → 127.0.0.1:8080
+│   │   │   ├── api/           # client.ts（fetch 封装）+ queryKeys.ts + ws.ts（stickyWS 单例，首帧 auth 协议）
+│   │   │   ├── hooks/         # useRealtimeSync.ts（桥接 stickyWS → TanStack Query invalidate）
+│   │   │   ├── store/         # authStore + uiStore（仅两个；stickyStore 已在云端数据源重构中删除）
+│   │   │   ├── types/         # 与后端对齐的 TypeScript DTO（含 sticky.ts）
+│   │   │   ├── lib/           # color / format / stickyCodec（StickyNoteDTO ↔ StickyView）
+│   │   │   ├── components/    # AppBar / StickyCard / TodoList / HistoryView / ...
+│   │   │   └── views/         # StickyBoard + LoginView
+│   │   └── vite.config.ts     # base='/app/', dev proxy → 127.0.0.1:8080（HTTP-only，不代理 WS）
 │   └── scripts/build.sh       # macOS 客户端本地回归
 ├── scripts/                   # 打包脚本（本地可单独跑，CI 也复用）
 │   ├── package-web.sh         # 构建 web + 同步到 server/internal/webui/dist
@@ -121,7 +127,10 @@ middleware.Auth ─▶ service.AuthService (JWT 验证；不接触 gorm.DB)
 | `server/internal/middleware/auth.go` | 仅一个 `Auth(*service.AuthService)`，解析 Bearer header、注入 `actor` 到 gin.Context | 校验失败统一 401 `{"error": ...}`；别在这里加其他业务逻辑 |
 | `server/internal/webui/webui.go` | `//go:embed all:dist` + SPA fallback + CSP | 修改前读 [§3.5 embed 约定](#35-embed-约定) |
 | `server/internal/router/router.go` | 路由注册、`corsMiddleware` 本地函数、`/app` 的 GET/HEAD 301 | `/app → /app/` 必须 GET 和 HEAD 都注册；`Deps.CorsOrigins` 为空时不注入 CORS |
-| `server/scripts/smoke.sh` | 32 步端到端冒烟（HTTP 黑盒），本项目**唯一**回归工具 | 新增 API 或修改既有契约时必须同步加步骤，否则 CI 发不出来也发现不了 |
+| `server/scripts/smoke.sh` | 36 步端到端冒烟（HTTP 黑盒 + Step 33-36 WS 回归），本项目**唯一**回归工具；启动时会 `go build ./scripts/ws-probe` 到 mktemp 作为 WS 探针 | 新增 API 或修改既有契约时必须同步加步骤，否则 CI 发不出来也发现不了；新增 WS 事件类型必须在 Step 33-36 附近加 ws-probe 校验 |
+| `server/scripts/ws-probe/main.go` | `smoke.sh` 默认 `go build -o $(mktemp -d)/ws-probe ./scripts/ws-probe` 构建的 WebSocket 探针二进制；可通过导出 `WS_PROBE_BIN=/path/to/prebuilt` 环境变量复用预编译产物跳过构建（见 `smoke.sh:30` 分支）。4 种模式 `no-auth` / `bad-token` / `auth-ready` / `wait-event` 分别对应 Step 33/34/35/36；退出码 `0=pass / 1=assertion fail / 2=usage error` | 改 WS 协议帧格式（auth / ready / 事件帧）时同步改 ws-probe 的解析逻辑，否则 smoke.sh 假阳性 |
+| `server/internal/ws/event.go` | 5 种事件类型常量 + close code（`4401` / `4400`）定义；事件帧构造函数 `NewResourceEvent` / `NewDeleteEvent` | **不要**超出这 5 种事件之外新增类型；改 close code 需要同步客户端 `ws.ts` / `RealtimeClient.swift` |
+| `server/internal/service/broadcaster.go` | `EventBroadcaster` interface（权威入口）+ `nopBroadcaster` 空实现；生产实现在 `ws/adapter.go` 的 `HubBroadcaster` | 加新事件方法时 interface + nop + HubBroadcaster 三处都要加，否则 `var _ EventBroadcaster = nopBroadcaster{}` / `var _ service.EventBroadcaster = (*HubBroadcaster)(nil)` 编译兜底会报错 |
 
 ### 3.3 API 约定
 
@@ -272,13 +281,16 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 - **Storage/FrameStore**：便签窗口位置的**纯本机**持久化。key `stickytodo.frames`，value 是 `[String: CodableRect]` 的 JSON。`StickyNote` 已经不再携带 frame 字段（属于"本机 UI 偏好，不跨设备同步"）；`StickyWindowController` 的 `didMove/didResize` 回调写入这里，`StickyWindowManager.sync` 开新窗口时从这里查（未命中则用 `defaultFrame + 偏移`兜底）
 - **Windows/**：**仅两个文件**（`StickyWindowController.swift` + `StickyWindowManager.swift`）——`StickyWindowController` 负责**单个**便签窗口（`window.level = .floating` 实现桌面置顶、`init(note:initialFrame:contentBuilder:)` 签名——frame 由 Manager 从 FrameStore 查出后注入，不从 note 读；把 SwiftUI `StickyView` 注入 `NSHostingView`）；`StickyWindowManager` 负责**多个**窗口集合，`init(frameStore:contentBuilder:)` 注入 FrameStore，按 sticky id 建立窗口，新增/关闭便签时增删对应 `NSWindow`。⚠️ `StickyWindowBridge` **不在** Windows/ 目录下，而是定义在 `StickyTodoApp.swift` 同文件内（`final class StickyWindowBridge: ObservableObject`），作为 App 与 WindowManager 的响应式桥梁；Bridge 的三个回调（`onNewSticky` / `onCloseSticky` / `onNoteChange`）都把 `appState.addSticky/removeSticky/updateSticky` 的 async API 包成 `Task { @MainActor do-catch }` 调用。**订阅机制**：`attach(appState:)` 通过 `import Combine` 的 `appState.$stickies.sink(...)` / `appState.$isAuthenticated.sink(...)` 订阅两个 `@Published` 源，cancellable 持有在 Bridge 自身——**不能**改用 SwiftUI 的 `.onChange` 挂在 `MenuBarExtra { } ` 内部，因为 MenuBarExtra 面板未展开时子树未挂载，`.onChange` 不求值，会导致便签被另一端通过 WS 删除/新增后本机窗口不同步，直到用户点开菜单栏才 catch up（历史 bug）
 - **Views/**（共 9 个文件）：
-  - `MenuBarContent.swift`：菜单栏点出的主面板（登录/新建/退出入口）。"新建便签"按钮通过 `Task { try? await appState.addSticky() }` 调用 async API
-  - `StickyView.swift`：单个便签的 SwiftUI 根视图；用 `@StateObject private var viewModel: StickyViewModel` 持有业务逻辑。`onCloseSticky` / `onNoteChange` 回调签名里的 sticky id 类型是 `String`（不是 UUID）
+  - `MenuBarContent.swift`：菜单栏点出的主面板。**当前布局三段**：①`headerRow`——品牌标题 + 已登录时在尾部展示用户名；②中段 `authenticatedBody` / `unauthenticatedBody`——已登录时只有**一个**「新建便签」按钮（独占一行、全宽、**`.bordered` 样式**，绑定 `⌘N`。从 `.borderedProminent` 改 `.bordered` 的原因代码注释已写：prominent 按下会切成高亮填充 + 白色前景，深浅色交叉下观感失衡）；未登录时展示一段"尚未登录。请在『设置』中配置服务器地址并登录。"提示 + 一个 **`.borderedProminent`** 样式的「打开设置」按钮；③`footerRow`——无论是否登录都挂在底部：`[设置] [登出（仅已登录）] [退出 ⌘Q]`，其中「退出」是 `.destructive`。**历史入口已整体迁移到 `SettingsView` 的「历史」Tab，MenuBarContent 里不再有「历史」按钮**（文件头注释明确写着"历史查看器已迁移到 Settings → 历史 Tab"）。新建便签的失败路径仅 `print("[MenuBarContent] addSticky failed: ...")`，不弹 alert
+  - `StickyView.swift`：单个便签的 SwiftUI 根视图；用 `@StateObject private var viewModel: StickyViewModel` 持有业务逻辑。`onCloseSticky` / `onNoteChange` 回调签名里的 sticky id 类型是 `String`（不是 UUID）。错误呈现靠 `.alert(item: $viewModel.currentError)`，由 ViewModel 的 `@Published var currentError: StickyViewError?` 驱动
   - `StickyViewModel.swift`：`final class StickyViewModel: ObservableObject`，承载单个便签的 TODO 列表、加载状态、错误态（`StickyViewError: Identifiable, Equatable`）等 `@Published` 字段；由 `StickyView` own 其生命周期。**在 `init` 里订阅 4 个 NotificationCenter 事件**（`.stickyTodoCreated/Updated/Deleted/.stickyRealtimeReconnected`），任一事件到来都触发 `scheduleDebouncedRefresh`（300ms 窗口合并多事件为一次 `refresh()`）。observer tokens 用 `nonisolated(unsafe)` 存储以便 `deinit` 能 remove
-  - `SettingsView.swift`：`⌘,` 打开的设置页（服务端地址 + 账号密码）
+  - `SettingsView.swift`：`⌘,` 打开的 Settings Scene，**标准 macOS Preferences 风格的 `TabView`**，固定尺寸 `520×420`（在 `body` 上 `.frame(width: 520, height: 420)`），共 **3 个 Tab**：
+      - 「设置」（`generalTab`）：服务器 Base URL 表单（`urlDraft` + 合法性状态 `URLValidationState`，「保存地址」会把 `http://` 自动前缀补全 + 「测试连接」→ `GET /health` + 绿色/红色结果文案）+ 账号表单（未登录→用户名/密码登录；已登录→展示账号 + 登出）
+      - 「历史」（`historyTab`）：已登录时嵌入 `HistoryView(mode: .global, apiClient: appState.apiClient, embedded: true)`（`embedded: true` 会让 HistoryView 不渲染自己的「关闭」按钮，由外层 Settings 窗口统一关闭）；**未登录时**展示锁图标 + 文案「请先在『设置』Tab 登录后查看历史」的占位视图
+      - 「关于」（`aboutTab`）：`Form + formStyle(.grouped)` 风格，内嵌 `aboutBlock`，展示品牌信息、版本号（来自 Info.plist 的 `CFBundleShortVersionString` / `CFBundleVersion`）、Bundle ID、项目链接
   - `TodoRow.swift` / `DraftTodoRow.swift`：已存 TODO / 新建草稿 TODO 的行组件
   - `FilterEditor.swift`：便签绑定的筛选条件编辑器
-  - `HistoryView.swift`：变更历史 / 审计日志弹窗
+  - `HistoryView.swift`：变更历史 / 审计日志视图。**两种展示模式**由 `Mode` enum 区分（`.todo(id:title:)` / `.global`）；另有一个 `embedded: Bool = false` 开关——`false`（默认）以独立 `.sheet` 形式弹出、顶部渲染「关闭」按钮（依赖 `@Environment(\.dismiss)`）；`true`（嵌入 Settings TabView）时顶部不渲染关闭按钮，由外层 Settings 窗口统一关闭
   - `WindowDragHandle.swift`：便签顶部不可见的拖动区（便签窗口 `styleMask = [.borderless, .resizable, .fullSizeContentView]`，**无系统标题栏**，靠这里拖动）
 - **Models/**（共 4 个，与后端 `models.go` + `types/api.ts` 一一对应）：`Todo.swift` / `AuditLog.swift` / `StickyNote.swift` / `Filter.swift`。`StickyNote.id: String`（客户端生成 UUID 字符串，由 `StickyNote.newID()` 产出）；**不包含 frame 字段**
 - **StickyTodoApp.swift**：`@main` 入口，持有**两个** `@StateObject`：
@@ -287,11 +299,11 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
   - body 只有两条 Scene：`MenuBarExtra { MenuBarContent() } label: { Image(systemName: "note.text") }.menuBarExtraStyle(.window)` 和 `Settings { SettingsView() }`；`Image(systemName:)` 走 SF Symbols，缺了 `systemName:` 会去 Asset Catalog 找同名图片。`.menuBarExtraStyle(.window)` 决定了点菜单栏图标弹出的是一个**浮窗**而非系统菜单
   - ⚠️ **这里绝对不能把"`appState.stickies` / `isAuthenticated` 变化 → 调 `windowBridge.syncWindows`"写成 SwiftUI 的 `.onChange` 挂在 `MenuBarExtra { }` 内部**——菜单栏面板未展开时整个子树不挂载、`.onChange` 不求值，会导致 WS 推送的 sticky 增删不能实时驱动桌面便签窗口更新。Bridge 用 Combine sink 自主订阅即可，StickyTodoApp.body 里**不需要**任何 onChange
 
-快捷键（均在菜单栏面板展开时生效）：
+快捷键：
 
-- `⌘,` 打开设置：SwiftUI `Settings` Scene 自带的系统级快捷键，代码里没有也不需要手动 `.keyboardShortcut(",")`
-- `⌘N` 新建便签（`MenuBarContent.swift` 显式绑定 `.keyboardShortcut("n", modifiers: [.command])`）
-- `⌘Q` 退出应用（`MenuBarContent.swift` 显式绑定，`role: .destructive`）
+- `⌘,` 打开设置：SwiftUI `Settings` Scene 自带的系统级快捷键，App 激活时即可命中，**不依赖菜单栏面板是否展开**；代码里没有也不需要手动 `.keyboardShortcut(",")`。macOS 14+ 走 `SettingsLink`，13 回退到 `NSApp.sendAction(#selector(showSettingsWindow:))`
+- `⌘N` 新建便签（`MenuBarContent.swift` 显式绑定 `.keyboardShortcut("n", modifiers: [.command])`，**仅在菜单栏面板展开时命中**；面板折叠时响应链上没有这个按钮）
+- `⌘Q` 退出应用（`MenuBarContent.swift` 显式绑定 `.keyboardShortcut("q", modifiers: [.command])`，按钮内部调用 `NSApplication.shared.terminate(nil)`；**仅在菜单栏面板展开时命中**）。**云端数据源重构后，进程退出不再需要 `willTerminate → flushStickiesSave`**——便签数据已是服务端权威，窗口位置由 `StickyWindowController` 的 `didMove` / `didResize` 在每次触发时同步 `frameStore.save(...)` 到 UserDefaults，`save` 方法无缓冲
 
 ---
 
@@ -349,14 +361,21 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 任何一次改动后都应从仓库根执行以下两条命令，均以退出码 0 结束：
 
 ```bash
-# 1) 后端端到端冒烟（32 步，覆盖 /health、login、todo CRUD、complete、reopen、
-#    history、tags、软删、恢复、audit、sticky-notes CRUD、401 & 400 & 404 分支）
-#    前置：另起终端 `cd server && export TODO_USERNAME=admin TODO_PASSWORD=change-me-please && go run ./cmd/todo-server`
-#    （server/.env.example 里示例值 TODO_PASSWORD=change-me-please；smoke.sh 的账号必须与 server 启动时一致）
+# 1) 后端端到端冒烟（36 步，覆盖 /health、login、todo CRUD、complete、reopen、
+#    history、tags、软删、恢复、audit、sticky-notes CRUD、401 & 400 & 404 分支，
+#    以及 Step 33-36 的 WebSocket 回归：
+#      Step 33: /api/ws 未在 2s 内发 auth 帧 → close 4401
+#      Step 34: auth with invalid token → close 4401
+#      Step 35: auth with valid token → 收到 {"type":"ready"} 帧
+#      Step 36: REST 触发 POST /api/todos → ws-probe 确认收到 todo.created 实时推送）
+#    脚本启动时会 `go build ./scripts/ws-probe` 产出一个临时 WS 探针二进制。
+#    前置：另起终端 `cd server && export TODO_USERNAME=admin TODO_PASSWORD=test123 && go run ./cmd/todo-server`
+#    （smoke.sh 的账号默认回退值是 TODO_USERNAME=admin / TODO_PASSWORD=test123，必须与 server 启动时一致；
+#     .env.example 里的示例 TODO_PASSWORD=change-me-please 是 Docker 部署时改密用途，与本地 smoke 用的默认值不同）
 #    （server/.env.example 里的 TODO_DATA_DIR=/data 是容器内路径，本地 `go run` 不要 source 它）
 BASE_URL=http://127.0.0.1:8080 \
   TODO_USERNAME="${TODO_USERNAME:-admin}" \
-  TODO_PASSWORD="${TODO_PASSWORD:-change-me-please}" \
+  TODO_PASSWORD="${TODO_PASSWORD:-test123}" \
   ./server/scripts/smoke.sh
 
 # 2) macOS 客户端 Xcode clean + build（Debug；ad-hoc 签名，仅本机可运行）

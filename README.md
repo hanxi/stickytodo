@@ -13,6 +13,8 @@
 - TODO 增删改 / 完成 / 软删除 / 恢复
 - 单条 TODO 变更历史 + 全局操作审计日志
 - 多便签：Web 网格布局 / macOS 每便签一窗，支持独立筛选、颜色、置顶
+- **跨端实时同步**（WebSocket `/api/ws`）：在任一端（浏览器 / macOS 客户端）新建、修改、删除一条 TODO 或便签，其他已登录在线的客户端会在 ~300ms 去抖窗口后自动刷新（客户端侧去抖窗口 + 服务端 hub 即时广播），无需手动按刷新；网络断连后自动指数退避重连并全量拉取
+- 便签本身**跨端同步**（服务端是唯一数据源）；macOS 端的便签**窗口位置**仅保存在本机 UserDefaults，不跨端同步（浏览器"便签"本质是 Card 也不需要位置）
 - 后端单二进制部署，Web UI 通过 `go:embed` 内嵌，零额外静态资源
 
 ## 前置依赖
@@ -106,9 +108,13 @@ Windows 直接双击 `.exe` 即可；`chmod +x` 和 `xattr` 两步仅 Unix 平�
 open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 ```
 
-**首次使用**：应用以菜单栏图标 `note.text` 常驻（无 Dock 图标）。点图标 → 「打开设置」（⌘,）→ 填服务端地址（如 `http://127.0.0.1:8080`）和账号密码 → 回到面板点「新建便签」（⌘N）。
+**首次使用**：应用以菜单栏图标 `note.text` 常驻（无 Dock 图标）。点图标 → 「打开设置」（⌘,）进入 Settings 窗口。**Settings 是 3 Tab 的 macOS Preferences 风格面板**：
 
-更多操作 / 快捷键见 [client/mac/README.md](./client/mac/README.md)。
+- 「设置」Tab：填服务端地址（如 `http://127.0.0.1:8080`，可选点「测试连接」验证 → `GET /health`）→ 登录
+- 「历史」Tab：登录后查看**全局**审计日志（菜单栏面板里已不再有「历史」按钮，全局入口只在此处）。单条 TODO 的变更历史仍可通过便签窗口内 TODO 行末尾的 `⋯` 菜单 →「历史」以 sheet 形式打开，作用域仅该条
+- 「关于」Tab：版本号 / Bundle ID / 项目链接
+
+登录后回到菜单栏面板点「新建便签」（⌘N）即可。更多操作 / 快捷键见 [client/mac/README.md](./client/mac/README.md)。
 
 ## 配置项
 
@@ -124,7 +130,7 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 | `TODO_TOKEN_TTL` | ❌ | `24h` | server | JWT 有效期（Go `time.Duration` 格式） |
 | `TODO_CORS_ORIGINS` | ❌ | 空（不注入 CORS 中间件） | server | 允许的 Origin allowlist，逗号分隔（精确匹配）；特殊值 `*` 代表放行任意源（见 `.env.example` 注释） |
 | `TODO_GIN_MODE` | ❌ | `release` | server | `debug` / `release` / `test` |
-| `TODO_VERBOSE` | ❌ | `false` | server | 打开更详细的请求日志（GORM info 级别） |
+| `TODO_VERBOSE` | ❌ | `false` | server | 打开更详细的请求日志（GORM info 级别）。合法取值：`1/true/yes/on/t/y`（true 集）或 `0/false/no/off/f/n`（false 集），大小写不敏感；非法值**启动时直接报错退出**（`config.go#parseBoolEnv`） |
 
 ## 文档索引
 
