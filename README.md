@@ -140,6 +140,21 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 - [client/web/README.md](./client/web/README.md)：Web 客户端架构、本地开发、embed 约定
 - [docs/RELEASE.md](./docs/RELEASE.md)：本地打包命令、CI 发布流程、所需 secrets
 
+## 💖 支持项目
+
+如果这个项目对你有帮助，欢迎通过以下方式支持：
+
+### ⭐ Star 项目
+点击右上角的 ⭐ Star 按钮，让更多人发现这个项目。
+
+### 💰 赞赏支持
+- [💝 爱发电](https://afdian.com/a/imhanxi) - 持续支持项目发展
+- 扫码请作者喝杯奶茶 ☕
+
+<p align="center">
+  <img src="https://i.v2ex.co/7Q03axO5l.png" alt="赞赏码" width="300">
+</p>
+
 ## License
 
 MIT
