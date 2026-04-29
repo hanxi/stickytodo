@@ -324,7 +324,7 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 |---|---|---|---|---|
 | `package-web.sh` | `client/web/dist/` + 同步到 `server/internal/webui/dist/` | Node.js、npm | ❌ 不读，固定构建静态产物 | ✅ `build-web` job |
 | `package-server.sh` | `dist/server/stickytodo-server-<ver>-<os>-<arch>[.exe]` × 7 + 汇总 `SHA256SUMS` | Go、跑过 `package-web.sh` | ✅ 默认 `dev`，通过 `-ldflags -X main.version=` 注入到 `/health` | ✅ `build-server` job |
-| `package-mac-client.sh` | `dist/mac-client/stickytodo-<ver>-macos-universal.dmg`（**或** `--skip-dmg` 时 fallback 成 `stickytodo-<ver>-macos-universal.app.zip`）+ 汇总 `SHA256SUMS`；**注意**发布文件名带版本，但 **DMG / zip 内部的 `.app` bundle 恒为 `stickytodo.app`**（不带版本），这是用户拖到 `/Applications` 后在 Launchpad / Dock 里看到的名字，必须是干净品牌名。DMG 卷标（双击 DMG 后 Finder 窗口标题）为 `stickytodo <ver>` | Xcode **26.x**（完整 IDE）；CI 用 `macos-latest` runner **自带的默认 Xcode**（当前 runner 镜像上是 26.3.0），不再通过 `setup-xcode@v1` 强制锁版本，详见 §5.2 与 §7.7；DMG 打包优先 `create-dmg`（`brew install create-dmg`），缺失时 fallback 到系统自带 `hdiutil` | ✅ 默认 `dev`，**仅用于发布文件名 + DMG 卷标**，不改 App 内的 `CFBundleShortVersionString`，也不改 `.app` bundle 文件名 | ✅ `build-mac-dmg` job |
+| `package-mac-client.sh` | `dist/mac-client/stickytodo-<ver>-macos-universal.dmg`（**或** `--skip-dmg` 时 fallback 成 `stickytodo-<ver>-macos-universal.app.zip`）+ 汇总 `SHA256SUMS`；**注意**发布文件名带版本，但 **DMG / zip 内部的 `.app` bundle 恒为 `stickytodo.app`**（不带版本），这是用户拖到 `/Applications` 后在 Launchpad / Dock 里看到的名字，必须是干净品牌名。DMG 卷标（双击 DMG 后 Finder 窗口标题）为 `stickytodo <ver>` | Xcode **26.4.x**（完整 IDE）；CI 用 `runs-on: macos-26`（**不是** `macos-latest`——后者 YAML label 目前指向 macos-15-arm64，上面根本没装 Xcode 26.x）+ `maxim-lobanov/setup-xcode@v1` **显式锁 Xcode 到 `26.4.1`**（与本机 26.4 同 `macosx26.4` SDK）。详见 §5.2 与 §7.7；DMG 打包优先 `create-dmg`（`brew install create-dmg`），缺失时 fallback 到系统自带 `hdiutil` | ✅ 默认 `dev`，**仅用于发布文件名 + DMG 卷标**，不改 App 内的 `CFBundleShortVersionString`，也不改 `.app` bundle 文件名 | ✅ `build-mac-dmg` job |
 | `package-docker.sh` | 本地 Docker 镜像（当前平台单架构，不跨平台，`docker build` 而非 `docker buildx build`）| Docker daemon | ✅ 默认 `dev`，也作为镜像 tag | ❌ **CI 不调用**，CI 用 buildx 直推多架构 manifest |
 
 脚本之间的依赖关系：
@@ -342,7 +342,7 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 - **`_build-all.yml`**（`on: workflow_call`）：reusable workflow，输入 `version` / `tag_name` / `prerelease` / `docker_image` / `tag_latest`，包含 6 个 job：
   1. `build-web`
   2. `build-server`（矩阵：linux × amd64/arm64/armv7、darwin × amd64/arm64、windows × amd64/arm64）
-  3. `build-mac-dmg`（`macos-latest` runner（当前指向 `macos-26` / macOS Tahoe，自带 Xcode 26.3.0）+ `brew install create-dmg || true` + `package-mac-client.sh`）。**关于 Xcode 版本**：**当前不通过 `setup-xcode@v1` 锁版本**，直接走 runner 自带默认 Xcode。曾尝试锁到 26.4，但 runner 镜像预装 Xcode 最高只有 26.3.0，setup-xcode action 直接报 `Could not find Xcode version that satisfied version spec: '26.4'` 失败。跨 SDK 的 SwiftUI `.buttonStyle(.bordered)` 默认外观差异（便签加号按钮白底 vs 灰底）已经在 `StickyView.swift` 用 `.tint(.secondary)` + `.controlSize(.small)` 显式钉死覆盖，不再依赖 SDK 默认，所以不锁也能产出与本机一致的视觉。详见 §7.7
+  3. `build-mac-dmg`（`runs-on: macos-26` runner——**明确不是** `macos-latest`，因为 runner-images 主 README 明载 `macos-latest` YAML label 当前指向 `macos-15-arm64`（macOS 15.7.x + Xcode 16.x 系列），那上面根本没有 macOS 26 SDK，和本机 Xcode 26.4 无法对齐；而 `macos-26` 是 macOS 26 Tahoe arm64 runner，`xcode-select -p` 默认指 `Xcode_26.2.app`、但预装列表里还有 26.5 beta / 26.4.1 / 26.3 / 26.1.1 / 26.0.1。`+ maxim-lobanov/setup-xcode@v1 xcode-version: '26.4.1'` 显式切到 `macosx26.4` SDK（字面量 `26.4.1` 在预装列表里精确匹配 `/Applications/Xcode_26.4.1.app`，其 symlink `Xcode_26.4.app` 同样存在；setup-xcode 其实支持 SemVer，写 `26.4` 也能解析到同一目标，字面量只是零歧义） + `brew install create-dmg || true` + `package-mac-client.sh`）。**为什么必须锁 Xcode 而非依赖 macos-26 runner 的默认 26.2**：macOS 26.2 SDK 和本机的 macOS 26.4 SDK 在 SwiftUI `.buttonStyle(.bordered)` 的默认填充基色上不等价——便签加号按钮在 macosx26.2 SDK 下编译出来是**白底**、在 macosx26.4 SDK 下是**灰底**。源码层在 `StickyView.swift` 里加的 `.tint(.secondary)` + `.controlSize(.small)` 是第二道防线（当未来锁定版本因镜像轮转失效时兜底），CI 侧锁 SDK 才是根本解。详见 §7.7
   4. `detect-docker-creds`（只有 3 行：读 `secrets.DOCKERHUB_USERNAME` 是否非空，输出 `have=true/false`；存在是因为 `secrets.*` 不能直接用在 `if:` 表达式里）
   5. `build-docker`（`needs: [build-web, detect-docker-creds]`、`if: needs.detect-docker-creds.outputs.have == 'true'`，用 `docker/setup-qemu-action` + `docker/setup-buildx-action` 推 `linux/amd64,linux/arm64,linux/arm/v7` 多架构）
   6. `publish-release`（`needs: [build-server, build-mac-dmg, build-docker]`；条件是多行 `if:` 表达式，容忍 `build-docker` 在没 secrets 时被 `skipped`，但 server / mac 任一失败仍会中止；用 `softprops/action-gh-release@v2` 把 `build-server` / `build-mac-dmg` 的 artifact 挂到 Release）
@@ -464,23 +464,57 @@ cd server && go run ./cmd/todo-server
 
 ### 7.7 macOS 客户端 Xcode / SDK 版本一致性
 
-**当前策略**：CI `build-mac-dmg` job **不锁 Xcode 版本**，直接使用 `macos-latest` runner 镜像自带的默认 Xcode（写作本章时是 **26.3.0**，Xcode 根随镜像每周更新漂移）；维护者本机为 Xcode 26.4（macOS 26.4 Tahoe）。两端 Xcode 次要版本号不完全一致是**可接受的**，详见下方说明。
+**当前策略（双保险）**：
 
-**决策历史**：
+1. **CI 侧锁 runner + 锁 Xcode 版本**：`_build-all.yml` 的 `build-mac-dmg` job
+   - `runs-on: macos-26`（**不是** `macos-latest`）
+   - `maxim-lobanov/setup-xcode@v1` + `xcode-version: '26.4.1'`，使用 `macosx26.4` SDK
+2. **源码侧显式 modifier**：`Views/StickyView.swift` 的便签加号按钮（`titleBar` 内）追加 `.tint(.secondary)` + `.controlSize(.small)`——作为 SDK 漂移的第二道防线，即使未来不得不临时降级到 26.3 SDK 时仍能保住基本外观
 
-1. **老策略（`macos-14` + Xcode 15.4）**：CI 和本机 Xcode 主版本不同，SwiftUI `.buttonStyle(.bordered)` 的默认外观填充差异明显——便签加号按钮在 CI DMG 里是**白底**、本机 Debug 是**浅灰底**。典型的"跨 SDK 视觉漂移"
-2. **中间尝试：用 `maxim-lobanov/setup-xcode@v1` 锁到 26.4**：想同时解决 runner 默认版本漂移 + 两端 Xcode 对齐两件事。但 runner 镜像 2026-04 当前预装 Xcode 最高只到 26.3.0，action 直接以 `Could not find Xcode version that satisfied version spec: '26.4'` 失败（见 `_build-all.yml` 该 job 的注释）
-3. **当前：不锁 Xcode + 在源码层显式钉死外观参数**：放弃"锁 Xcode 版本"这条纪律，改用"关键控件不依赖 SDK 默认外观"来防漂移。具体：便签加号按钮（`Views/StickyView.swift` 的 `titleBar` 内）显式追加 `.tint(.secondary)` + `.controlSize(.small)`，让按钮填充与尺寸档位不依赖 SDK 默认
+**关键事实（决策前请先读这段；别再凭印象猜了）**：
 
-**为什么现在可以不锁**：跨 Xcode 26.x 次要版本（26.0/26.1/26.3/26.4）的 SDK 变化远小于 Xcode 15 → 26 那种主版本跳跃，同时所有曾踩过坑的控件都已经手工加了显式 modifier。只要 runner 默认 Xcode ≥ 26.0（macOS 26 SDK），产物视觉就应和本机一致。
+- **`macos-latest` 不是"最新 macOS"**。runner-images 主 README（`https://github.com/actions/runner-images` 的 "Available Images" 表）当前明载：
+  - macOS 15 Arm64 → YAML label `macos-latest`, `macos-15`, `macos-15-xlarge`
+  - macOS 26 Arm64 → YAML label `macos-26`, `macos-26-xlarge`（**和 `macos-latest` 是两个不同的镜像，互不相关**）
+  
+  GitHub Actions 的 `-latest` label 迁移非常保守，2025-08 才从 macos-14 迁到 macos-15，macOS 26 目前不会被自动收编为 `-latest`。想用 macOS 26 SDK 就必须显式写 `runs-on: macos-26`
+- **`macos-26` runner 的 Xcode 预装列表**（截至本节写就时，来自 `images/macos/macos-26-arm64-Readme.md` 的 `### Xcode` 表；如果 runner 镜像升级了，请以 readme 为准）：
+  - 26.5 (beta) → `/Applications/Xcode_26.5_beta_2.app`（symlinks: `Xcode_26.5.0.app` / `Xcode_26.5.app`）
+  - **26.4.1** → `/Applications/Xcode_26.4.1.app`（symlink: **`Xcode_26.4.app`**，即裸 `26.4` 也是合法字面量）
+  - 26.3 → `/Applications/Xcode_26.3.app`
+  - **26.2 (default)** → `/Applications/Xcode.app`（`xcode-select -p` 默认指这里，但**这是 macos-26 runner 的默认，不是 macos-latest 的**）
+  - 26.1.1、26.0.1 等
+- **setup-xcode@v1 的版本匹配规则**：官方 README（`https://github.com/maxim-lobanov/setup-xcode`）明载支持 **SemVer**，例如 `16`、`16.4`、`26.3`、`^16.2.0` 都合法；不是"必须精确字面量"。但字面量（如 `26.4.1`）在 workflow yaml 里更醒目、升级时一眼能看出改了哪一版，所以仍推荐字面量
+- 维护者本机 Xcode 26.4（macOS 26.4 Tahoe），对应 SDK `macosx26.4`——这是和 `runs-on: macos-26` 上 `Xcode_26.4.1.app` 一致的目标 SDK
+
+**决策历史**（每一步都要写清"为什么上一步不够"，避免后人重复踩坑）：
+
+1. **阶段 1（`macos-14` + Xcode 15.4）**：CI 和本机 Xcode 跨主版本，SwiftUI `.buttonStyle(.bordered)` 默认外观填充差异明显——便签加号按钮在 CI DMG 里是**白底**、本机 Debug 是**浅灰底**。典型跨 SDK 视觉漂移
+2. **阶段 2（尝试：`runs-on: macos-latest` + `setup-xcode 26.4`）**：**本阶段基于多个错误前提**：
+   - 错 ①：以为 `macos-latest` 指向 macos-26 runner（实际指向 macos-15-arm64，上面完全没有 Xcode 26.x）
+   - 错 ②：以为 setup-xcode "必须精确字面量匹配"（实际支持 SemVer）
+   
+   失败日志：`Could not find Xcode version that satisfied version spec: '26.4'`。**真正原因**是 macos-15-arm64 runner 上就没装任何 Xcode 26.x，setup-xcode 在 `/Applications/` 下找不到任何能满足 `26.4` 的 app bundle——和字面量/SemVer 无关
+3. **阶段 3（尝试：`runs-on: macos-latest` + 不锁 Xcode + 只靠源码层 `.tint(.secondary)` + `.controlSize(.small)`）**：误把问题归因到"runner 默认 Xcode 和本机只差一点"，想靠源码层兜底。实测 CI 产出的加号仍是白底、本机灰底。**真正原因**依然是 `macos-latest` = macos-15 runner 根本没有 macOS 26 SDK，产物其实是 macOS 15 SDK（Xcode 16.x）编出来的，和本机 macOS 26.4 SDK 跨了整整一个主版本——源码层 modifier 覆盖不住这么大的 SDK 差
+4. **阶段 4（当前：`runs-on: macos-26` + `setup-xcode 26.4.1` + 保留源码层 modifier）**：真正把 runner 从 macos-15 切到 macos-26（这才有 macOS 26 SDK 可选），再锁 Xcode 26.4.1 对齐本机。锁 runner + 锁 Xcode = 第一道防线（SDK 对齐），源码层 modifier = 第二道防线
+
+**如何升级 / 调整锁定的 Xcode 版本**：
+
+1. 打开 `https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md`（如果目标是 macos-27 GA，就去 `macos-27-arm64-Readme.md`），找到 `### Xcode` 的表格
+2. 从表格挑一个**字面量**——可以是主版本号（`26.5`）或完整修订号（`26.4.1`）；由于 setup-xcode 支持 SemVer，如果想写 `26.4` 也合法（会解析到 `Xcode_26.4.1.app` 的 symlink）。不过推荐字面量完整版本号（`26.4.1`）以便一眼看出和本机对齐的是哪个修订
+3. 同时改 3 处（全部改完才算一次升级完整）：
+   - `.github/workflows/_build-all.yml` 的 `- name: Select Xcode ...` step 的 `xcode-version` 字面量
+   - `.github/workflows/_build-all.yml` 的 `build-mac-dmg` 注释块里"预装列表"的版本号快照
+   - 本文档 §5.1 表格的 `package-mac-client.sh` 那行、§5.2 `build-mac-dmg` 描述、本节（§7.7）的 "当前策略" + "关键事实" 两处版本号
+4. 如果 runner 镜像本身要升（比如 macOS 27 GA 后想迁到 macos-27），那还要把 `runs-on` 同步改，且 §7.7 的"关键事实"段落里的 runner-images README 引用也要改
 
 **仍然要守的纪律**：
 
-1. **关键按钮的显式 modifier 不能删**。当前至少 `StickyView.swift` 的加号按钮依赖 `.tint(.secondary)` + `.controlSize(.small)`，不要为了"代码简洁"把它们拿掉——一旦 runner Xcode 默认版和本机分叉，视觉分歧会立刻回归。未来如果发现 `MenuBarContent.swift` / `SettingsView.swift` 里的 `.bordered` / `.borderedProminent` / `.menuStyle(.borderlessButton)` 在 CI 产物里和本机不一致，第一反应应是**给它们也加显式外观 modifier**，不是回头锁 Xcode
-2. **不要主观升级本机 Xcode 到比 runner 高太多**。runner 镜像更新大约每 2-3 周一次；维护者本机和 runner 的 Xcode 主版本号应保持一致（都 26），次要版本差距 ≤ 2 个点位以内。偏差超过就人工抽检一次 CI 产物 DMG
-3. **若未来 CI 产物又出现视觉漂移**（例如 Xcode 27 发布后 runner 优先更新、而本机还没升），回退策略有两个，**按优先级**：
-   - **优先**：继续在源码层对涉事控件追加显式 modifier（最稳）
-   - **其次**：才考虑在 `_build-all.yml` 的 `build-mac-dmg` job 里恢复 `setup-xcode@v1`，但必须先 `gh api /repos/actions/runner-images/contents/images/macos` 或看 runner 镜像 release note 确认要锁的版本确实预装了，再写到 `xcode-version` 里，否则会重蹈"26.4 找不到"的覆辙
+1. **`runs-on` 必须显式写 `macos-26`，绝不能改回 `macos-latest`**。已经踩过两次坑，`-latest` 不等于"最新 macOS"。即使未来 `macos-latest` 有一天迁到 macos-26 了，也要等迁移稳定、且本文档确认过之后才能改
+2. **CI 侧的 `setup-xcode` step 不能删**。只依赖 runner 默认 Xcode（`macos-26` 默认是 26.2）会与本机 26.4 跨两个次要版本，`.buttonStyle(.bordered)` 的填充基色会漂
+3. **源码层的显式 modifier 也不能删**。当前至少 `StickyView.swift` 的加号按钮依赖 `.tint(.secondary)` + `.controlSize(.small)`。未来如果发现 `MenuBarContent.swift` / `SettingsView.swift` 里的 `.bordered` / `.borderedProminent` / `.menuStyle(.borderlessButton)` 在 CI 产物和本机有分歧，第一反应应是**再给它们也加显式外观 modifier**
+4. **本机 Xcode 不要比 CI 锁的版本超前太多**。当前约束：本机 Xcode 主次版本 ≤ 锁定版本的主次版本 + 1。例如锁 26.4.1，本机用 26.4 / 26.5 都可接受；本机升到 27.x 就必须先把 CI 锁定版同步升级（前提：runner 预装列表里有对应字面量），否则 CI 和本机再次跨 SDK 漂移
+5. **runner 镜像更新后的抽检**：runner-images 大约每 2-3 周 release 一次，有时会在 minor release 里轮转掉老 Xcode。建议每月手动跑一次 `release-branch` workflow，挂载产出的 DMG、肉眼看一眼加号 / 其它关键按钮的外观；如果发现 setup-xcode step 开始报 `Could not find Xcode version` 错误，立刻到 runner-images readme 里查最新预装列表，按上面"如何升级"的流程更新
 
 ---
 
