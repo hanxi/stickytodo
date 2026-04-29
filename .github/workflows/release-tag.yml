@@ -10,6 +10,15 @@ on:
     tags:
       - 'v*'
 
+# Reusable workflows inherit permissions from the caller, and the inherited
+# set cannot exceed what the caller itself declares. _build-all.yml needs
+# `contents: write` (softprops/action-gh-release uploads assets + creates the
+# Release), so we must grant it here too — otherwise GitHub rejects the call
+# with "requesting 'contents: write', but is only allowed 'contents: read'".
+# Keep this in sync with release-branch.yml.
+permissions:
+  contents: write
+
 jobs:
   build-and-publish:
     uses: ./.github/workflows/_build-all.yml
