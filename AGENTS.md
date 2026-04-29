@@ -40,6 +40,10 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 .
 ├── README.md                  # 用户文档：只讲安装和使用
 ├── AGENTS.md                  # 本文件：开发者 / 代理架构文档
+├── assets/branding/           # 品牌视觉资产（单一真相源）
+│   ├── stickytodo-icon.svg    # 1024×1024 主 SVG 设计稿（**彩色** brand mark）；AppIcon/favicon 派生
+│   ├── stickytodo-menubar.svg # 18×18pt **模板图**（纯黑 + alpha），menubar MenuBarIcon 派生
+│   └── out/                   # 脚本生成目录（.gitignore 之外的 AppIcon.icns 等）
 ├── server/                    # Go 后端（单模块 go.mod）
 │   ├── cmd/todo-server/       # main 入口（支持 -port / -username / -password / -version flag）
 │   ├── internal/
@@ -85,7 +89,8 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 │   ├── package-web.sh         # 构建 web + 同步到 server/internal/webui/dist
 │   ├── package-server.sh      # 7 份跨平台二进制 + SHA256SUMS
 │   ├── package-mac-client.sh  # xcodebuild universal → codesign → DMG
-│   └── package-docker.sh      # 单架构 docker build（多架构交给 CI）
+│   ├── package-docker.sh      # 单架构 docker build（多架构交给 CI）
+│   └── generate-icons.sh      # 从 assets/branding/*.svg 派生：Mac AppIcon.appiconset + MenuBarIcon.imageset（template）+ AppIcon.icns + Web favicons
 ├── .github/workflows/
 │   ├── _build-all.yml         # 可复用 workflow，6 job：build-web / build-server(matrix) / build-mac-dmg / detect-docker-creds / build-docker(qemu+buildx) / publish-release
 │   ├── release-tag.yml        # push tag v* 自动走正式发布
@@ -268,7 +273,9 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 - Keychain service name：`com.hanxi.stickytodo`（`KeychainStore.service`，存储 JWT）
 - UserDefaults：`UserDefaults.standard`（**非** App Group suite），本机窗口位置持久化 key 是 `stickytodo.frames`（`FrameStore.defaultsKey`）——便签业务数据本身已改走服务端，不再落 UserDefaults
 - `os.Logger` subsystem：`com.hanxi.stickytodo`
-- 菜单栏图标：SF Symbol `note.text`，**无 Dock 图标**（Info.plist `LSUIElement=YES`）
+- 菜单栏图标：Assets.xcassets 中的 **`MenuBarIcon`**（template image，由 `scripts/generate-icons.sh` 从 `assets/branding/stickytodo-menubar.svg` 渲染产出）；**无 Dock 图标**（Info.plist `LSUIElement=YES`）
+- **模板图（template image）规则**：`MenuBarIcon.imageset/Contents.json` 里必须有 `"properties":{"template-rendering-intent":"template"}`（注意 `properties` 是顶层字段，不是塞在每张图里）。这样系统才会自动按"明/暗菜单栏 + 选中态"反色。源 SVG 只能用纯黑 `#000000` + alpha；**不要**在 SVG 里画彩色——主 brand mark 的黄/绿配色属于 AppIcon，不是 menubar
+- App 图标（Dock / Finder / About / DMG）：Assets.xcassets 中的 **`AppIcon`**（`ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon`）；SwiftUI 侧在 `StickyTodoApp.swift` 用 `Image("MenuBarIcon")`（注意是名称加载，不是 `systemName:`；写成 `Image(systemName: "MenuBarIcon")` 会被当作 SF Symbol 查不到而显示占位）
 
 模块职责：
 
@@ -317,7 +324,7 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 |---|---|---|---|---|
 | `package-web.sh` | `client/web/dist/` + 同步到 `server/internal/webui/dist/` | Node.js、npm | ❌ 不读，固定构建静态产物 | ✅ `build-web` job |
 | `package-server.sh` | `dist/server/stickytodo-server-<ver>-<os>-<arch>[.exe]` × 7 + 汇总 `SHA256SUMS` | Go、跑过 `package-web.sh` | ✅ 默认 `dev`，通过 `-ldflags -X main.version=` 注入到 `/health` | ✅ `build-server` job |
-| `package-mac-client.sh` | `dist/mac-client/stickytodo-<ver>-macos-universal.dmg`（**或** `--skip-dmg` 时 fallback 成 `stickytodo-<ver>-macos-universal.app.zip`）+ 汇总 `SHA256SUMS` | Xcode（15+，完整 IDE）；DMG 打包优先 `create-dmg`（`brew install create-dmg`），缺失时 fallback 到系统自带 `hdiutil` | ✅ 默认 `dev`，**仅用于产物文件名**，不改 App 内的 `CFBundleShortVersionString` | ✅ `build-mac-dmg` job |
+| `package-mac-client.sh` | `dist/mac-client/stickytodo-<ver>-macos-universal.dmg`（**或** `--skip-dmg` 时 fallback 成 `stickytodo-<ver>-macos-universal.app.zip`）+ 汇总 `SHA256SUMS`；**注意**发布文件名带版本，但 **DMG / zip 内部的 `.app` bundle 恒为 `stickytodo.app`**（不带版本），这是用户拖到 `/Applications` 后在 Launchpad / Dock 里看到的名字，必须是干净品牌名。DMG 卷标（双击 DMG 后 Finder 窗口标题）为 `stickytodo <ver>` | Xcode **26.x**（完整 IDE；CI 在 `_build-all.yml` 里用 `maxim-lobanov/setup-xcode@v1` 锁到 `26.4`，本机也需对齐，详见 §5.2 与 §7.7）；DMG 打包优先 `create-dmg`（`brew install create-dmg`），缺失时 fallback 到系统自带 `hdiutil` | ✅ 默认 `dev`，**仅用于发布文件名 + DMG 卷标**，不改 App 内的 `CFBundleShortVersionString`，也不改 `.app` bundle 文件名 | ✅ `build-mac-dmg` job |
 | `package-docker.sh` | 本地 Docker 镜像（当前平台单架构，不跨平台，`docker build` 而非 `docker buildx build`）| Docker daemon | ✅ 默认 `dev`，也作为镜像 tag | ❌ **CI 不调用**，CI 用 buildx 直推多架构 manifest |
 
 脚本之间的依赖关系：
@@ -335,7 +342,7 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 - **`_build-all.yml`**（`on: workflow_call`）：reusable workflow，输入 `version` / `tag_name` / `prerelease` / `docker_image` / `tag_latest`，包含 6 个 job：
   1. `build-web`
   2. `build-server`（矩阵：linux × amd64/arm64/armv7、darwin × amd64/arm64、windows × amd64/arm64）
-  3. `build-mac-dmg`（`macos-latest` runner，`brew install create-dmg || true` + `package-mac-client.sh`）
+  3. `build-mac-dmg`（`macos-latest` runner（当前指向 `macos-26` / macOS Tahoe）+ `maxim-lobanov/setup-xcode@v1` 锁 **Xcode 26.4** + `brew install create-dmg || true` + `package-mac-client.sh`）。**为什么要锁 Xcode 版本**：SwiftUI `.buttonStyle(.bordered)` 等默认控件外观由运行时 SDK 决定，旧 Xcode（15.4 / SDK 14.5）与新 Xcode（26 / SDK 26）在同一份源码上会产出视觉不同的按钮填充——曾在便签加号按钮上出现过 CI 白底、本机灰底的分歧。Xcode 版本 **必须** 与维护者本机一致并一起升级，不要单边走
   4. `detect-docker-creds`（只有 3 行：读 `secrets.DOCKERHUB_USERNAME` 是否非空，输出 `have=true/false`；存在是因为 `secrets.*` 不能直接用在 `if:` 表达式里）
   5. `build-docker`（`needs: [build-web, detect-docker-creds]`、`if: needs.detect-docker-creds.outputs.have == 'true'`，用 `docker/setup-qemu-action` + `docker/setup-buildx-action` 推 `linux/amd64,linux/arm64,linux/arm/v7` 多架构）
   6. `publish-release`（`needs: [build-server, build-mac-dmg, build-docker]`；条件是多行 `if:` 表达式，容忍 `build-docker` 在没 secrets 时被 `skipped`，但 server / mac 任一失败仍会中止；用 `softprops/action-gh-release@v2` 把 `build-server` / `build-mac-dmg` 的 artifact 挂到 Release）
@@ -349,7 +356,7 @@ Bundle 和命名（真值来自 `stickytodo.xcodeproj/project.pbxproj`）：
 | 产物类型 | 命名 | 备注 |
 |---|---|---|
 | Server 二进制 | `stickytodo-server-<ver>-<os>-<arch>[.exe]` | 7 份：linux × (amd64/arm64/armv7)、darwin × (amd64/arm64)、windows × (amd64/arm64)；与同目录的 `SHA256SUMS` 汇总文件一起上传 |
-| Mac 客户端 | `stickytodo-<ver>-macos-universal.dmg` | universal（arm64 + x86_64）；脚本用 `codesign --force --deep --options runtime --sign -` 做 **ad-hoc** 签名（`--sign -` 等价短写 `-s -`），`--options runtime` 启用 Hardened Runtime 以便将来可平滑切到开发者 ID 签名；同目录一份 `SHA256SUMS` |
+| Mac 客户端 | 发布文件名：`stickytodo-<ver>-macos-universal.dmg`；DMG 卷标（挂载后 Finder 窗口标题）：`stickytodo <ver>`；DMG 内 `.app` bundle：**`stickytodo.app`**（无版本号） | universal（arm64 + x86_64）；脚本用 `codesign --force --deep --options runtime --sign -` 做 **ad-hoc** 签名（`--sign -` 等价短写 `-s -`），`--options runtime` 启用 Hardened Runtime 以便将来可平滑切到开发者 ID 签名；同目录一份 `SHA256SUMS`。**三套命名的分工**：① 发布文件名要带 `<ver>` 供下载归档区分；② DMG 卷标要带 `<ver>` 方便用户知道自己挂的是哪个版本；③ `.app` bundle 名必须是干净的 `stickytodo.app`——这是用户拖进 `/Applications` 后在 Launchpad / Dock / Cmd+Tab 里永久看到的名字，绝不能混入发布文件名里的 `branch-main` / `v1.2.3` 之类噪声。历史 bug：曾把这三套名字合成一套，导致 DMG 双击开打是 "stickytodo branch-main (2849)" 这种脏窗口标题，且拖进 /Applications 后 App 图标下方显示 `stickytodo-branch-main-macos-universal`，非常不像正式应用 |
 | Docker 镜像 | `docker.io/hanxi/stickytodo:<ver>`（正式 tag 时还会打 `:latest`）| 多架构 manifest：`linux/amd64` / `linux/arm64` / `linux/arm/v7`；镜像分发**不带** SHA256SUMS，完整性靠 registry digest |
 
 `SHA256SUMS` 由 `package-server.sh` 和 `package-mac-client.sh` 在结尾处统一生成：优先 `sha256sum`（Linux），缺失时 fallback `shasum -a 256`（macOS 自带），产物文件名以相对路径写入同目录的 `SHA256SUMS`。Docker 镜像没有也**不应该**有这个文件——镜像完整性靠 registry 返回的 content digest（`sha256:...`）校验。
@@ -454,6 +461,24 @@ cd server && go run ./cmd/todo-server
 - 本地脚本来自 `$VERSION` 环境变量，`package-server.sh` / `package-mac-client.sh` / `package-docker.sh` 均默认 `dev`；`package-web.sh` 不读 `VERSION`（静态产物）
 - 后端二进制启动时 `/health` 返回的 `version` 由 `-ldflags "-X main.version=..."` 在 build 时注入，用户能实时看到
 - **Mac 客户端版本号的限制**：当前 `MARKETING_VERSION` 在 `stickytodo.xcodeproj/project.pbxproj` 里**硬编码为 `1.0`**，`package-mac-client.sh` 不会修改 Info.plist，因此 DMG 里的 App "关于"信息永远显示 `1.0`；外部可见的版本号只有**产物文件名**（`stickytodo-<VERSION>-macos-universal.dmg`）。如果未来需要把 `$VERSION` 真正写进 App Bundle，需要在 `package-mac-client.sh` 的 xcodebuild 阶段额外改 pbxproj 的 `MARKETING_VERSION` 或用 `PlistBuddy` 改生成后的 `*.app/Contents/Info.plist`
+
+### 7.7 macOS 客户端 Xcode / SDK 版本一致性
+
+**事实**：CI 的 `build-mac-dmg` job 在 `_build-all.yml` 里用 `maxim-lobanov/setup-xcode@v1` 明确锁 Xcode 到 **26.4**；维护者本机也用 Xcode 26.4（macOS 26.4 Tahoe）。两者**必须对齐**。
+
+**为什么必须锁**：SwiftUI 的默认控件外观（`.buttonStyle(.bordered)` 的填充色、`.controlSize` 的默认档位、圆角半径等）由**运行时 SDK**决定，不是你在源码里能直接控制的维度。历史上 CI 曾用 `macos-14` + Xcode 15.4 / macOS 14.5 SDK，与本机 Xcode 26 / SDK 26 在同一份源码上产出了视觉分歧——具体表现是便签标题栏的加号按钮在 CI DMG 里是**白底**、本机 Debug 跑是**浅灰底**。
+
+**规避策略（已落地）**：
+
+1. **CI 锁 Xcode 版本**（`_build-all.yml` 的 `build-mac-dmg` job 里 `maxim-lobanov/setup-xcode@v1` + `xcode-version: '26.4'`）
+2. **关键按钮显式钉死外观参数**，避免依赖 SDK 默认。当前已对便签加号按钮（`Views/StickyView.swift` 的 `titleBar` 内）显式追加 `.tint(.secondary)` + `.controlSize(.small)`。**不要**随手把这两个 modifier 拿掉以换取"简洁"——跨 SDK 回归成本远高于两行代码
+
+**升级 Xcode 的操作顺序**（未来要升 Xcode 27 时走一遍）：
+
+1. 本机先升 Xcode → 本地跑 `./client/scripts/build.sh` 确认编译通过
+2. 手动对照 UI 快照检查所有用了 `.buttonStyle(.bordered)` / `.borderedProminent` / `.menuStyle(.borderlessButton)` 的控件（目前至少在 `StickyView.swift` / `MenuBarContent.swift` / `SettingsView.swift` 里出现）
+3. 同步修改 `_build-all.yml` 的 `xcode-version` 和本文件对应描述
+4. **绝对不要只升 CI 不升本机，或只升本机不升 CI**——两边产物会走向不同的视觉，且 bug 非常隐蔽
 
 ---
 

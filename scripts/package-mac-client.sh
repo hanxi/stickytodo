@@ -16,10 +16,22 @@
 #   flag --skip-dmg     Produce only the .app bundle inside a zip (no dmg).
 #
 # Outputs (under dist/mac-client/):
-#   stickytodo-${VERSION}-macos-universal.app         (universal .app bundle)
-#   stickytodo-${VERSION}-macos-universal.dmg         (disk image, unless --skip-dmg)
-#   stickytodo-${VERSION}-macos-universal.app.zip     (fallback when --skip-dmg)
-#   SHA256SUMS                                        (one line per artifact)
+#   stickytodo.app                                    (universal .app bundle;
+#                                                      intentionally does NOT
+#                                                      carry ${VERSION} — this
+#                                                      is the on-disk name
+#                                                      users see in Launchpad
+#                                                      / /Applications after
+#                                                      drag-install, so it must
+#                                                      be a clean brand name)
+#   stickytodo-${VERSION}-macos-universal.dmg         (disk image, unless --skip-dmg;
+#                                                      volume label on mount
+#                                                      is "stickytodo ${VERSION}")
+#   stickytodo-${VERSION}-macos-universal.app.zip     (fallback when --skip-dmg;
+#                                                      inner .app is still
+#                                                      stickytodo.app thanks to
+#                                                      ditto --keepParent)
+#   SHA256SUMS                                        (one line per file artifact)
 #
 # Strategy:
 #   1. xcodebuild with ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO → fat binary
@@ -64,8 +76,23 @@ for arg in "$@"; do
 done
 
 VERSION="${VERSION:-dev}"
+# ARTIFACT_BASE is only used for release-artifact filenames (dmg / zip /
+# SHA256SUMS entries). It intentionally includes ${VERSION} so that users who
+# download multiple builds can tell them apart at a glance.
 ARTIFACT_BASE="stickytodo-${VERSION}-macos-universal"
-APP_BUNDLE_NAME="${ARTIFACT_BASE}.app"
+# APP_BUNDLE_NAME is what the user sees AFTER drag-installing: in Launchpad,
+# in /Applications, in the Dock, and as the volume title on mount when going
+# through create-dmg. It must be a clean brand string, NOT the release filename
+# (which is why we split these two concepts — a previous version used
+# "stickytodo-branch-main-macos-universal.app" as the bundle name, leading to
+# that same ugly string showing up in the user-facing DMG window and Launchpad).
+# Keep aligned with xcodebuild's own product name (stickytodo.app under
+# DerivedData/Build/Products/Release/) so the rename below is a no-op/identity.
+APP_BUNDLE_NAME="stickytodo.app"
+# Shown in the Finder window title after the user double-clicks the DMG. Kept
+# deliberately free of PID / branch-noise / "(N)" dedup suffixes. VERSION can
+# contain non-semver tokens like "branch-main", which is fine here.
+DMG_VOLNAME="stickytodo ${VERSION}"
 
 log() { printf '[package-mac-client] %s\n' "$*"; }
 
@@ -194,11 +221,29 @@ else
   # bash variable names and the shell would try to execute it as a command.
   dmg_produced=0
   if command -v create-dmg >/dev/null 2>&1; then
-    log "packaging with create-dmg"
-    if ( set -x; create-dmg "$APP_BUNDLE_NAME" "$OUT_DIR" ); then
-      # create-dmg writes a file like "stickytodo X.Y.Z.dmg" next to the .app;
-      # rename it to our canonical artifact name.
-      produced="$(find "$OUT_DIR" -maxdepth 1 -name 'stickytodo *.dmg' -print -quit)"
+    log "packaging with create-dmg (volname='${DMG_VOLNAME}')"
+    # --volname: override the default volume label (which sindresorhus/create-dmg
+    #   otherwise derives from the .app's CFBundleDisplayName + version; on our
+    #   hardcoded MARKETING_VERSION=1.0 that would always read "stickytodo 1.0"
+    #   even when the release tag is v1.2.3 or branch-main, confusing users).
+    # --overwrite: avoids an interactive y/n prompt when an earlier dmg exists.
+    # --identity: use ad-hoc; a paid Developer ID is not available here.
+    # --skip-jenkins: suppresses the "did you mean to set --jenkins?" hint that
+    #   create-dmg prints on CI-looking TTYs, keeping the build log clean.
+    # If any of these flags are unsupported by the installed create-dmg major
+    # version, the tool exits non-zero and we fall back to hdiutil below.
+    if ( set -x; create-dmg \
+           --volname "$DMG_VOLNAME" \
+           --overwrite \
+           --identity=- \
+           --skip-jenkins \
+           "$APP_BUNDLE_NAME" "$OUT_DIR" ); then
+      # create-dmg writes a file like "stickytodo 1.0.dmg" next to the .app
+      # (derived from the .app's CFBundleDisplayName + version); rename it to
+      # our canonical artifact name. Use the broadest glob so future create-dmg
+      # versions that change the produced filename still get picked up.
+      produced="$(find "$OUT_DIR" -maxdepth 1 -name 'stickytodo*.dmg' \
+                                   ! -name "$DMG_NAME" -print -quit)"
       if [[ -n "${produced:-}" && -f "$produced" ]]; then
         mv "$produced" "$DMG_NAME"
         dmg_produced=1
@@ -221,12 +266,22 @@ else
     # Retry hdiutil on "Resource busy" — macOS sometimes holds locks on newly
     # created directories until fseventsd settles (empirically <1s).
     #
-    # Unique volume name per run to avoid "hdiutil: create failed - Resource
-    # busy" when multiple jobs share the same builder host and leave a
-    # lingering /Volumes/stickytodo-* mount. BASHPID is the current shell's
-    # PID — guaranteed-set in bash 4+, and immune to the $-escaping gotchas
-    # some editors/templaters have when double-dollar appears in a string.
-    VOLNAME="stickytodo ${VERSION} ($$)"
+    # Volume label shown in the Finder title bar after the user double-clicks
+    # the DMG. Earlier versions appended $ (shell PID) to avoid "Resource busy"
+    # caused by a stale /Volumes/stickytodo-* mount on shared CI runners, but
+    # that leaked a meaningless number like "(2849)" into the user-visible title.
+    # The proper fix — force-detach any stale volumes BEFORE attempting the
+    # create — is done in the retry loop below, so the volume name can now stay
+    # clean and predictable.
+    VOLNAME="$DMG_VOLNAME"
+
+    # Proactively detach any stale stickytodo* volumes left over from previous
+    # runs on the same host. Without this, macOS auto-renames colliding mounts
+    # (e.g. "stickytodo branch-main (2849)"), and that renamed label is what the
+    # user would see in Finder. Suppress errors: a fresh host has no such mounts.
+    for vol in /Volumes/stickytodo*; do
+      [[ -d "$vol" ]] && hdiutil detach -force "$vol" 2>/dev/null || true
+    done
 
     hdiutil_try() {
       # `-ov` already overwrites existing output, but some macOS versions

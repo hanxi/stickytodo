@@ -28,6 +28,11 @@ struct TodoRow: View {
     @State private var showingEditSheet = false
     @State private var showingHistorySheet = false
 
+    /// 整行 hover 态：用于控制右侧「⋯」操作菜单按钮的可见性。
+    /// 未 hover 时按钮 opacity=0（仍占位，行高不跳动）；hover 时淡入显示。
+    /// 降低待办密集时的视觉噪声，贴近原生 Notes.app / Reminders.app 的体验。
+    @State private var isHovering = false
+
     // MARK: - 就地编辑态
 
     /// 进入标题编辑态。单击标题文字触发；Text 与 TextField 之间的切换由此标记驱动。
@@ -58,10 +63,23 @@ struct TodoRow: View {
             Spacer(minLength: 6)
 
             // 右：操作菜单
+            // 未 hover 时 opacity=0 但仍占位，保证行高不跳动；鼠标滑入时淡入。
+            // 不用条件渲染（`if isHovering { actionsMenu }`）的原因：条件渲染会让
+            // 按钮从布局中移除，鼠标移入的瞬间行宽重算 → 视觉抖动。
+            // 注意：本行整体已有一层 `.opacity(todo.deletedAt == nil ? 1.0 : 0.55)`，
+            // 软删行 hover 时实际 opacity = 0.55（透明度相乘），这是期望行为——
+            // 软删行的操作按钮本来就该视觉上弱化，和整行保持一致。
             actionsMenu
+                .opacity(isHovering ? 1 : 0)
+                .animation(.easeInOut(duration: 0.15), value: isHovering)
         }
         .padding(.vertical, 4)
         .opacity(todo.deletedAt == nil ? 1.0 : 0.55)
+        // 整行作为 hover 热区：透明间隙也参与命中测试，避免鼠标滑过 Spacer 时按钮闪烁。
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovering = hovering
+        }
         .alert("确认删除", isPresented: $showingDeleteConfirm) {
             Button("取消", role: .cancel) { }
             Button("删除", role: .destructive) {

@@ -44,9 +44,28 @@ struct StickyView: View {
 
     @State private var showingFilterEditor = false
 
-    /// 标题栏悬停态：为 true 时显示右上角的"关闭此便签" × 按钮。
+    /// 标题栏悬停态：为 true 时显示右上角的"删除此便签" 🗑 按钮。
     /// 仿 macOS 原生 Notes.app：鼠标离开时按钮隐藏，保持便签外观干净。
     @State private var isHoveringTitle = false
+
+    /// 「删除此便签」确认 Alert 的开关。点击标题栏 trash 按钮置 true，
+    /// 用户在 Alert 中确认后才真正调 onCloseSticky → DELETE /api/sticky-notes/:id。
+    /// 该操作不可撤销且会通过 WS 同步删除到所有登录本账号的设备。
+    @State private var showingDeleteConfirm = false
+
+    /// 是否跳过"删除便签"的二次确认 Alert。
+    ///
+    /// 默认 false（首次删除仍弹 Alert，保留安全网）。Alert 中提供"删除并不再提示"按钮，
+    /// 点击后把此值写入 UserDefaults，之后再点 trash 将直接删除。
+    ///
+    /// 设计取舍：
+    ///   - trash 按钮本身默认隐身、hover 才出现，误触概率已经很低
+    ///   - 便签删除虽不可撤销，但待办数据不受影响（属于全局池），实际损失可控
+    ///   - macOS 原生 Notes / Mail / Finder 都是"首次提示 + 允许关闭"的模式
+    ///
+    /// UserDefaults key 走 `UserDefaults.standard`（与 FrameStore 同一套），
+    /// 用户想重新开启提示目前只能手动清 key（未来如有需要可在 SettingsView 暴露开关）。
+    @AppStorage("sticky.skipDeleteConfirm") private var skipDeleteConfirm = false
 
     // MARK: - Init
 
@@ -104,6 +123,30 @@ struct StickyView: View {
                   message: Text(err.message),
                   dismissButton: .default(Text("好的")))
         }
+        // 删除便签二次确认：标题栏 trash 按钮点击后弹出（仅在 skipDeleteConfirm=false 时）。
+        // 确认后调 onCloseSticky（即 App 层的 appState.removeSticky → DELETE /api/sticky-notes/:id），
+        // 该操作不可撤销，通过 WS sticky.deleted 事件广播到所有登录本账号的设备。
+        //
+        // Alert 提供三个按钮：
+        //   - 取消：关闭 Alert
+        //   - 删除：本次删除，下次仍会弹
+        //   - 删除并不再提示：本次删除 + 把 skipDeleteConfirm 写入 UserDefaults，之后直接删
+        // 之所以用"第三个按钮"而不是"Toggle 勾选框"：SwiftUI .alert 的 actions 只能放
+        // Button/TextField，不支持 Toggle；强行换 .confirmationDialog 会丢失 Alert
+        // 经典视觉（图标 + 居中 + 粗体标题），macOS 原生 App 也多用此模式（Finder
+        // "清倒废纸篓"、Mail "永久删除"都走这一套）。
+        .alert("删除此便签？", isPresented: $showingDeleteConfirm) {
+            Button("取消", role: .cancel) { }
+            Button("删除", role: .destructive) {
+                onCloseSticky(note.id)
+            }
+            Button("删除并不再提示") {
+                skipDeleteConfirm = true
+                onCloseSticky(note.id)
+            }
+        } message: {
+            Text("此便签将从云端永久移除，所有登录本账号的设备都会同步删除。待办数据不受影响（待办属于全局池，不随便签删除）。")
+        }
         .sheet(isPresented: $showingFilterEditor) {
             // 不再强制外层 .frame；尺寸由 FilterEditor 自身 idealWidth/idealHeight 决定，
             // 避免与内部 header/Form 高度竞争导致顶部按钮被裁切。
@@ -137,23 +180,41 @@ struct StickyView: View {
             } label: {
                 Image(systemName: "plus")
             }
+            // 显式钉死样式参数，消除 SwiftUI .bordered 在不同 macOS SDK
+            // 下的默认填充差异（曾出现 Xcode 15.4 / SDK 14.5 编译产物是白底、
+            // Xcode 26.4 / SDK 26 是灰底的观感分歧，见 AGENTS.md §7.7）：
+            //   - .tint(.secondary) 固定按钮填充基调为系统次级色，在浅黄
+            //     便签背景上稳定呈现浅灰半透明
+            //   - .controlSize(.small) 固定控件尺寸档位，避免 SDK 默认档
+            //     位漂移造成和旁边 trash / ⋯ 两个按钮的视觉节律不一致
             .buttonStyle(.bordered)
+            .tint(.secondary)
+            .controlSize(.small)
             .help("新建待办")
 
-            // 悬停 × 关闭按钮：替代被移除的窗口红灯。
+            // 悬停 trash 删除按钮：替代被移除的窗口红灯。
             // 平时不可见（opacity 0），鼠标进入 titleBar 区域才显示，贴近原生 Notes.app 体验。
-            // 放在「⋯」菜单左侧：点击等价菜单里的"删除此便签"。
+            // 放在「⋯」菜单左侧。点击行为：
+            //   - 若 skipDeleteConfirm=false（默认）：弹删除确认 Alert（showingDeleteConfirm=true）
+            //   - 若 skipDeleteConfirm=true（用户已选过"删除并不再提示"）：直接调 onCloseSticky
+            //     → DELETE /api/sticky-notes/:id
+            // 图标从 xmark.circle.fill 改为 trash 是因为原先 × 图标在 macOS 习惯里
+            // 更像"关闭窗口"（非破坏性），容易误导用户；trash 能明确表达"从云端永久删除"。
             Button {
-                onCloseSticky(note.id)
+                if skipDeleteConfirm {
+                    onCloseSticky(note.id)
+                } else {
+                    showingDeleteConfirm = true
+                }
             } label: {
-                Image(systemName: "xmark.circle.fill")
+                Image(systemName: "trash")
                     .imageScale(.medium)
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
             .opacity(isHoveringTitle ? 1 : 0)
             .animation(.easeInOut(duration: 0.15), value: isHoveringTitle)
-            .help("关闭此便签")
+            .help("删除此便签")
 
             Menu {
                 colorMenu
@@ -163,10 +224,30 @@ struct StickyView: View {
                 } label: {
                     Label("新增便签", systemImage: "square.stack.3d.up")
                 }
-                Button(role: .destructive) {
-                    onCloseSticky(note.id)
-                } label: {
-                    Label("删除此便签", systemImage: "xmark.square")
+                Divider()
+                // 「打开设置」入口：便签上下文里快速打开主 Settings 窗口（三个 Tab：设置/历史/关于）。
+                // 放在菜单最底部（符合 macOS 传统：设置类入口常驻末尾）。
+                // 「删除此便签」已迁移到标题栏的 trash 按钮，菜单里不再重复。
+                //
+                // 跨版本实现（与 MenuBarContent.settingsButton 同一套方案，但不套 ButtonStyle
+                // ——Menu 的子项由系统原生渲染，强加 .bordered/.borderedProminent 无效且会失焦）：
+                //   - macOS 14+：用 SwiftUI 官方 SettingsLink；点击后 SwiftUI 负责激活 App + 打开 Settings Scene
+                //   - macOS 13：SettingsLink 不可用，回退 Button + NSApp.sendAction(showSettingsWindow:)
+                //
+                // 注意：最初错误地尝试"统一走 sendAction 路径"，实测在 macOS 14+ 下该 selector
+                // 已完全失效（只打印 "Please use SettingsLink..." 警告，不打开窗口）；必须走
+                // SettingsLink 分支。
+                if #available(macOS 14.0, *) {
+                    SettingsLink {
+                        Label("打开设置", systemImage: "gearshape")
+                    }
+                } else {
+                    Button {
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                    } label: {
+                        Label("打开设置", systemImage: "gearshape")
+                    }
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")

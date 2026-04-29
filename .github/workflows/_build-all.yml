@@ -7,7 +7,7 @@
 # Jobs (fan-out):
 #   build-web      → web/dist artifact     (ubuntu-latest)
 #   build-server   → 7 cross-compiled bins (ubuntu-latest, needs build-web)
-#   build-mac-dmg  → universal .dmg        (macos-14,     needs build-web)
+#   build-mac-dmg  → universal .dmg        (macos-latest + Xcode 26.4, needs build-web)
 #   build-docker   → multi-arch image push (ubuntu-latest, needs build-web)
 #   publish-release → gh release upload    (ubuntu-latest, needs all above)
 #
@@ -119,13 +119,33 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 3. Mac universal DMG. Must run on macOS for xcodebuild + codesign.
+  #
+  # Runner / Xcode pinning
+  # ----------------------
+  # 选用 macos-latest（当前指向 macos-26 / macOS Tahoe）+ 固定 Xcode 26.4，
+  # 与维护者本机 (Xcode 26.4 Build 17E192, macOS 26.4) 完全一致。
+  #
+  # 为什么必须固定 Xcode：SwiftUI 的 .buttonStyle(.bordered) 等默认控件外观
+  # 由运行时 SDK 决定，Xcode 15.4 (macOS 14.5 SDK) 与 Xcode 26 (macOS 26 SDK)
+  # 在同一份源码上会产出视觉不同的按钮填充（浅色便签上曾出现过白底 vs 灰底
+  # 的差异）。把 CI Xcode 钉死可保证 DMG 产物与开发者本机看到的一致。
+  # 参见：AGENTS.md §7.7（若要升级 Xcode，需同步升级本机与 CI，不要单边走）。
   # -------------------------------------------------------------------------
   build-mac-dmg:
     name: Build macOS universal DMG
-    runs-on: macos-14
+    runs-on: macos-latest
     needs: build-web
     steps:
       - uses: actions/checkout@v4
+
+      # 固定到 Xcode 26.4。macos-latest（macos-26）runner 上同时预装了
+      # 26.4 / 26.4.1 等多个版本，不显式指定的话 $DEVELOPER_DIR 走的是
+      # runner 镜像当前默认值——该默认值随 runner 镜像每周更新会漂移，
+      # 必须锁定才能保证未来每次构建产物行为一致。
+      - name: Select Xcode 26.4
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.4'
 
       - name: Download web dist
         uses: actions/download-artifact@v4

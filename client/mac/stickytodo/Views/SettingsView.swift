@@ -30,6 +30,17 @@ struct SettingsView: View {
     @State private var pingSubmitting: Bool = false
     @State private var pingResult: PingResult?
 
+    // 「删除便签前弹出确认」偏好。
+    //
+    // 存储侧 key 沿用 StickyView 的 `sticky.skipDeleteConfirm`（"跳过确认"，值语义 reverse）。
+    // 不在这里单独起新 key 是为了避免双 key 同义造成状态分裂——StickyView 是该偏好的唯一
+    // 消费点，`@AppStorage` 直接指向同一个 UserDefaults 条目，两处视图会自动同步。
+    //
+    // UI 侧用 `showDeleteConfirmBinding`（计算属性，下面定义）把"跳过=true / 弹窗=false"
+    // 反转成面向用户的"弹窗=true / 跳过=false"，让 Toggle 的正向语义（打开=弹提示）
+    // 更符合直觉。
+    @AppStorage("sticky.skipDeleteConfirm") private var skipDeleteConfirm = false
+
     var body: some View {
         TabView {
             generalTab
@@ -117,9 +128,33 @@ struct SettingsView: View {
                     unauthenticatedBlock
                 }
             }
+
+            Section("通用") {
+                Toggle(isOn: showDeleteConfirmBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("删除便签前弹出确认")
+                        Text("关闭后，便签标题栏的删除按钮将直接执行删除，不再二次确认。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
+    }
+
+    /// 面向 UI 的正向绑定：`true` = 删除时弹确认，`false` = 直接删除。
+    ///
+    /// 底层存储 `skipDeleteConfirm` 是反向语义（"跳过确认=true"），在这里做一次反转：
+    /// `get { !skipDeleteConfirm } / set { skipDeleteConfirm = !newValue }`。
+    /// 这样 Toggle 的视觉态（"开=弹提示"）和用户语义一致，且完全不需要改 StickyView 端。
+    private var showDeleteConfirmBinding: Binding<Bool> {
+        Binding(
+            get: { !skipDeleteConfirm },
+            set: { skipDeleteConfirm = !$0 }
+        )
     }
 
     /// 「历史」Tab：已登录时嵌入 HistoryView(global)；未登录时显示提示。

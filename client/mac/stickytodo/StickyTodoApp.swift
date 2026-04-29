@@ -45,8 +45,14 @@ struct StickyTodoApp: App {
             MenuBarContent()
                 .environmentObject(appState)
         } label: {
-            // SF Symbols：note 作为应用图标；系统会根据主题自动切换前景色。
-            Image(systemName: "note.text")
+            // 品牌菜单栏图标（模板图 / TEMPLATE）：由 scripts/generate-icons.sh 从
+            // assets/branding/stickytodo-menubar.svg 渲染，落在
+            // Assets.xcassets/MenuBarIcon.imageset/（@1x 18px / @2x 36px / @3x 54px）。
+            // 该 imageset 的 Contents.json 声明了 "template-rendering-intent":"template"，
+            // 系统会在明/暗菜单栏与选中态下自动反色。⚠️ 这里必须用 Image("name")
+            // 名称加载；改写成 Image(systemName: "note.text") 会退回 SF Symbol，
+            // 失去品牌识别度。
+            Image("MenuBarIcon")
         }
         .menuBarExtraStyle(.window)
 

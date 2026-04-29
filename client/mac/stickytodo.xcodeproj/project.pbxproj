@@ -29,6 +29,7 @@
 		A1010101010101010101011C /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011C /* SettingsView.swift */; };
 		A1010101010101010101011D /* DraftTodoRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011D /* DraftTodoRow.swift */; };
 		A1010101010101010101011E /* WindowDragHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011E /* WindowDragHandle.swift */; };
+		A20202020202020202020201 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B20202020202020202020201 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -56,6 +57,7 @@
 		B1010101010101010101011E /* WindowDragHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandle.swift; sourceTree = "<group>"; };
 		B2020202020202020202020A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B2020202020202020202020B /* stickytodo.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = stickytodo.entitlements; sourceTree = "<group>"; };
+		B20202020202020202020201 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		B3030303030303030303030A /* stickytodo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = stickytodo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -90,6 +92,7 @@
 				D00000000000000000000011 /* Windows */,
 				B2020202020202020202020A /* Info.plist */,
 				B2020202020202020202020B /* stickytodo.entitlements */,
+				B20202020202020202020201 /* Assets.xcassets */,
 			);
 			path = stickytodo;
 			sourceTree = "<group>";
@@ -215,6 +218,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A20202020202020202020201 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -376,7 +380,7 @@
 		F1010101010101010101010B /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = stickytodo/stickytodo.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
@@ -405,7 +409,7 @@
 		F1010101010101010101010C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = "";
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = stickytodo/stickytodo.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
