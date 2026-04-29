@@ -94,6 +94,19 @@ jobs:
       # the upstream action prints a warning + truncates again. We trim by
       # byte here so the action receives a value it won't need to touch.
       #
+      # Implementation note: we previously used `head -c 97 | iconv -f UTF-8
+      # -t UTF-8//IGNORE` to drop a partial trailing codepoint, but GNU iconv
+      # on Ubuntu runners exits non-zero with "incomplete character or shift
+      # sequence at end of buffer" even with //IGNORE (which only suppresses
+      # "target-side unrepresentable", not "source-side truncated"). Combined
+      # with `set -euo pipefail` that killed the step. BSD iconv on macOS
+      # behaves differently, masking the bug locally. Now we do the UTF-8
+      # boundary walk inside awk using each byte's high bits:
+      #   * 0xxxxxxx         → ASCII start (safe cut point)
+      #   * 11xxxxxx         → multi-byte start (safe cut point)
+      #   * 10xxxxxx         → continuation (NOT safe; must walk back)
+      # Zero external tools, no locale assumptions, no non-zero exit.
+      #
       # If README doesn't yield a usable intro line we emit an empty output
       # and skip the short-description param entirely downstream — leaves
       # whatever was previously set on Docker Hub untouched.
@@ -111,18 +124,37 @@ jobs:
           ' README.md || true)"
           # Trim surrounding whitespace + collapse inner runs.
           line="$(printf '%s' "$line" | tr -s ' ' | sed 's/^ *//; s/ *$//')"
-          # Byte-safe truncation: keep at most 100 bytes, and if we cut we
-          # step back up to 3 bytes to avoid splitting a UTF-8 codepoint,
-          # then append "..." (3 ASCII bytes → total still ≤100).
-          byte_len=$(printf '%s' "$line" | wc -c | tr -d ' ')
-          if [ "$byte_len" -gt 100 ]; then
-            # Reserve 3 bytes for the ellipsis.
-            truncated="$(printf '%s' "$line" | head -c 97)"
-            # If head -c landed mid-codepoint, iconv will drop the partial
-            # trailing bytes; //IGNORE keeps everything else.
-            truncated="$(printf '%s' "$truncated" | iconv -f UTF-8 -t UTF-8//IGNORE)"
-            line="${truncated}..."
-          fi
+          # Byte-safe truncation inside awk: keep ≤100 bytes, reserve 3 for
+          # "..." if we actually cut, and never split a UTF-8 codepoint.
+          # Runs under LC_ALL=C so awk's length()/substr() operate on bytes,
+          # not characters — which is exactly what we need since Docker Hub's
+          # limit is measured in bytes.
+          line="$(printf '%s' "$line" | LC_ALL=C awk -v LIMIT=100 -v ELLIPSIS_LEN=3 '
+            {
+              s = $0
+              n = length(s)
+              if (n <= LIMIT) { print s; exit }
+              # Target cut = LIMIT - ELLIPSIS_LEN. If the byte just AFTER the
+              # cut is a UTF-8 continuation byte (10xxxxxx → 0x80..0xBF),
+              # cutting there would strand an orphan lead byte; walk back one
+              # byte at a time until the byte after the cut is a start byte
+              # (ASCII 0xxxxxxx or multi-byte lead 11xxxxxx).
+              cut = LIMIT - ELLIPSIS_LEN
+              while (cut > 0) {
+                c = substr(s, cut + 1, 1)
+                ord = _ord(c)
+                if (ord >= 128 && ord < 192) { cut-- } else { break }
+              }
+              print substr(s, 1, cut) "..."
+            }
+            function _ord(ch,    i) {
+              if (!_ord_built) {
+                for (i = 0; i < 256; i++) _ord_map[sprintf("%c", i)] = i
+                _ord_built = 1
+              }
+              return _ord_map[ch]
+            }
+          ')"
           if [ -n "$line" ]; then
             echo "short=$line" >> "$GITHUB_OUTPUT"
             echo "Derived short description ($(printf '%s' "$line" | wc -c | tr -d ' ') bytes): $line"
