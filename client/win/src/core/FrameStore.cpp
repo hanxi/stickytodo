@@ -2,6 +2,14 @@
 
 #include <nlohmann/json.hpp>
 #include <windows.h>
+// Required explicitly for CoTaskMemFree used below to release the wide-path
+// buffer handed out by SHGetKnownFolderPath. Project-wide WIN32_LEAN_AND_MEAN
+// means <windows.h> no longer transitively pulls in COM basics, and while
+// <shlobj.h> does declare SHGetKnownFolderPath it is not guaranteed to
+// forward-declare CoTaskMemFree on every Windows SDK revision. Being
+// explicit here avoids the same C3861 class of error that caught main.cpp
+// on the CI build.
+#include <objbase.h>
 #include <shlobj.h>
 #include <fstream>
 #include <filesystem>

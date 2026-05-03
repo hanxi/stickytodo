@@ -1,6 +1,15 @@
 #include "App.h"
 
 #include <windows.h>
+// CoInitializeEx / CoUninitialize live in <objbase.h>. When WIN32_LEAN_AND_MEAN
+// is defined (we do, project-wide, in CMakeLists.txt) <windows.h> intentionally
+// skips including <objbase.h>, so the COM APIs used below (CoInitializeEx at
+// startup to enable WinRT / apartment-threaded COM, CoUninitialize on every
+// exit path) become unresolved identifiers — observed as
+// "error C3861: 'CoUninitialize': identifier not found" on the CI build.
+// Pull it in explicitly here to restore the symbols without giving up the
+// compile-time savings WIN32_LEAN_AND_MEAN gives every other TU.
+#include <objbase.h>
 #include <shellapi.h>
 
 // Single-instance mutex name
