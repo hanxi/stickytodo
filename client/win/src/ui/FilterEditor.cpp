@@ -244,6 +244,26 @@ LRESULT CALLBACK FilterEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_CHAR:        OnChar(impl, static_cast<wchar_t>(wParam)); return 0;
         case WM_KEYDOWN:     OnKeyDown(impl, wParam, lParam); return 0;
 
+        case WM_SETCURSOR: {
+            // I-beam cursor over tag / keyword TextBoxes. Both are
+            // always laid out (the filter editor doesn't conditionally
+            // hide them), so a simple rect hit-test is sufficient —
+            // no visibility gate like StickyWindow's drafting_ flag.
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT pt;
+                if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt)) {
+                    float mx = static_cast<float>(pt.x);
+                    float my = static_cast<float>(pt.y);
+                    if (impl->tagBox_.rect.Contains(mx, my) ||
+                        impl->keywordBox_.rect.Contains(mx, my)) {
+                        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                        return TRUE;
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+
         case WM_CLOSE:
             // × chrome button — treat as cancel.
             DoCancelAndClose(impl);

@@ -132,6 +132,96 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
                           format, textRect, textBrush);
             textBrush->Release();
         }
+
+        // Caret (text cursor) — drawn as a 1px vertical line at the
+        // cursorPos offset inside the display text. Only visible while
+        // the TextBox has focus, is enabled, and we are NOT rendering
+        // the grey placeholder (drawing a caret on top of a
+        // placeholder would be misleading — as soon as the user types
+        // a char, the placeholder disappears and the cursor snaps to
+        // position 1, so showing a caret alongside the placeholder
+        // doesn't match what Win32 Edit / macOS NSTextField do either).
+        //
+        // Positioning: we need the pixel X of the char boundary
+        // `cursorPos` INSIDE displayText. IDWriteTextLayout's
+        // HitTestTextPosition maps a character index to a point
+        // relative to the layout origin. We create a layout sized to
+        // the same textRect and query the index, then add
+        // textRect.left for the absolute X.
+        //
+        // Rendering choice — solid (non-blinking) caret. A blinking
+        // caret on a D2D-rendered surface requires a SetTimer-driven
+        // InvalidateRect loop plus a shared blink-phase boolean,
+        // which would have to be plumbed through every window that
+        // hosts a TextBox. A solid caret is visually acceptable
+        // (Microsoft Edge's omnibox, VS Code's command palette input,
+        // and most modern D2D/Skia apps render a solid caret) and
+        // matches what the user explicitly asked for — "看不到光标".
+        if (focused && enabled && !showPlaceholder) {
+            IDWriteTextLayout* layout = nullptr;
+            float layoutWidth = textRect.right - textRect.left;
+            float layoutHeight = textRect.bottom - textRect.top;
+            // Build the layout over `drawText` (which is `displayText`
+            // in the focused branch, i.e. the bullet-masked password
+            // or the raw text) so caret math matches what's rendered.
+            dw->CreateTextLayout(drawText.c_str(),
+                                 static_cast<UINT32>(drawText.size()),
+                                 format, layoutWidth, layoutHeight, &layout);
+            if (layout) {
+                // Clamp cursorPos to the valid range to tolerate any
+                // transient mismatch between `text` and `cursorPos`
+                // (e.g. programmatic text replacement that forgot to
+                // update cursorPos — defensive only, should never
+                // trip in practice).
+                UINT32 clampedPos = static_cast<UINT32>(std::max(
+                    0, std::min(cursorPos, static_cast<int>(drawText.size()))));
+
+                DWRITE_HIT_TEST_METRICS hitMetrics = {};
+                FLOAT caretX = 0.0f, caretY = 0.0f;
+                // isTrailingHit=FALSE → leading edge of the char at
+                // clampedPos. For clampedPos == drawText.size() this
+                // correctly returns the trailing edge of the last
+                // char, which is what "cursor at end" should show.
+                HRESULT hr = layout->HitTestTextPosition(
+                    clampedPos, /*isTrailingHit=*/FALSE,
+                    &caretX, &caretY, &hitMetrics);
+                if (SUCCEEDED(hr)) {
+                    // caretX / caretY are relative to the layout
+                    // origin (textRect.left/top). Translate to the
+                    // render target's coordinate space.
+                    float absX = textRect.left + caretX;
+
+                    // Vertical extent: center the caret on the text
+                    // rect but shrink by 2px top/bottom so the line
+                    // doesn't touch the input border. hitMetrics.height
+                    // is the line height of the char; we use it when
+                    // available for proper font metrics alignment.
+                    float caretHeight = hitMetrics.height > 0.0f
+                        ? hitMetrics.height
+                        : (textRect.bottom - textRect.top - 8.0f);
+                    float caretTop = textRect.top +
+                        ((textRect.bottom - textRect.top) - caretHeight) * 0.5f;
+                    float caretBottom = caretTop + caretHeight;
+
+                    ID2D1SolidColorBrush* caretBrush = nullptr;
+                    rt->CreateSolidColorBrush(Theme::TextPrimary(),
+                                              &caretBrush);
+                    if (caretBrush) {
+                        // Offset by 0.5px for crisp 1-px line on
+                        // pixel-aligned rendering (D2D antialiases
+                        // lines; the half-pixel offset avoids the
+                        // classic "blurry 2-pixel" artifact).
+                        rt->DrawLine(
+                            D2D1::Point2F(absX + 0.5f, caretTop),
+                            D2D1::Point2F(absX + 0.5f, caretBottom),
+                            caretBrush, 1.0f);
+                        caretBrush->Release();
+                    }
+                }
+                layout->Release();
+            }
+        }
+
         format->Release();
     }
 }
@@ -434,6 +524,10 @@ void Label::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     if (!format) return;
 
     format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    // Honour caller-requested horizontal alignment (default LEADING ==
+    // DirectWrite default; CENTER used by empty-state placeholders in
+    // StickyWindow::DrawTodoList).
+    format->SetTextAlignment(alignment);
 
     ID2D1SolidColorBrush* brush = nullptr;
     rt->CreateSolidColorBrush(color, &brush);

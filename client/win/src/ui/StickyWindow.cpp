@@ -90,9 +90,37 @@ bool StickyWindow::classRegistered_ = false;
 StickyWindow::StickyWindow(HINSTANCE hInstance, const std::string& stickyId)
     : hInstance_(hInstance), stickyId_(stickyId)
 {
+    // alive_ is initialised to std::make_shared<std::atomic<bool>>(true)
+    // by the default member initialiser in StickyWindow.h. No explicit
+    // initialisation needed here — but the async callbacks in this file
+    // depend on it being non-null and true before any mutation call
+    // site runs, which is guaranteed because member-init runs before
+    // the body of this ctor, and no HTTP call is fired from the ctor.
 }
 
 StickyWindow::~StickyWindow() {
+    // Flip the liveness flag BEFORE any other teardown. In-flight HTTP
+    // worker threads may be about to post their completion lambdas to
+    // the tray HWND; once this store() runs, every such lambda that
+    // value-captured `alive_` will see false on the UI thread and
+    // early-return without touching `this`. The shared_ptr keeps the
+    // atomic's backing memory alive as long as at least one callback
+    // still holds a ref, so the load() on the callback side is safe
+    // even after ~StickyWindow finishes and our own alive_ member is
+    // destroyed.
+    //
+    // We use memory_order_seq_cst (the default) rather than release
+    // because ordering matters in BOTH directions: the store must
+    // happen-before any callback load on another thread (release
+    // would suffice), AND we rely on the store being visible to the
+    // UI thread immediately so the very next pumped message sees
+    // false (sequential consistency makes this trivial to reason
+    // about; the perf cost is negligible for a once-per-destructor
+    // store).
+    if (alive_) {
+        alive_->store(false);
+    }
+
     DiscardRenderTarget();
     if (hwnd_) {
         DestroyWindow(hwnd_);
@@ -194,15 +222,58 @@ void StickyWindow::LoadData() {
 
     filter_ = codec::StickyCodec::JsonToFilter(stickyNote_.filter);
 
-    auto result = app->GetState()->GetHttp()->ListTodos(filter_);
-    if (result.has_value()) {
-        todos_ = std::move(result->items);
-    }
-
     // Any in-flight draft/edit state must not outlive a data reload.
     CancelDraft();
     CancelTitleEdit();
     hoveredRowIndex_ = -1;
+
+    // Pessimistic read: flag loading, kick off async list, the
+    // callback swaps todos_ in on the UI thread. Keeping the previous
+    // todos_ in place (not cleared) avoids flicker — on first load
+    // todos_ is already empty so the "Loading..." placeholder in
+    // DrawTodoList will show; on refresh the stale list stays visible
+    // until the new one lands.
+    // Bump generation token BEFORE firing the async. Any earlier
+    // in-flight LoadData's callback will see its captured myGen <
+    // loadDataGeneration_ when it lands and silently drop — this
+    // prevents a stale filter's result from overwriting the current
+    // filter's todos_ when two LoadData() calls overlap (the
+    // ShowFilterEditor rollback path is the prime offender; see the
+    // field doc on loadDataGeneration_).
+    uint64_t myGen = ++loadDataGeneration_;
+    todosLoading_ = true;
+    app->GetState()->GetHttp()->AsyncListTodos(filter_,
+        [this, alive = alive_, myGen]
+        (std::optional<HttpClient::TodoListResult> result) {
+            // Liveness guard — the StickyWindow may have been destroyed
+            // (user closed it / WS sticky.deleted / App shutdown)
+            // between AsyncListTodos firing on the worker thread and
+            // this callback landing on the UI thread. alive_ is a
+            // shared_ptr<atomic<bool>>; the worker thread's captured
+            // copy keeps the atomic alive even after ~StickyWindow, so
+            // this load() is safe to call on a dead object. All the
+            // other captures in this file follow the same pattern.
+            if (!alive->load()) return;
+            // Secondary defense: hwnd_ can be null in the brief
+            // window between WM_DESTROY handler running (which nulls
+            // hwnd_) and ~StickyWindow running (which flips alive_).
+            // Both guards redundantly protect against that window.
+            if (!hwnd_) return;
+            // Generation guard: if a newer LoadData has already
+            // started (loadDataGeneration_ advanced), this callback
+            // is stale — drop its result but leave todosLoading_
+            // alone (the newer LoadData already set it to true and
+            // its own callback will flip it back).
+            if (myGen != loadDataGeneration_) return;
+            todosLoading_ = false;
+            if (result.has_value()) {
+                todos_ = std::move(result->items);
+            }
+            // On failure: keep whatever todos_ had before — the
+            // list stays stale but visible, matching the "don't
+            // blow away the UI on a transient network error" rule.
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +454,13 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
                                            // back to tofu, but the adjacent
                                            // hover-only UX already signals
                                            // destructive intent.
+        // Disable while a DELETE /api/sticky-notes/:id is in flight so
+        // the user can't retry-bomb the request. Button::Draw fades
+        // the fill/text alpha by 0.5 when !enabled, and
+        // Button::HandleMouse short-circuits at its top when !enabled,
+        // so both the visual and the click paths are covered by this
+        // single assignment.
+        trashButton_.enabled = !stickyDeleting_;
         trashButton_.onClick = [this]() { DoDeleteSticky(); };
         trashButton_.Draw(rt, dw, dpi);
     } else {
@@ -556,6 +634,42 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
         }
     }
 
+    // Empty-state / loading placeholder. Drawn centered in the
+    // scroll-content area when there are no rows to display. Two
+    // distinct states:
+    //   • todosLoading_          → "加载中…" (initial load only —
+    //                               todosLoading_ is also true during
+    //                               refetches, but in that case todos_
+    //                               usually has the previous list so
+    //                               this branch doesn't fire and the
+    //                               stale rows stay visible, avoiding
+    //                               flicker)
+    //   • !todosLoading_ & empty → "暂无待办" (server returned an
+    //                               empty list for the current filter;
+    //                               without this the sticky would be
+    //                               completely blank which looks like
+    //                               a render bug)
+    //
+    // Drafting rows don't count as "empty" — when the draft row is
+    // visible the sticky isn't blank. The filter bar at the bottom is
+    // drawn by DrawFilterButton so it's always present regardless.
+    if (todos_.empty() && !drafting_) {
+        const wchar_t* msg = todosLoading_
+            ? L"\u52A0\u8F7D\u4E2D\u2026"       // 加载中…
+            : L"\u6682\u65E0\u5F85\u529E";      // 暂无待办
+        Label placeholder;
+        // Center vertically in the list area; horizontally the Label's
+        // own DWRITE_TEXT_ALIGNMENT_CENTER handles centering across
+        // the full width.
+        float phY = listTop + (listHeight - Theme::kTodoRowHeight) * 0.5f;
+        placeholder.rect = {0, phY, width, Theme::kTodoRowHeight};
+        placeholder.text = msg;
+        placeholder.fontSize = Theme::kFontSizeBody;
+        placeholder.color = Theme::TextPlaceholder();
+        placeholder.alignment = DWRITE_TEXT_ALIGNMENT_CENTER;
+        placeholder.Draw(rt, dw, dpi);
+    }
+
     scrollView_.EndContent(rt);
     scrollView_.DrawScrollbar(rt);
 }
@@ -695,6 +809,29 @@ LRESULT StickyWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             mouseTracking_ = false;
             OnMouseLeave();
             return 0;
+        case WM_SETCURSOR: {
+            // I-beam cursor over the inline draft / title-edit
+            // TextBoxes. Gate each on its visibility flag because
+            // their rects are leftover from the previous frame when
+            // the box is not currently rendered (drafting_=false or
+            // editingRowIndex_=-1), and we don't want a phantom
+            // I-beam over an invisible hit zone.
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT pt;
+                if (GetCursorPos(&pt) && ScreenToClient(hwnd_, &pt)) {
+                    float mx = static_cast<float>(pt.x);
+                    float my = static_cast<float>(pt.y);
+                    bool overInput =
+                        (drafting_ && draftBox_.rect.Contains(mx, my)) ||
+                        (editingRowIndex_ >= 0 && editBox_.rect.Contains(mx, my));
+                    if (overInput) {
+                        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                        return TRUE;
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd_, msg, wParam, lParam);
+        }
         case core::WM_STICKYTODO_REFRESH:
             // Fan-out from AppState::HandleWsEventOnUIThread on todo.*
             // events, routed precisely via App::PostMessageToAllStickies
@@ -1062,22 +1199,83 @@ void StickyWindow::CommitDraft() {
     }
 
     std::string title = WideToUtf8(trimmed);
-    auto created = app->GetState()->GetHttp()->CreateTodo(title);
 
-    // Exit draft mode regardless of outcome; the user can see the row appear or see
-    // nothing change — WS reconnect will eventually reconcile on failure.
+    // ---- Optimistic append ---------------------------------------
+    //
+    // Reserve a placeholder uint64 id from the top of the id space
+    // (UINT64_MAX, UINT64_MAX-1, ...) — the server allocates small
+    // sequential ids so this range is collision-free. Construct a
+    // local Todo with the user's title and insert into todos_ so the
+    // row appears immediately. Store the placeholder id in a local
+    // variable: the async callback will use it to locate the row for
+    // swap (on success) or removal (on failure).
+    uint64_t placeholderId = nextPendingTodoId_--;
+    models::Todo placeholder;
+    placeholder.id = placeholderId;
+    placeholder.title = title;
+    placeholder.priority = 0;
+    // Leave other fields at default (created_at empty, deleted_at
+    // empty, tag empty). The real server-returned Todo will replace
+    // this wholesale on success, so these placeholder defaults are
+    // only visible for the ~round-trip duration.
+    todos_.push_back(placeholder);
+
+    // Exit draft mode immediately — the user sees their text become
+    // a real row and can start a new draft right away.
     drafting_ = false;
     draftBox_.text.clear();
     draftBox_.SetFocus(false);
-
-    if (created.has_value()) {
-        // Optimistic local append — the server will also broadcast a todo.created
-        // event which triggers WM_STICKYTODO_REFRESH -> Refresh(), so the duplicate
-        // is merged away by the subsequent ListTodos call.
-        todos_.push_back(*created);
-    }
-
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    // Fire the async create. Capture placeholderId + trimmed text by
+    // value so the rollback path can re-seed the draft box with the
+    // user's original input on failure.
+    app->GetState()->GetHttp()->AsyncCreateTodo(title, 0, "", "",
+        [this, alive = alive_, placeholderId, originalText = trimmed]
+        (std::optional<models::Todo> created) {
+            // See LoadData's callback for the alive_ / hwnd_ guard
+            // rationale.
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            // Locate the placeholder in todos_ by id. It may have
+            // moved (unlikely but possible — a WS-driven refresh
+            // could have reordered the list during the round-trip)
+            // or been removed (e.g. user clicked the trash on their
+            // own placeholder row, which shouldn't really be
+            // possible since the row id is unknown to the UI but
+            // we guard anyway).
+            auto it = std::find_if(todos_.begin(), todos_.end(),
+                [placeholderId](const models::Todo& t) {
+                    return t.id == placeholderId;
+                });
+            if (created.has_value()) {
+                // Success: swap placeholder for the real row in
+                // place. If the placeholder is gone (unusual), just
+                // append the real row — the server-side WS
+                // broadcast will cause a full refresh shortly anyway
+                // so a transient duplicate is harmless.
+                if (it != todos_.end()) {
+                    *it = std::move(*created);
+                } else {
+                    todos_.push_back(std::move(*created));
+                }
+            } else {
+                // Failure: rollback — remove placeholder row and
+                // restore the user's text into the draft box so
+                // they can retry without retyping. Re-enter
+                // draft mode to make that path immediately usable.
+                if (it != todos_.end()) {
+                    todos_.erase(it);
+                }
+                drafting_ = true;
+                draftBox_.text = originalText;
+                draftBox_.cursorPos = static_cast<int>(originalText.size());
+                draftBox_.selStart = draftBox_.selEnd = -1;
+                draftBox_.SetFocus(true);
+                SetFocus(hwnd_);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 void StickyWindow::CancelDraft() {
@@ -1143,12 +1341,43 @@ void StickyWindow::CommitTitleEdit() {
         return;
     }
 
-    auto updated = app->GetState()->GetHttp()->UpdateTodo(
-        todo.id, newTitle, todo.priority, todo.tag, todo.due_at);
-    if (updated.has_value() && savingIndex >= 0 && savingIndex < static_cast<int>(todos_.size())) {
-        todos_[savingIndex] = *updated;
-    }
+    // ---- Optimistic update ---------------------------------------
+    //
+    // Snapshot the row's current state for rollback, apply the new
+    // title locally, then fire async update. On success the callback
+    // swaps in the server-authoritative row (which may differ from
+    // our optimistic version in e.g. updated_at); on failure we
+    // restore the snapshot so the user sees their pre-edit title.
+    //
+    // Locate by id (not savingIndex) because a concurrent WS refresh
+    // could reorder the list during the round-trip.
+    uint64_t todoId = todo.id;
+    models::Todo snapshot = todo;
+    todo.title = newTitle;  // in-place optimistic
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    app->GetState()->GetHttp()->AsyncUpdateTodo(
+        todoId, newTitle, snapshot.priority, snapshot.tag, snapshot.due_at,
+        [this, alive = alive_, todoId, snapshot = std::move(snapshot)]
+        (std::optional<models::Todo> updated) mutable {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            auto it = std::find_if(todos_.begin(), todos_.end(),
+                [todoId](const models::Todo& t) { return t.id == todoId; });
+            if (it == todos_.end()) {
+                // Row disappeared (WS-driven delete?) — nothing to
+                // reconcile. Leave the list as-is.
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (updated.has_value()) {
+                *it = std::move(*updated);
+            } else {
+                // Rollback to pre-edit snapshot.
+                *it = std::move(snapshot);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 void StickyWindow::CancelTitleEdit() {
@@ -1165,16 +1394,58 @@ void StickyWindow::CancelTitleEdit() {
 // Per-row actions
 // ---------------------------------------------------------------------------
 
+// ---- Optimistic toggle pattern ------------------------------------------
+//
+// DoComplete / DoReopen / DoRestore all share the same shape:
+//   1. capture todoId + a pre-mutation snapshot of todos_[rowIndex]
+//   2. apply an optimistic local mutation (local lambda `applyLocal`)
+//   3. fire the async HTTP; on success swap in the server row, on
+//      failure restore the snapshot
+//
+// An earlier draft factored this into a free-function helper
+// `FireOptimisticToggle(vector&, HWND&, ...)` to keep each call site
+// to ~10 lines. That helper captured `todos_` and `hwnd_` BY
+// REFERENCE into the async callback — which breaks the `this`-based
+// lifetime guard used by every other async call site in this file:
+// if the StickyWindow is destroyed before the callback lands, the
+// reference dangles and we read garbage instead of seeing
+// hwnd_==nullptr. Rather than smuggle `this` through the helper (at
+// which point the helper is no longer saving meaningful lines), each
+// call site is written out inline so the `this` capture and
+// `!hwnd_` guard are uniform across the whole file.
+
 void StickyWindow::DoComplete(size_t rowIndex) {
     if (rowIndex >= todos_.size()) return;
     auto* app = GetApp();
     if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
 
-    auto updated = app->GetState()->GetHttp()->CompleteTodo(todos_[rowIndex].id);
-    if (updated.has_value()) {
-        todos_[rowIndex] = *updated;
-    }
+    uint64_t todoId = todos_[rowIndex].id;
+    models::Todo snapshot = todos_[rowIndex];
+    // Optimistic: mark as completed. The real updated_at / completed_at
+    // will come back from the server and overwrite this, but for the
+    // visual state (strike-through keyed off IsDone()) a sentinel
+    // suffices.
+    todos_[rowIndex].completed_at = std::string("pending");
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    app->GetState()->GetHttp()->AsyncCompleteTodo(todoId,
+        [this, alive = alive_, todoId, snapshot = std::move(snapshot)]
+        (std::optional<models::Todo> updated) mutable {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            auto it = std::find_if(todos_.begin(), todos_.end(),
+                [todoId](const models::Todo& t) { return t.id == todoId; });
+            if (it == todos_.end()) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (updated.has_value()) {
+                *it = std::move(*updated);
+            } else {
+                *it = std::move(snapshot);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 void StickyWindow::DoReopen(size_t rowIndex) {
@@ -1182,11 +1453,31 @@ void StickyWindow::DoReopen(size_t rowIndex) {
     auto* app = GetApp();
     if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
 
-    auto updated = app->GetState()->GetHttp()->ReopenTodo(todos_[rowIndex].id);
-    if (updated.has_value()) {
-        todos_[rowIndex] = *updated;
-    }
+    uint64_t todoId = todos_[rowIndex].id;
+    models::Todo snapshot = todos_[rowIndex];
+    // Optimistic: clear completed_at so IsDone() returns false and the
+    // row immediately re-renders as active.
+    todos_[rowIndex].completed_at.clear();
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    app->GetState()->GetHttp()->AsyncReopenTodo(todoId,
+        [this, alive = alive_, todoId, snapshot = std::move(snapshot)]
+        (std::optional<models::Todo> updated) mutable {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            auto it = std::find_if(todos_.begin(), todos_.end(),
+                [todoId](const models::Todo& t) { return t.id == todoId; });
+            if (it == todos_.end()) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (updated.has_value()) {
+                *it = std::move(*updated);
+            } else {
+                *it = std::move(snapshot);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 void StickyWindow::DoDelete(size_t rowIndex) {
@@ -1218,13 +1509,35 @@ void StickyWindow::DoDelete(size_t rowIndex) {
         // IDYES and IDNO both fall through to actually perform the delete.
     }
 
-    bool ok = app->GetState()->GetHttp()->DeleteTodo(todo.id);
-    if (ok) {
-        // Optimistic: mark locally as deleted (set deleted_at to a sentinel)
-        // so the row gets the "deleted" style until WS refresh catches up.
-        todos_[rowIndex].deleted_at = std::string("pending");
-    }
+    // ---- Optimistic soft-delete ----------------------------------
+    //
+    // Snapshot the row for rollback, flip deleted_at locally so the
+    // row immediately shows the "deleted" style, then fire async
+    // DELETE. On failure clear deleted_at back (no server-returned
+    // row to swap — DELETE's bool API doesn't carry one) so the row
+    // returns to its live state. On success keep our optimistic
+    // state; the WS-driven refresh will replace it with the
+    // server-authoritative row (with a real deleted_at timestamp)
+    // shortly.
+    uint64_t todoId = todo.id;
+    std::string prevDeletedAt = todos_[rowIndex].deleted_at;
+    todos_[rowIndex].deleted_at = std::string("pending");
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    app->GetState()->GetHttp()->AsyncDeleteTodo(todoId,
+        [this, alive = alive_, todoId, prevDeletedAt = std::move(prevDeletedAt)]
+        (bool ok) {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            if (!ok) {
+                auto it = std::find_if(todos_.begin(), todos_.end(),
+                    [todoId](const models::Todo& t) { return t.id == todoId; });
+                if (it != todos_.end()) {
+                    it->deleted_at = prevDeletedAt;
+                }
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,20 +1569,43 @@ void StickyWindow::DoDeleteSticky() {
         }
     }
 
-    bool ok = app->GetState()->GetHttp()->DeleteSticky(stickyId_);
-    if (!ok) {
-        // HTTP failure — leave the window open. macOS also leaves the sticky
-        // present on failure (the mutation is revoked). No local optimistic
-        // state to unwind here because we haven't modified anything yet.
-        return;
-    }
+    // ---- Pessimistic delete --------------------------------------
+    //
+    // Don't optimistically close the window: DeleteSticky IS the
+    // action that removes the window, so if the HTTP fails we need
+    // the window to still be around to surface the failure (and
+    // re-enable the trash button). Set stickyDeleting_ to disable
+    // the trash button UI while the request is in flight.
+    //
+    // Guard re-entry: if the user somehow clicks trash twice between
+    // the async call and its callback, the second click is a no-op.
+    if (stickyDeleting_) return;
+    stickyDeleting_ = true;
+    InvalidateRect(hwnd_, nullptr, FALSE);
 
-    // Success: the server broadcast sticky.deleted → AppState →
-    // PostMessageToSticky(WM_STICKYTODO_STICKY_DELETED) will shortly land in
-    // our queue and trigger DestroyWindow. We can also post it immediately to
-    // close faster than waiting for the WS round-trip; the duplicate delivery
-    // is harmless because the handler is idempotent (checks hwnd_ != nullptr).
-    PostMessageW(hwnd_, core::WM_STICKYTODO_STICKY_DELETED, 0, 0);
+    app->GetState()->GetHttp()->AsyncDeleteSticky(stickyId_,
+        [this, alive = alive_](bool ok) {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            if (!ok) {
+                // Failure: re-enable the trash button for a retry.
+                // Leave the sticky visible and unchanged. macOS's
+                // equivalent path also silently leaves the sticky
+                // on failure (no user-facing error — best we can do
+                // without a toast system).
+                stickyDeleting_ = false;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            // Success: the server broadcast sticky.deleted will
+            // land shortly and trigger WM_STICKYTODO_STICKY_DELETED
+            // → DestroyWindow. Post it directly to close faster —
+            // the handler is idempotent so a duplicate WS-driven
+            // post later is harmless. Leave stickyDeleting_ = true
+            // so no further clicks can slip through between this
+            // post and WM_DESTROY.
+            PostMessageW(hwnd_, core::WM_STICKYTODO_STICKY_DELETED, 0, 0);
+        });
 }
 
 void StickyWindow::DoRestore(size_t rowIndex) {
@@ -1277,11 +1613,32 @@ void StickyWindow::DoRestore(size_t rowIndex) {
     auto* app = GetApp();
     if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
 
-    auto updated = app->GetState()->GetHttp()->RestoreTodo(todos_[rowIndex].id);
-    if (updated.has_value()) {
-        todos_[rowIndex] = *updated;
-    }
+    uint64_t todoId = todos_[rowIndex].id;
+    models::Todo snapshot = todos_[rowIndex];
+    // Optimistic: clear deleted_at so IsDeleted() returns false and the
+    // row re-renders as active. Todo::deleted_at is
+    // std::optional<std::string>, so reset the optional to clear.
+    todos_[rowIndex].deleted_at.reset();
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    app->GetState()->GetHttp()->AsyncRestoreTodo(todoId,
+        [this, alive = alive_, todoId, snapshot = std::move(snapshot)]
+        (std::optional<models::Todo> updated) mutable {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            auto it = std::find_if(todos_.begin(), todos_.end(),
+                [todoId](const models::Todo& t) { return t.id == todoId; });
+            if (it == todos_.end()) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                return;
+            }
+            if (updated.has_value()) {
+                *it = std::move(*updated);
+            } else {
+                *it = std::move(snapshot);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,27 +1651,64 @@ void StickyWindow::ShowFilterEditor() {
     auto* app = GetApp();
     if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
 
+    // FilterEditor::ShowModal is a locally-driven modal window (no
+    // HTTP), so it's fine to keep that call synchronous — it returns
+    // after the user closes the filter dialog. Only the subsequent
+    // persistence + refetch need to go async.
     models::Filter edited = filter_;
     bool ok = FilterEditor::ShowModal(hwnd_, hInstance_, edited);
     if (!ok) return;
 
+    // ---- Optimistic filter apply ---------------------------------
+    //
+    // Apply the new filter locally immediately so the sticky's
+    // filter label in the title bar updates right away and the
+    // upcoming LoadData uses the new filter. Snapshot the previous
+    // filter JSON + local filter for rollback on UpsertSticky
+    // failure.
     std::string filterJson = codec::StickyCodec::FilterToJson(edited);
-    auto updated = app->GetState()->GetHttp()->UpsertSticky(
-        stickyId_, stickyNote_.title, stickyNote_.bg_color, filterJson);
-    if (updated.has_value()) {
-        stickyNote_ = *updated;
-    } else {
-        // Persist failed — keep local filter in sync with what the user saw in the editor.
-        stickyNote_.filter = filterJson;
-    }
-    filter_ = edited;
+    std::string prevFilterJson = stickyNote_.filter;
+    models::Filter prevFilter = filter_;
 
-    // Refetch with the new filter.
-    auto todosResult = app->GetState()->GetHttp()->ListTodos(filter_);
-    if (todosResult.has_value()) {
-        todos_ = std::move(todosResult->items);
-    }
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    filter_ = edited;
+    stickyNote_.filter = filterJson;
+
+    // Kick off async persist. The filter list refresh is handled by
+    // LoadData() — called unconditionally below — which itself runs
+    // AsyncListTodos, so we don't double-fetch here.
+    app->GetState()->GetHttp()->AsyncUpsertSticky(
+        stickyId_, stickyNote_.title, stickyNote_.bg_color, filterJson,
+        [this, alive = alive_,
+         prevFilterJson = std::move(prevFilterJson),
+         prevFilter = std::move(prevFilter)]
+        (std::optional<models::StickyNote> updated) {
+            if (!alive->load()) return;
+            if (!hwnd_) return;
+            if (updated.has_value()) {
+                // Server-authoritative sticky: accept it wholesale
+                // (preserves server-side fields like frame). Don't
+                // overwrite filter_ — we already set it locally and
+                // the server's filter echoes ours.
+                stickyNote_ = std::move(*updated);
+            } else {
+                // Rollback: restore prev filter so the next refresh
+                // uses the pre-edit filter. Avoid flicker by only
+                // re-loading if we're still in a state consistent
+                // with the rollback (filter_ still == edited). A
+                // concurrent WS event could have already overwritten
+                // stickyNote_, in which case rollback is moot.
+                filter_ = prevFilter;
+                stickyNote_.filter = prevFilterJson;
+                LoadData();  // refetch with the reverted filter
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        });
+
+    // Kick off the list refresh with the new filter in parallel
+    // with UpsertSticky. If UpsertSticky later fails, its callback
+    // will LoadData again with the reverted filter — that's the
+    // only surface that needs to care about persist failure.
+    LoadData();
 }
 
 } // namespace stickytodo::ui

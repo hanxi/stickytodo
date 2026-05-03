@@ -1,10 +1,12 @@
 #include "ui/TrayIcon.h"
 #include "App.h"
 #include "core/AppState.h"
+#include "core/UIThreadMarshal.h" // For WM_STICKYTODO_RUN_ON_UI.
 
 #include <strsafe.h>
 #include <objbase.h>
 #include <cwctype>
+#include <functional>
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -165,24 +167,59 @@ void TrayIcon::HandleMenuCommand(UINT cmdId) {
 
             // Create on server with default title and default sticky yellow
             // color. Successful creation only mutates the server-side store;
-            // we then call FetchStickies() which updates the local cache AND
-            // fires onStickiesChanged_ → App::SyncStickyWindows(), which in
-            // turn opens the new window. This is deliberately a SINGLE path
-            // — we do NOT also call OpenStickyWindow(stickyId) here. Calling
-            // both would be harmless (App::OpenStickyWindow de-dupes via its
-            // map) but would set up a confusing "new-sticky window open" UX
-            // with two entry points that must stay in sync forever. Keeping
-            // SyncStickyWindows as the single owner of window open/close
-            // means any future creation path (tray, keyboard shortcut,
-            // WS-driven sticky.upserted from another device, …) benefits
-            // from one canonical behaviour.
+            // we then call FetchStickiesAsync which updates the local cache
+            // AND fires onStickiesChanged_ → App::SyncStickyWindows(), which
+            // in turn opens the new window. This is deliberately a SINGLE
+            // path — we do NOT also call OpenStickyWindow(stickyId) here.
+            // Calling both would be harmless (App::OpenStickyWindow de-dupes
+            // via its map) but would set up a confusing "new-sticky window
+            // open" UX with two entry points that must stay in sync forever.
+            // Keeping SyncStickyWindows as the single owner of window
+            // open/close means any future creation path (tray, keyboard
+            // shortcut, WS-driven sticky.upserted from another device, …)
+            // benefits from one canonical behaviour.
+            //
+            // Async, not sync: UpsertSticky + ListStickies together can take
+            // up to 2 × (resolve+connect+send+receive) = ~80s on a bad
+            // network, and this runs on the UI thread after the tray menu's
+            // TrackPopupMenu returns. Blocking the UI thread for that long
+            // is exactly the "window not responding" regression we're
+            // eliminating in this refactor. Async callbacks are marshalled
+            // back to the UI thread via PostToUIThread (tray HWND), so by
+            // the time we touch AppState state we're on the UI thread again
+            // with the same thread-safety story as the previous sync code.
+            //
+            // Callback captures ONLY stickyId by value (not `this` / `app`):
+            // after the menu closes, this TrayIcon instance may still exist
+            // but the safe way to re-reach AppState in a callback is via
+            // stickytodo::GetApp() which handles the Shutdown race cleanly
+            // (returns nullptr if App has already torn down).
             if (app->GetState() && app->GetState()->IsAuthenticated()) {
                 std::string defaultBgColor = R"({"red":1.0,"green":0.92,"blue":0.54,"alpha":1.0})";
-                auto result = app->GetState()->GetHttp()->UpsertSticky(
-                    stickyId, "New Note", defaultBgColor, "{}");
-                if (result.has_value()) {
-                    app->GetState()->FetchStickies();
-                }
+                app->GetState()->UpsertStickyAsync(
+                    stickyId, "New Note", defaultBgColor, "{}",
+                    [stickyId](std::optional<stickytodo::models::StickyNote> result) {
+                        if (!result.has_value()) {
+                            // Silent failure: the tray menu is already
+                            // closed, there's no status control to surface
+                            // an error to. A WS reconnect-driven refresh
+                            // will reconcile eventually if the server did
+                            // persist. Consistent with the pre-refactor
+                            // behaviour (which also silently no-op'd on
+                            // UpsertSticky returning nullopt).
+                            return;
+                        }
+                        auto* app2 = stickytodo::GetApp();
+                        if (!app2 || !app2->GetState()) return;
+                        // Refresh the authoritative sticky list so
+                        // SyncStickyWindows opens the new window. Nested
+                        // callback intentionally empty — onStickiesChanged_
+                        // inside FetchStickiesAsync drives the UI update,
+                        // we don't need the bool success signal here
+                        // (same silent-on-failure policy as above).
+                        app2->GetState()->FetchStickiesAsync(
+                            [](bool /*ok*/) {});
+                    });
             }
             break;
         }
@@ -258,6 +295,42 @@ LRESULT CALLBACK TrayIcon::TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             if (auto* state = app->GetState()) {
                 state->HandleWsSignalOnUIThread(signal);
             }
+        }
+        return 0;
+    }
+
+    // Generic "run arbitrary callable on the UI thread" marshalling. The
+    // wParam is a heap-allocated std::function<void()>* produced by
+    // core::PostToUIThread (from any thread — typically an HTTP async
+    // worker). We invoke it on the UI thread then delete the allocation.
+    //
+    // Why this lives in TrayIcon's WndProc rather than in a dedicated
+    // window: the tray's message-only HWND already exists for WS event
+    // marshalling (SetUIThreadTarget in App::Initialize), lives as long
+    // as the app does, and is created on + pumped by the UI thread. Any
+    // *new* hidden window we added for this would duplicate that setup
+    // with zero semantic difference, and introduce a second HWND that
+    // App::Shutdown would have to tear down in a careful order. Reusing
+    // this single tray HWND keeps the marshalling story — WS events,
+    // WS signals, and arbitrary callables — consistent and
+    // single-ownership.
+    //
+    // Exception safety: if the invoked function throws, we still need
+    // to delete the heap allocation to avoid a leak. The try/catch
+    // swallows the exception because propagating out of a WndProc
+    // crosses Win32 message-dispatch boundaries (the OS, not our code,
+    // is between the throw site and any C++ catch block in WinMain),
+    // which is undefined behaviour. Worker-thread-originated callbacks
+    // should not normally throw anyway.
+    if (msg == core::WM_STICKYTODO_RUN_ON_UI) {
+        auto* fn = reinterpret_cast<std::function<void()>*>(wParam);
+        if (fn) {
+            try {
+                (*fn)();
+            } catch (...) {
+                // Intentionally swallowed — see rationale above.
+            }
+            delete fn;
         }
         return 0;
     }

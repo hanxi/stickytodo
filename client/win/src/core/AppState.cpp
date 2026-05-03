@@ -7,6 +7,11 @@
 
 namespace stickytodo::core {
 
+// NOTE: PostToUIThread() and WM_STICKYTODO_RUN_ON_UI live in
+// core/UIThreadMarshal.{h,cpp} — see the comment block above the
+// WM_STICKYTODO_* constants in AppState.h for the rationale behind
+// splitting them out.
+
 AppState::AppState() = default;
 AppState::~AppState() { Shutdown(); }
 
@@ -40,6 +45,33 @@ void AppState::Shutdown() {
     DisconnectWebSocket();
 }
 
+void AppState::ApplyLoginSuccess(const std::string& baseUrl, const LoginResult& result) {
+    // Store credentials
+    baseUrl_ = baseUrl;
+    username_ = result.username;
+    token_ = result.token;
+
+    // Ensure http_ reflects the new identity. We set baseUrl + token
+    // here (rather than leaving it to the caller) because both the
+    // sync Login path and the async path want the same invariant:
+    // after success, http_ is fully configured for authenticated
+    // follow-up calls.
+    http_.SetBaseUrl(baseUrl_);
+    http_.SetToken(token_);
+    http_.SetOnUnauthorized([this]() { HandleUnauthorized(); });
+
+    // Persist to Credential Manager.
+    CredentialStore::Credentials creds;
+    creds.username = username_;
+    creds.token = token_;
+    creds.base_url = baseUrl_;
+    CredentialStore::Save(creds);
+
+    // Notify auth change + connect WebSocket.
+    if (onAuthChanged_) onAuthChanged_(true);
+    ConnectWebSocket();
+}
+
 bool AppState::Login(const std::string& baseUrl, const std::string& username, const std::string& password) {
     // Configure HTTP client for this attempt
     http_.SetBaseUrl(baseUrl);
@@ -51,26 +83,7 @@ bool AppState::Login(const std::string& baseUrl, const std::string& username, co
         return false;
     }
 
-    // Store credentials
-    baseUrl_ = baseUrl;
-    username_ = result->username;
-    token_ = result->token;
-
-    http_.SetToken(token_);
-
-    // Persist to Credential Manager
-    CredentialStore::Credentials creds;
-    creds.username = username_;
-    creds.token = token_;
-    creds.base_url = baseUrl_;
-    CredentialStore::Save(creds);
-
-    // Notify auth change
-    if (onAuthChanged_) onAuthChanged_(true);
-
-    // Connect WebSocket
-    ConnectWebSocket();
-
+    ApplyLoginSuccess(baseUrl, *result);
     return true;
 }
 
@@ -104,6 +117,114 @@ std::string AppState::TestConnection(const std::string& baseUrl) {
         return health->version;
     }
     return "";
+}
+
+// ==========================================================================
+// Async API (callbacks fire on the UI thread via core::PostToUIThread)
+// ==========================================================================
+
+void AppState::TestConnectionAsync(const std::string& baseUrl,
+                                   TestConnectionCallback onDone) {
+    // Thin fan-out to http_.AsyncHealthCheck: the worker thread
+    // runs HealthCheck on a local HttpClient (no token needed, no
+    // this->* access) and PostToUIThreads the completion back. We
+    // translate the optional<HealthResult> to a version string here
+    // in the UI-thread callback so SettingsWindow's UI code doesn't
+    // need to know about HttpClient types. Empty version string ==
+    // failure, matching sync TestConnection's contract.
+    http_.AsyncHealthCheck(baseUrl,
+        [cb = std::move(onDone)](std::optional<HealthResult> result) {
+            if (!cb) return;
+            if (result.has_value()) {
+                cb(result->version);
+            } else {
+                cb(std::string{});
+            }
+        });
+}
+
+void AppState::LoginAsync(const std::string& baseUrl,
+                          const std::string& username,
+                          const std::string& password,
+                          LoginAsyncCallback onDone) {
+    // Snapshot `this` + args into the UI-thread completion lambda.
+    // `this` capture is safe here because the lambda only runs on
+    // the UI thread via PostToUIThread — AppState's lifetime is
+    // bounded by App's lifetime, which is bounded by the UI thread
+    // itself (WinMain's message loop). By the time AppState could be
+    // destroyed the tray HWND is already gone, PostToUIThread
+    // returns false, and the lambda is never invoked. So no
+    // use-after-free window exists here.
+    //
+    // The baseUrl string is value-captured because http_.AsyncLogin
+    // doesn't echo it back in the callback — we need it in
+    // ApplyLoginSuccess to persist into baseUrl_.
+    http_.AsyncLogin(baseUrl, username, password,
+        [this, baseUrl, cb = std::move(onDone)](std::optional<LoginResult> result) {
+            if (!result.has_value()) {
+                if (cb) cb(false);
+                return;
+            }
+            // Success path: apply all the side effects that the sync
+            // Login() path applies — then notify the caller.
+            ApplyLoginSuccess(baseUrl, *result);
+            if (cb) cb(true);
+        });
+}
+
+void AppState::ListAuditLogsAsync(int page, int pageSize,
+                                  const std::string& action,
+                                  ListAuditLogsCallback onDone) {
+    // Pure query — delegate directly. HttpClient::AsyncListAuditLogs
+    // already snapshots baseUrl_/token_/onUnauthorized_ and marshals
+    // back to the UI thread.
+    http_.AsyncListAuditLogs(page, pageSize, action,
+        [cb = std::move(onDone)](std::vector<models::AuditLog> logs) {
+            if (cb) cb(std::move(logs));
+        });
+}
+
+void AppState::FetchStickiesAsync(FetchStickiesAsyncCallback onDone) {
+    // `this` capture is safe: the UI-thread callback delivered via
+    // PostToUIThread can only fire while the tray HWND is alive,
+    // which is bounded by App's lifetime (tray_ destruction in
+    // App::Shutdown nulls our uiThreadTarget_ → PostToUIThread drops
+    // the callback). See LoginAsync's comment for the full lifetime
+    // argument.
+    if (!IsAuthenticated()) {
+        if (onDone) onDone(false);
+        return;
+    }
+    http_.AsyncListStickies(
+        [this, cb = std::move(onDone)](std::optional<StickyListResult> result) {
+            if (!result.has_value()) {
+                if (cb) cb(false);
+                return;
+            }
+            // Same side effects as the blocking FetchStickies(): take
+            // the mutex, replace stickies_, fire onStickiesChanged_.
+            {
+                std::lock_guard<std::mutex> lock(dataMutex_);
+                stickies_ = std::move(result->items);
+            }
+            if (onStickiesChanged_) onStickiesChanged_();
+            if (cb) cb(true);
+        });
+}
+
+void AppState::UpsertStickyAsync(const std::string& id,
+                                 const std::string& title,
+                                 const std::string& bgColor,
+                                 const std::string& filter,
+                                 UpsertStickyAsyncCallback onDone) {
+    // Pure delegation. No AppState-level side effects — the
+    // authoritative update comes back through the server's
+    // sticky.upserted WS event, which already funnels into
+    // MergeStickyUpserted on the UI thread.
+    http_.AsyncUpsertSticky(id, title, bgColor, filter,
+        [cb = std::move(onDone)](std::optional<models::StickyNote> sticky) {
+            if (cb) cb(std::move(sticky));
+        });
 }
 
 std::vector<models::StickyNote> AppState::GetStickies() const {

@@ -40,6 +40,16 @@ public:
     /// Access the app state (auth, HTTP, WS, data).
     core::AppState* GetState() const { return state_.get(); }
 
+    /// Access the singleton settings window (may be nullptr if never
+    /// shown yet). Used by UI-thread async callbacks to verify the
+    /// original issuing window is still alive before mutating its
+    /// state — the async HTTP layer's PostToUIThread only guarantees
+    /// the callback runs on the UI thread, NOT that the widget the
+    /// callback wants to update still exists. Compare against a
+    /// captured `this` before touching window state:
+    ///   if (GetApp()->GetSettingsWindow() != self) return;
+    ui::SettingsWindow* GetSettingsWindow() const { return settings_.get(); }
+
     /// Open/focus the settings window.
     void ShowSettings();
 

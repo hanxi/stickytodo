@@ -21,6 +21,10 @@
 #   client/web/public/
 #       favicon.svg (copy of master), favicon-32.png, favicon-16.png,
 #       apple-touch-icon.png (180×180)
+#   client/win/src/res/icons/stickytodo.ico        (multi-resolution ICO
+#       embedded into stickytodo.exe via src/res/app.rc's `IDI_APPICON ICON
+#       "icons\\stickytodo.ico"`. Contains 16/20/24/32/40/48/64/128/256 frames
+#       so Explorer/Taskbar/Alt-Tab/Jump-List all pick a crisp size.)
 #   assets/branding/out/AppIcon.icns              (standalone icns for DMG/about box)
 #
 # Rasterization strategy:
@@ -42,6 +46,7 @@
 #   scripts/generate-icons.sh                # full regen
 #   scripts/generate-icons.sh --mac-only     # only the AppIcon.appiconset + icns
 #   scripts/generate-icons.sh --web-only     # only the web favicons
+#   scripts/generate-icons.sh --win-only     # only the Windows multi-res .ico
 #
 # Idempotent: rerunning overwrites outputs deterministically.
 
@@ -55,16 +60,19 @@ MENUBAR_SVG_SRC="$REPO_ROOT/assets/branding/stickytodo-menubar.svg"
 MAC_ICONSET_DIR="$REPO_ROOT/client/mac/stickytodo/Assets.xcassets/AppIcon.appiconset"
 MAC_MENUBAR_DIR="$REPO_ROOT/client/mac/stickytodo/Assets.xcassets/MenuBarIcon.imageset"
 WEB_PUBLIC_DIR="$REPO_ROOT/client/web/public"
+WIN_ICO_PATH="$REPO_ROOT/client/win/src/res/icons/stickytodo.ico"
 BRANDING_OUT_DIR="$REPO_ROOT/assets/branding/out"
 TMP_DIR="$(mktemp -d -t stickytodo-icons.XXXXXX)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 MAC_ONLY=0
 WEB_ONLY=0
+WIN_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --mac-only) MAC_ONLY=1 ;;
     --web-only) WEB_ONLY=1 ;;
+    --win-only) WIN_ONLY=1 ;;
     -h|--help)
       sed -n '2,35p' "$0"
       exit 0
@@ -75,6 +83,16 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# Mutual exclusivity: the three "--*-only" flags are documented as selecting
+# *one* target. If caller passes more than one we'd silently do nothing (each
+# section's guard requires all other "*_ONLY" vars to be 0), so fail fast with
+# a clear message instead.
+only_count=$(( MAC_ONLY + WEB_ONLY + WIN_ONLY ))
+if (( only_count > 1 )); then
+  echo "generate-icons: --mac-only / --web-only / --win-only are mutually exclusive" >&2
+  exit 2
+fi
 
 log() { printf '[generate-icons] %s\n' "$*"; }
 
@@ -193,6 +211,79 @@ render_menubar_svg_to_png() {
   [[ -s "$out" ]] || { echo "generate-icons: empty output $out" >&2; return 1; }
 }
 
+# build_windows_ico <out-ico>
+# Pack a multi-resolution Windows .ico from the colored master SVG.
+#
+# Frame set (16/20/24/32/40/48/64/128/256) matches the sizes the Windows shell
+# actually asks for across DPI scales + surfaces (Taskbar, Alt-Tab, Start
+# Menu, Explorer tiles, File Properties). Shipping all of them lets Windows
+# pick a pre-rendered frame instead of bilinear-resampling a single large one
+# (which looks fuzzy at 16/20/24).
+#
+# The 256×256 frame is stored as PNG-compressed inside the ICO (Vista+ format
+# extension). ImageMagick and icotool both emit it that way automatically;
+# png2ico does not support 256, so we skip that size when falling back to it.
+#
+# Tool preference (all OS-agnostic — the Windows ico ships from any host):
+#   1. magick / convert (ImageMagick)  — single-call multi-frame packer, most
+#                                         portable; always emits PNG compression
+#                                         for the 256 frame
+#   2. icotool (icoutils)              — brew install icoutils; clean CLI
+#   3. png2ico                         — last resort; caps at 128, so output
+#                                         is a degraded ICO (warning printed)
+build_windows_ico() {
+  local out="$1"
+  local work="$TMP_DIR/win-ico"
+  mkdir -p "$work"
+
+  # Sizes that Windows actually requests. Keep sorted ascending so packing
+  # tools emit frames in a deterministic order.
+  local -a WIN_SIZES=(16 20 24 32 40 48 64 128 256)
+
+  log "  rendering Windows PNG frames: ${WIN_SIZES[*]}"
+  local s
+  for s in "${WIN_SIZES[@]}"; do
+    render_svg_to_png "$SVG_SRC" "$s" "$work/icon_${s}.png"
+  done
+
+  mkdir -p "$(dirname "$out")"
+
+  # ImageMagick: `magick icon_16.png icon_20.png ... icon_256.png out.ico`
+  # packs every input as a separate frame; the 256 frame is auto-encoded as
+  # embedded PNG (verify with `magick identify out.ico` — look for "PNG" in
+  # the format column of the largest frame).
+  if command -v magick >/dev/null 2>&1; then
+    local -a frames=()
+    for s in "${WIN_SIZES[@]}"; do frames+=("$work/icon_${s}.png"); done
+    magick "${frames[@]}" "$out"
+  elif command -v convert >/dev/null 2>&1; then
+    local -a frames=()
+    for s in "${WIN_SIZES[@]}"; do frames+=("$work/icon_${s}.png"); done
+    convert "${frames[@]}" "$out"
+  elif command -v icotool >/dev/null 2>&1; then
+    # icotool auto-picks PNG compression for frames ≥ 256, per its manpage.
+    local -a frames=()
+    for s in "${WIN_SIZES[@]}"; do frames+=("$work/icon_${s}.png"); done
+    icotool -c -o "$out" "${frames[@]}"
+  elif command -v png2ico >/dev/null 2>&1; then
+    # png2ico chokes on 256; drop it and warn so the caller knows the ICO is
+    # missing the tile-sized frame.
+    echo "generate-icons: png2ico does not support 256px frames; omitting it" >&2
+    local -a frames=()
+    for s in "${WIN_SIZES[@]}"; do
+      [[ "$s" -le 128 ]] && frames+=("$work/icon_${s}.png")
+    done
+    png2ico "$out" "${frames[@]}"
+  else
+    echo "generate-icons: need one of: magick (ImageMagick), icotool (icoutils), or png2ico to build a Windows .ico" >&2
+    echo "  brew install imagemagick    # recommended — single tool, handles 256 frame" >&2
+    echo "  brew install icoutils       # alternative" >&2
+    return 1
+  fi
+
+  [[ -s "$out" ]] || { echo "generate-icons: empty output $out" >&2; return 1; }
+}
+
 # ---------- Mac AppIcon.appiconset ----------
 if [[ "$WEB_ONLY" -eq 0 ]]; then
   log "building macOS AppIcon.appiconset at $MAC_ICONSET_DIR"
@@ -289,8 +380,24 @@ JSON
 JSON
 fi
 
+# ---------- Windows multi-resolution .ico ----------
+# This is the icon embedded into stickytodo.exe via src/res/app.rc's
+# `IDI_APPICON ICON "icons\\stickytodo.ico"`. Windows picks a frame out of it
+# per-DPI/per-surface, so we ship every size the shell might request rather
+# than letting it resample a single large frame (which looks blurry at small
+# sizes in the taskbar / Alt-Tab).
+#
+# AGENTS.md previously documented this file as "hand-checked-in, regenerate
+# manually"; now that we have a reliable multi-frame packer path, keep that
+# note in sync when editing this section.
+if [[ "$MAC_ONLY" -eq 0 && "$WEB_ONLY" -eq 0 ]]; then
+  log "building Windows .ico at $WIN_ICO_PATH"
+  build_windows_ico "$WIN_ICO_PATH"
+  log "  wrote $WIN_ICO_PATH"
+fi
+
 # ---------- Web favicons ----------
-if [[ "$MAC_ONLY" -eq 0 ]]; then
+if [[ "$MAC_ONLY" -eq 0 && "$WIN_ONLY" -eq 0 ]]; then
   log "building web favicons at $WEB_PUBLIC_DIR"
   mkdir -p "$WEB_PUBLIC_DIR"
 

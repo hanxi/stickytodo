@@ -53,7 +53,18 @@ bool App::Initialize(int /*nCmdShow*/)
     //    one-shot publish of uiThreadTarget_ happens before
     //    ConnectWebSocket spawns the worker thread, so there's no data
     //    race between the UI thread's write and the worker thread's read.
-    state_->SetUIThreadTarget(tray_->GetMessageHwnd());
+    //
+    //    AppState owns HttpClient by value (AppState::http_). We publish
+    //    the SAME tray HWND into HttpClient so its Async* methods (used
+    //    by SettingsWindow's Test / Login / LoadAuditLogs buttons and
+    //    eventually by AppState's own async API) can marshal their
+    //    completion callbacks back onto the UI thread via the same
+    //    PostToUIThread path. If this line is missing, every Async*
+    //    callback is silently dropped — see HttpClient::SetUIThreadTarget
+    //    contract in HttpClient.h.
+    HWND uiTarget = tray_->GetMessageHwnd();
+    state_->SetUIThreadTarget(uiTarget);
+    state_->GetHttp()->SetUIThreadTarget(uiTarget);
 
     // 5) Subscribe to the stickies-changed callback. Every code path that
     //    mutates the authoritative sticky list (FetchStickies,
@@ -83,32 +94,108 @@ bool App::Initialize(int /*nCmdShow*/)
 
 void App::Shutdown()
 {
-    // Teardown order is the reverse of Initialize(), and it matters:
+    // Teardown order is the reverse of Initialize(), and every step
+    // matters for the detached HTTP async workers to land safely.
+    // The detached std::thread workers spawned by
+    // HttpClient::AsyncHealthCheck / AsyncLogin / AsyncListAuditLogs
+    // may still be mid-WinHTTP (up to ~40s per request) when we
+    // start tearing down; they eventually come back and call
+    // core::PostToUIThread on their captured HWND. We must make
+    // both "still running" and "just finished" cases non-leaking
+    // and non-crashing.
     //
-    // 1) Stop AppState first — this Disconnect()s the WS worker thread
-    //    and joins it. After state_->Shutdown() returns, no more
-    //    PostWsEventToUIThread / PostWsSignalToUIThread calls can happen,
-    //    which means no more heap-allocated WsEvent pointers will be
-    //    posted at the tray HWND. Without this ordering we'd race: tray
-    //    destroyed → WS worker still posting → PostMessageW returns
-    //    false → AppState's fallback `delete heap` runs, but ONLY if the
-    //    race is clean; any in-flight message already enqueued before
-    //    DestroyWindow would leak.
+    // 1) Stop the WS worker (joins inside WebSocketClient::Disconnect).
+    //    After state_->Shutdown() returns, no more WS-originated
+    //    PostMessageW fires. HTTP async workers may still be
+    //    mid-flight — that's fine, they target the tray HWND which
+    //    is still alive here.
     if (state_) {
         state_->Shutdown();
     }
 
-    // 2) Destroy the tray icon (and its message-only HWND). Safe now
-    //    because nothing will PostMessageW to it any more.
+    // 2) "Cut off new arrivals" — null out the UI-thread targets
+    //    inside AppState and HttpClient. Any HTTP async worker that
+    //    finishes AFTER this point sees a null target in
+    //    core::PostToUIThread, which returns false, frees the
+    //    heap-allocated std::function, and drops the callback.
+    //    This has to run BEFORE tray_->Destroy() so that a worker
+    //    completing during the window between here and the drain
+    //    below cannot add new enqueued messages we'd then fail to
+    //    handle.
+    if (state_) {
+        state_->SetUIThreadTarget(nullptr);
+        if (auto* http = state_->GetHttp()) {
+            http->SetUIThreadTarget(nullptr);
+        }
+    }
+
+    // 3) "Drain already-enqueued messages" — by the time we reach
+    //    step 2, zero to N  WM_STICKYTODO_RUN_ON_UI messages may
+    //    already sit in the tray HWND's queue (posted by HTTP
+    //    workers that completed earlier but whose messages the main
+    //    loop never got to process because the user quit). If we
+    //    went straight to DestroyWindow, those would be discarded
+    //    by Win32 and their heap-allocated std::function payloads
+    //    would leak.
+    //
+    //    PeekMessageW with PM_REMOVE pulls each pending message off
+    //    the queue; DispatchMessageW routes it to TrayIcon::TrayWndProc
+    //    which runs its WM_STICKYTODO_RUN_ON_UI branch (invoke then
+    //    delete). We only drain our own custom messages, so
+    //    DispatchMessageW doesn't trigger unrelated side-effects.
+    //
+    //    There's no loop bound issue: the set of drainable messages
+    //    is finite because step 2 blocked new additions. We pass
+    //    both the tray HWND and the message filter range to
+    //    PeekMessageW so we don't accidentally dispatch unrelated
+    //    windows' messages (sticky windows / settings window may
+    //    still have queued repaint messages and we want those
+    //    discarded on their own destroy).
+    if (tray_) {
+        HWND trayHwnd = tray_->GetMessageHwnd();
+        if (trayHwnd) {
+            MSG msg;
+            while (PeekMessageW(&msg, trayHwnd,
+                                core::WM_STICKYTODO_RUN_ON_UI,
+                                core::WM_STICKYTODO_RUN_ON_UI,
+                                PM_REMOVE)) {
+                DispatchMessageW(&msg);
+            }
+            // Also drain the WS event/signal messages for the same
+            // reason — state_->Shutdown already joined the WS
+            // worker so no new WS messages can be posted, but
+            // previously-enqueued ones still need their WsEvent
+            // heap allocations freed by the TrayWndProc branch.
+            while (PeekMessageW(&msg, trayHwnd,
+                                core::WM_STICKYTODO_WS_EVENT,
+                                core::WM_STICKYTODO_WS_EVENT,
+                                PM_REMOVE)) {
+                DispatchMessageW(&msg);
+            }
+            while (PeekMessageW(&msg, trayHwnd,
+                                core::WM_STICKYTODO_WS_SIGNAL,
+                                core::WM_STICKYTODO_WS_SIGNAL,
+                                PM_REMOVE)) {
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    // 4) Destroy the tray icon (and its message-only HWND). Safe now:
+    //    no new messages can be posted (step 2 nulled the target),
+    //    and all previously-enqueued ones have been drained (step 3).
+    //    Any HTTP worker that finishes from this point on will find
+    //    the target HWND already nulled inside HttpClient/AppState
+    //    and drop its callback without touching Win32 at all.
     if (tray_) {
         tray_->Destroy();
         tray_.reset();
     }
 
-    // 3) Settings window — independent, just a normal top-level window.
+    // 5) Settings window — independent, just a normal top-level window.
     settings_.reset();
 
-    // 4) Close all sticky windows. Lock is taken for form (no concurrent
+    // 6) Close all sticky windows. Lock is taken for form (no concurrent
     //    writer remains at this point because WS is dead and the UI
     //    thread is calling Shutdown), but cheap and clarifies intent.
     {
@@ -116,11 +203,21 @@ void App::Shutdown()
         stickyWindows_.clear();
     }
 
-    // 5) Finally drop AppState itself (its destructor is trivial at this
+    // 7) Finally drop AppState itself (its destructor is trivial at this
     //    point because Shutdown already disconnected the WS).
+    //
+    //    Note on detached HTTP workers: at this point up to ~40 s of
+    //    worker lifetime may remain (WinHTTP timeout budget). They
+    //    hold value-captured snapshots (baseUrl, token, callback
+    //    lambdas) on their own stack — NOT references into state_
+    //    or http_ — so dropping state_ here is safe. The process
+    //    itself will tear the workers down as part of ExitProcess
+    //    right after WinMain returns; no clean join is attempted
+    //    because std::thread::detach was a deliberate choice (see
+    //    HttpClient.cpp's async implementation contract).
     state_.reset();
 
-    // 6) Release D2D resources last — everything above that drew into
+    // 8) Release D2D resources last — everything above that drew into
     //    a render target is gone.
     renderer_.reset();
 

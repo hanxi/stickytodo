@@ -83,6 +83,7 @@ set(SOURCES
     src/main.cpp
     src/App.cpp
     src/core/AppState.cpp
+    src/core/UIThreadMarshal.cpp
     src/core/HttpClient.cpp
     src/core/WebSocketClient.cpp
     src/core/CredentialStore.cpp

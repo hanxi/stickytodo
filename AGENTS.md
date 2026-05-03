@@ -122,7 +122,7 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 │   ├── package-mac-client.sh  # xcodebuild universal → codesign → DMG
 │   ├── package-win-client.sh  # cmake --preset release + ctest + Inno Setup → zip + setup.exe + SHA256SUMS
 │   ├── package-docker.sh      # 单架构 docker build（多架构交给 CI）
-│   └── generate-icons.sh      # 从 assets/branding/*.svg 派生：Mac AppIcon.appiconset + MenuBarIcon.imageset（template）+ AppIcon.icns + Web favicons
+│   └── generate-icons.sh      # 从 assets/branding/*.svg 派生：Mac AppIcon.appiconset + MenuBarIcon.imageset（template）+ AppIcon.icns + Web favicons + Windows 多分辨率 stickytodo.ico
 ├── .github/workflows/
 │   ├── _build-all.yml         # 可复用 workflow，7 job：build-web / build-server(matrix) / build-mac-dmg / build-win-client / detect-docker-creds / build-docker(qemu+buildx) / publish-release
 │   ├── release-tag.yml        # push tag v* 自动走正式发布
@@ -366,10 +366,32 @@ Bundle 和命名（真值来自 `client/win/CMakeLists.txt` + `src/res/app.rc` +
 - Windows 桌面没有像 macOS `⌘,` 一样的系统级"打开设置"约定，SettingsWindow 的入口有 3 条：①**托盘图标右键菜单** → `Settings` ②**托盘图标双击**（等价于右键 → `Settings`，见 `TrayIcon::WndProc` 的 `WM_LBUTTONDBLCLK` 分派到 `App::ShowSettings`）③**便签窗口标题栏 `⚙` 按钮**（`settingsButton_` 永远可见，`onClick` 直接调 `App::ShowSettings()`）
 - 便签窗口内部：`Enter`（在 DraftTodoRow 聚焦时）= 提交新 TODO；`Esc`（编辑中）= 取消；**没有任何 `RegisterHotKey` 调用的全局/系统级快捷键**（grep `RegisterHotKey` / `MOD_CONTROL` / `VK_N` 全仓返回空；与 macOS 的 `⌘N` 仅菜单展开时可触达是同一哲学——所有 sticky/todo 级操作都靠托盘菜单或便签窗口按钮触发）
 
+**网络调用异步化** — 所有 UI 线程触发的 HTTP 调用都走 `HttpClient::Async*`，严禁在 UI 线程同步调 `HttpClient::*`：
+
+- **问题背景**：WinHTTP 的 `WinHttpSendRequest` / `WinHttpReceiveResponse` 是同步阻塞的，且默认超时**非常宽松**（按 Microsoft 文档 <https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpsettimeouts>：`dwResolveTimeout = 0` **表示"无超时/infinite"而非 0 秒**，`dwConnectTimeout = 60 s`、`dwSendTimeout = 30 s`、`dwReceiveTimeout = 30 s`；累加最坏情况是**无限**，即使名字解析快也至少 **120 s**）。在 `Button::onClick` lambda 里同步调 HTTP 会直接冻结窗口消息泵，表现为 Windows 弹出"未响应"灰屏。macOS 侧同样场景靠 `URLSession` 的 completion handler 天然异步，不需要这层基础设施
+- **超时值**：`HttpClient::DoRequest` 统一 `WinHttpSetTimeouts(session, 10000, 10000, 10000, 10000)` — resolve / connect / send / receive 各 10 s，兼顾内网快响和公网弱网。这是**会话级默认**，单个请求不再单独覆盖，保持行为可预测
+- **UI-thread marshal 机制**：`core/UIThreadMarshal.{h,cpp}` 提供 `SetUIThreadTarget(HWND)` / `PostToUIThread(std::function<void()>)`。实现方式：把 lambda heap-allocate 后通过 `PostMessageW(target, WM_STICKYTODO_RUN_ON_UI, 0, (LPARAM)funcPtr)` 投递；`TrayIcon::WndProc` 收到 `WM_STICKYTODO_RUN_ON_UI` 时 `invoke() + delete`。**target HWND 选 tray**（不是 sticky / settings 的 HWND），因为 tray 是 App 生命周期内存活最长且唯一的窗口（sticky 可能被删，settings 可能被关）。`PostMessageW` 天然线程安全、天然按到达顺序串行化执行，不需要额外的 mutex 或队列
+- **HttpClient Async API 形状**：每个同步方法都有配对的 `Async*` 变体，callback 签名是 `std::function<void(Result)>`（如 `AsyncListTodos(filter, [](std::optional<TodoListResult>){...})`）。内部实现统一样板：`std::thread([...]{ auto r = Sync版本(...); PostToUIThread([cb, r]{ cb(r); }); }).detach()`。**故意不用 `std::future` / `std::promise`**——MSVC `std::promise<void>` 在 WinHTTP 错误分支里存在生命周期陷阱（worker 抛 `future_error` 比 UI 线程读 future 更早时崩溃），`std::function` 回调简单可靠
+- **Worker 线程 `detach()` 的代价**：进程退出时最多有 **~40 s**（4 × 10 s 超时预算）的 detached worker 残留。`App::Shutdown` 的闭环设计把这个代价吸收掉：
+  1. step 2 `SetUIThreadTarget(nullptr)` — 后续 `PostToUIThread` 返回 false 直接丢弃 callback（worker 侧不会触碰已销毁对象）
+  2. step 3 `drain` 把 tray HWND 消息队列里已排队的 `WM_STICKYTODO_RUN_ON_UI` 全部 `DispatchMessage`（lambda 执行 + 堆对象释放，防止内存泄漏）
+  3. step 4-8 按 tray → settings → stickies → state_ → D2D 的顺序 reset
+  4. 最后 `g_app = nullptr`（`App.cpp:224`）。detached worker 即使在 `WinMain` 返回后才醒来也只会读到 `g_app == nullptr` 而 early-return，进程整体被 `ExitProcess` 清理，不 join 是**刻意选择**（见 `HttpClient.cpp` async 实现注释）
+- **UI 回调的 `this` 捕获安全性**：三种 guard 模式按窗口类型区分，**任何新加的异步回调必须选其一**：
+  - **StickyWindow（窗口数量不定、生命周期短、可被 WS 推送销毁）**：`std::shared_ptr<std::atomic<bool>> alive_` 字段（声明在 `StickyWindow.h:200`），构造时默认 true、析构函数**第一行**置 false。回调 capture `[this, alive = alive_, ...]`，入口先 `if (!alive->load()) return;`。shared_ptr 保证 atomic 的存储在回调执行前不会被释放（即使 StickyWindow 本体已析构）。二次守卫 `if (!hwnd_) return;` 作为 defense-in-depth，但**真正起作用的是 `alive->load()`**——`hwnd_` 的读取发生在 alive==true 分支内，此时对象还活着，语义安全
+  - **StickyWindow LoadData 特化 — 请求代 token**：`loadDataGeneration_` 单调计数器，`LoadData()` 入口 `uint64_t myGen = ++loadDataGeneration_`，callback capture `myGen` 并在 alive 守卫后判 `if (myGen != loadDataGeneration_) return;`。**必要性**：`ShowFilterEditor` 失败回滚路径会触发第二次 `LoadData()`，如果没有代号，两次 `AsyncListTodos`（不同 filter）的 callback 可能**乱序落回**，导致 `todos_` 与 `filter_` 内容错位
+  - **SettingsWindow（单例，App 持有 `unique_ptr`）**：guard `auto* app2 = GetApp(); if (!app2 || app2->GetSettingsWindow() != self) return;`。原理：`App::Shutdown` step 3 drain 先清空所有已排队回调，再 step 5 `settings_.reset()`——因此回调真正执行时 SettingsWindow 要么还活着（`GetSettingsWindow() == self`），要么整个 App 已经 `g_app = nullptr`（`GetApp()` 返回 null）
+  - **TrayIcon（单例，菜单命令触发但无 `this` 依赖）**：NEW_STICKY 的 `UpsertStickyAsync` callback **不捕获 `this`**，只捕获值类型数据（`stickyId` by value）+ 通过 `stickytodo::GetApp()` 重查拿 state。g_app 在 Shutdown 最后置 null，单独通过 `GetApp()` null check 就足够
+- **乐观 vs 悲观的分工**（回答"为什么 StickyWindow 10 处调用不是一刀切同一策略"）：
+  - **写操作（CreateTodo / UpdateTodo / Complete / Reopen / Restore / Delete / UpsertSticky）→ 乐观 + 回滚**：用户点击后立即本地改 `todos_` / `filter_` 并重绘，HTTP 异步飞；callback 成功则用服务端返回的 Todo 覆盖占位行（对齐服务端时间戳 / ID），callback 失败则用 snapshot 回滚。CreateTodo 额外用 `nextPendingTodoId_ = UINT64_MAX` 递减作为占位 ID（服务端真实 ID 小，不冲突）
+  - **读操作（ListTodos × 2）→ 悲观 Loading**：`todosLoading_ = true` 触发 DrawTodoList 显示 `Loading...` 占位（**仅当 `todos_` 为空**，后续 refresh 不闪屏只显示底部状态），callback 回来 flip 回 false。不做 optimistic 因为"读"没有可乐观的本地状态
+  - **DeleteSticky → 悲观 + 按钮禁用**：`stickyDeleting_ = true` 禁用 trashButton，HTTP 异步飞；成功直接 `PostMessageW(WM_STICKYTODO_STICKY_DELETED)` 走正常关窗路径（WS 广播兜底），失败 flip 回 false 让用户重试。**不能乐观**，因为"关窗"本身就是最终操作，关了就没有 UI 表达错误的地方
+- **SettingsWindow 的 inFlight 字段**：`testInFlight_` / `loginInFlight_` / `auditInFlight_` 三个 bool。按钮 `enabled = !xxxInFlight_`，callback 无论成败都 flip 回 false。用于防止用户在请求期间狂点重复发起——比 macOS 侧的 `isLoading` 语义等价，但没有 `@Published` 的 binding 机制，手动 `InvalidateRect` 触发重绘
+
 与 macOS 的**必须对齐的不变量**（回归测试时优先看这几条）：
 
-1. **乐观追加**：`DraftTodoRow` 提交成功后 `todos_.push_back(new_todo)`，立即重绘，不等 WS → 与 macOS `TodoListViewModel.commitDraft` 语义一致
-2. **乐观删除**：`StickyWindow::DoDelete(rowIndex)`（`StickyWindow.cpp:1192-1228`）先弹三选一确认框（`:1203-1219`，受 `ShouldSkipTodoDeleteConfirm` 短路），用户确认后同步调 `HttpClient::DeleteTodo(todo.id)`（`:1221`），仅在 HTTP 成功（`if (ok)`，`:1222`）时才把 `todos_[rowIndex].deleted_at = std::string("pending")`（`:1225`）作为软删视觉占位，WS `todo.deleted` 推送到达后 refetch 对齐真正的 deleted_at 时间戳
+1. **乐观追加**：`DraftTodoRow` 提交成功后 `todos_.push_back(new_todo)`，立即重绘，不等 WS → 与 macOS `TodoListViewModel.commitDraft` 语义一致。Windows 侧具体路径：`CommitDraft` 立即把占位 Todo 推入 `todos_`（占位 ID = `nextPendingTodoId_--` 从 `UINT64_MAX` 递减），然后发 `AsyncCreateTodo`；callback 成功用服务端 Todo 替换占位行，失败则移除占位行
+2. **乐观删除**：`StickyWindow::DoDelete(rowIndex)` 先弹三选一确认框（受 `ShouldSkipTodoDeleteConfirm` 短路），用户确认后**立即**把 `todos_[rowIndex].deleted_at = "pending"`（本地软删视觉占位，UI 立刻显示恢复按钮），然后发 `AsyncDeleteTodo(todoId)`；失败则用 `prevDeletedAt` 快照回滚（大多数场景是清空 `deleted_at` 恢复未删状态）。WS `todo.deleted` 到达后 refetch 对齐真正的服务端时间戳
 3. **删除确认 "N/Y/Cancel" 三选一**：`IDYES = 直接删` / `IDNO = 删除并不再提示（写 HKCU）` / `IDCANCEL = 放弃`——与 macOS 的 3-way `alert` 三按钮形态对齐（macOS 的 `@AppStorage` ↔ Windows 的 `Preferences` 封装）
 4. **Frame 不跨端**：`UpsertSticky` 请求体里 `frame` 字段恒 `"{}"`，frame 只走 `FrameStore` 本机持久化
 
@@ -680,7 +702,7 @@ cd server && go run ./cmd/todo-server
   - `Source:` 段落以 iscc 的 `/DArtifactDir=...` 参数为基准。`package-win-client.sh` 通过 `/DArtifactDir=$(to_win "$OUT_DIR/$ARTIFACT_BASE")` 把已构建好的 `dist/win-client/stickytodo-<ver>-windows-<arch>/` 目录路径传给 iscc（staging 目录名也带架构后缀，两架构并行构建不会互相覆盖），`.iss` 里写 `Source: "{#ArtifactDir}\stickytodo.exe"` 解析即生效——**不**需要先复制到 `installer/` 下做 staging。`.iss` 的 fallback `#define ArtifactDir` 也按 `AppArch` 分支（`build\release` vs `build\release-arm64`），保证在 CI 不传 `/D` 的本地 iscc 裸调用场景里也能产出正确路径
 - **资源编译纪律**：
   - `client/win/src/res/app.rc` 里的 `FILEVERSION` / `PRODUCTVERSION` 必须是 4 段数字（如 `1,0,0,0`），不能写 `dev` / `1.2.3-rc1` 这种语义版本。当前通过 `#define VER_MAJOR/MINOR/PATCH/BUILD` 硬编码为 `1,0,0,0` —— **尚未**与 `$VERSION` 联动（见本节前文 Bundle 说明），未来做联动时要在 CMakeLists 里解析 `APP_VERSION` 字符串 → 拆 4 段数字 → `configure_file` 模板替换，无法解析时退化为 `0,0,0,0`
-  - 图标资源：`client/win/src/res/app.rc` 引用 `icons\\stickytodo.ico`（相对 `.rc` 自身目录，即 `client/win/src/res/icons/stickytodo.ico`）。**该 ico 是手工 checkin 到仓库的**——`scripts/generate-icons.sh` 目前**只**负责 macOS AppIcon.iconset/icns 和 MenuBarIcon template，**不产** Windows `.ico`。原因是 SVG → 多分辨率 ICO 的工具链（ImageMagick 的 ICO 编码器有缺陷 / png2ico 需额外装）本地化负担比直接 checkin 一份 ico 大；更新品牌 ico 时手工从 `assets/branding/stickytodo-icon.svg` 导出 16/20/24/32/40/48/64/128/256 多分辨率 PNG → 合并成 .ico 后覆盖即可。未来如果要把生成步骤自动化，应在 `generate-icons.sh` 里加 `build_windows_ico` 段落，而不是散到别的脚本
+  - 图标资源：`client/win/src/res/app.rc` 引用 `icons\\stickytodo.ico`（相对 `.rc` 自身目录，即 `client/win/src/res/icons/stickytodo.ico`）。该 ico 由 `scripts/generate-icons.sh` 的 `build_windows_ico` 段落从 `assets/branding/stickytodo-icon.svg` 自动派生，包含 **16/20/24/32/40/48/64/128/256** 共 9 档帧（256 走 Vista+ 的 PNG 压缩格式嵌入），覆盖 Taskbar / Alt-Tab / Start Menu / Explorer 各 DPI 所有请求尺寸——**禁止**只 checkin 单档小图，Windows 会 bilinear 放大导致其他尺寸模糊。打包器优先级：`magick` → `convert` → `icotool` → `png2ico`（后者不支持 256 帧，会降级并 warn）；更新品牌时改完 SVG 后跑 `scripts/generate-icons.sh`（或 `--win-only`）即可，ico 仍 checkin 入库（Windows rc 编译链路需要它作为 `ICON` 资源的物理文件，不能像 macOS 那样走运行期渲染）。调用约束：`--mac-only` / `--web-only` / `--win-only` 三者互斥，同时传会 `exit 2`
   - Manifest：`client/win/src/res/app.manifest` 声明 DPI 感知、UTF-8 活动代码页、Common Controls v6，通过 `1 RT_MANIFEST "app.manifest"` 嵌入 exe。修改 manifest 不需要改 CMake（rc 引用是相对路径），但修改后必须做一次干净构建（删 `build/release/` 重配），因为 MSBuild / Ninja 有时检测不到 manifest 内容变化
 
 ---

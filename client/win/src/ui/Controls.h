@@ -122,12 +122,20 @@ struct ScrollView {
 };
 
 /// Multi-line label with DirectWrite text layout for automatic line wrapping.
+///
+/// Horizontal alignment defaults to LEADING (left) — matching the
+/// DirectWrite default and all existing call sites. Set `alignment`
+/// explicitly for centered empty-state / placeholder messages. We
+/// don't expose paragraph (vertical) alignment because every current
+/// caller centers text vertically inside the rect by sizing the rect
+/// to a single line's height.
 struct Label {
     ControlRect rect;
     std::wstring text;
     float fontSize = 13.0f;
     bool bold = false;
     D2D1_COLOR_F color = D2D1::ColorF(0, 0, 0, 1);
+    DWRITE_TEXT_ALIGNMENT alignment = DWRITE_TEXT_ALIGNMENT_LEADING;
 
     void Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const;
 };

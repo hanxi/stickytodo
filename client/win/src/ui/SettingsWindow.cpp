@@ -298,8 +298,16 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
     urlInput_.Draw(rt, dw, dpi);
     y += Theme::kInputHeight + Theme::kPadding;
 
-    // Test connection button
+    // Test connection button.
+    //
+    // `enabled` is gated on `!testInFlight_` so repeated clicks while
+    // a request is in flight are swallowed by Button::HandleMouse
+    // (which short-circuits on !enabled) and the user gets a visual
+    // "grayed out" cue courtesy of Button::Draw's alpha halving. The
+    // inflight flag is cleared by the UI-thread completion callback
+    // posted via AppState::TestConnectionAsync → PostToUIThread.
     testButton_.rect = {x, y, 140.0f, Theme::kButtonHeight};
+    testButton_.enabled = !testInFlight_;
     testButton_.onClick = [this]() { DoTestConnection(); };
     testButton_.Draw(rt, dw, dpi);
 
@@ -341,8 +349,10 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
         passwordInput_.Draw(rt, dw, dpi);
         y += Theme::kInputHeight + Theme::kPaddingLarge;
 
-        // Login button
+        // Login button — gated on !loginInFlight_, see testButton_
+        // above for the identical rationale.
         loginButton_.rect = {x, y, 100.0f, Theme::kButtonHeight};
+        loginButton_.enabled = !loginInFlight_;
         loginButton_.onClick = [this]() { DoLogin(); };
         loginButton_.Draw(rt, dw, dpi);
     } else {
@@ -430,7 +440,21 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
     if (auditLogs_.empty()) {
         Label hint;
         hint.rect = {x, y + 40.0f, width - 2 * x, 40.0f};
-        hint.text = L"No audit log entries.";
+        // Three distinct empty states:
+        //   • auditInFlight_ → request is mid-flight, show "Loading..."
+        //     so the user knows the blank space isn't a bug.
+        //   • !logsLoaded_   → user just opened History tab for the
+        //     first time this session and LoadAuditLogs hasn't kicked
+        //     off the fetch yet (defensive — OnLButtonDown schedules
+        //     it immediately so this should be a transient state).
+        //   • everything else → genuine empty result from the server.
+        if (auditInFlight_) {
+            hint.text = L"Loading...";
+        } else if (!logsLoaded_) {
+            hint.text = L"Loading...";
+        } else {
+            hint.text = L"No audit log entries.";
+        }
         hint.fontSize = Theme::kFontSizeBody;
         hint.color = Theme::TextSecondary();
         hint.Draw(rt, dw, dpi);
@@ -525,7 +549,49 @@ void SettingsWindow::DrawAboutTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, flo
     linksLabel.Draw(rt, dw, dpi);
 }
 
+// ---------------------------------------------------------------------------
+// Async network button handlers
+// ---------------------------------------------------------------------------
+//
+// All three handlers below follow the same pattern:
+//
+//   1. Input validation + short-circuit if a prior request is still
+//      in flight (defensive — Button::HandleMouse already gates on
+//      enabled=!inFlight_, but handling the re-entry here too makes
+//      this code safe against any future non-button caller).
+//   2. Flip `*InFlight_ = true`, set status text to a progress
+//      string, request a repaint. The next frame renders with the
+//      button grayed and the "Testing..." / "Logging in..." /
+//      "Loading..." hint.
+//   3. Kick off AppState's async API. The callback is marshalled
+//      back onto the UI thread by core::PostToUIThread — see
+//      AppState::TestConnectionAsync / LoginAsync / ListAuditLogsAsync.
+//   4. In the callback:
+//        a. Liveness check — during the 10s×4 WinHTTP budget the
+//           user may have closed Settings. GetApp()->GetSettingsWindow()
+//           returns nullptr if the owning App destroyed settings_,
+//           or a DIFFERENT pointer if (hypothetically) a new
+//           SettingsWindow was instantiated in the meantime.
+//           Compare against the captured `self` to cover both.
+//        b. Clear `*InFlight_`, update status text / audit logs,
+//           request a repaint.
+//
+// The callbacks capture `self = this`. That is safe because:
+//   - App owns SettingsWindow in a unique_ptr; destruction happens on
+//     the UI thread during App::Shutdown AFTER the message loop has
+//     exited, so at that point no PostToUIThread callback can still
+//     reach us — the tray HWND is already gone, PostToUIThread
+//     returns false, and the lambda is dropped on the worker thread
+//     without ever dereferencing `self`.
+//   - The liveness check above handles the "Settings currently
+//     hidden / destroyed but App still alive" case (which today
+//     doesn't actually happen because App keeps the unique_ptr alive
+//     for the whole app lifetime, but we code defensively for future
+//     changes).
+
 void SettingsWindow::DoTestConnection() {
+    if (testInFlight_) return;
+
     std::string url(urlInput_.text.begin(), urlInput_.text.end());
     if (url.empty()) {
         connectionStatus_ = L"Please enter a URL";
@@ -536,16 +602,33 @@ void SettingsWindow::DoTestConnection() {
     auto* app = GetApp();
     if (!app || !app->GetState()) return;
 
-    std::string version = app->GetState()->TestConnection(url);
-    if (!version.empty()) {
-        connectionStatus_ = L"Connected (v" + std::wstring(version.begin(), version.end()) + L")";
-    } else {
-        connectionStatus_ = L"Connection failed";
-    }
+    testInFlight_ = true;
+    connectionStatus_ = L"Testing...";
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    SettingsWindow* self = this;
+    app->GetState()->TestConnectionAsync(url,
+        [self](std::string version) {
+            auto* app2 = GetApp();
+            if (!app2 || app2->GetSettingsWindow() != self) {
+                // Window vanished during the request. Drop the
+                // result — we cannot touch `self` safely.
+                return;
+            }
+            self->testInFlight_ = false;
+            if (!version.empty()) {
+                self->connectionStatus_ = L"Connected (v" +
+                    std::wstring(version.begin(), version.end()) + L")";
+            } else {
+                self->connectionStatus_ = L"Connection failed";
+            }
+            if (self->hwnd_) InvalidateRect(self->hwnd_, nullptr, FALSE);
+        });
 }
 
 void SettingsWindow::DoLogin() {
+    if (loginInFlight_) return;
+
     std::string url(urlInput_.text.begin(), urlInput_.text.end());
     std::string username(usernameInput_.text.begin(), usernameInput_.text.end());
     std::string password(passwordInput_.text.begin(), passwordInput_.text.end());
@@ -559,17 +642,37 @@ void SettingsWindow::DoLogin() {
     auto* app = GetApp();
     if (!app || !app->GetState()) return;
 
-    bool ok = app->GetState()->Login(url, username, password);
-    if (ok) {
-        connectionStatus_ = L"Login successful";
-        passwordInput_.text.clear();
-    } else {
-        connectionStatus_ = L"Login failed";
-    }
+    loginInFlight_ = true;
+    connectionStatus_ = L"Logging in...";
     InvalidateRect(hwnd_, nullptr, FALSE);
+
+    SettingsWindow* self = this;
+    app->GetState()->LoginAsync(url, username, password,
+        [self](bool success) {
+            auto* app2 = GetApp();
+            if (!app2 || app2->GetSettingsWindow() != self) {
+                // Window closed mid-login. AppState already applied
+                // the success side effects (token persistence, WS
+                // connect, onAuthChanged_) from inside LoginAsync's
+                // UI-thread callback — those mutations happened on
+                // the AppState level, independent of whether any
+                // particular UI widget is still around to observe.
+                return;
+            }
+            self->loginInFlight_ = false;
+            if (success) {
+                self->connectionStatus_ = L"Login successful";
+                self->passwordInput_.text.clear();
+            } else {
+                self->connectionStatus_ = L"Login failed";
+            }
+            if (self->hwnd_) InvalidateRect(self->hwnd_, nullptr, FALSE);
+        });
 }
 
 void SettingsWindow::DoLogout() {
+    // Synchronous — no network round-trip (AppState::Logout just
+    // closes WS + clears local state + deletes saved credential).
     auto* app = GetApp();
     if (app && app->GetState()) {
         app->GetState()->Logout();
@@ -579,11 +682,26 @@ void SettingsWindow::DoLogout() {
 }
 
 void SettingsWindow::LoadAuditLogs() {
+    if (auditInFlight_) return;
+
     auto* app = GetApp();
     if (!app || !app->GetState() || !app->GetState()->IsAuthenticated()) return;
 
-    auditLogs_ = app->GetState()->GetHttp()->ListAuditLogs(1, 50);
-    logsLoaded_ = true;
+    auditInFlight_ = true;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+
+    SettingsWindow* self = this;
+    // Empty action filter = all actions; matches the legacy sync
+    // ListAuditLogs(1, 50) call that had no third argument.
+    app->GetState()->ListAuditLogsAsync(1, 50, std::string{},
+        [self](std::vector<models::AuditLog> logs) {
+            auto* app2 = GetApp();
+            if (!app2 || app2->GetSettingsWindow() != self) return;
+            self->auditInFlight_ = false;
+            self->auditLogs_ = std::move(logs);
+            self->logsLoaded_ = true;
+            if (self->hwnd_) InvalidateRect(self->hwnd_, nullptr, FALSE);
+        });
 }
 
 LRESULT CALLBACK SettingsWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -627,6 +745,40 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KEYDOWN:
             OnKeyDown(wParam, lParam);
             return 0;
+        case WM_SETCURSOR: {
+            // Show an I-beam text cursor when the mouse is over any
+            // TextBox in the client area. Without this the window's
+            // WNDCLASS IDC_ARROW is used everywhere — which for an
+            // input field looks "not clickable" even though it is.
+            //
+            // LPARAM low word = hit-test code; we only override for
+            // HTCLIENT so title bar / resize borders keep their
+            // normal system cursors. WM_SETCURSOR does NOT carry
+            // the mouse position; pull it from GetCursorPos +
+            // ScreenToClient.
+            if (LOWORD(lParam) == HTCLIENT) {
+                POINT pt;
+                if (GetCursorPos(&pt) && ScreenToClient(hwnd_, &pt)) {
+                    float mx = static_cast<float>(pt.x);
+                    float my = static_cast<float>(pt.y);
+                    // urlInput_ is disabled while authenticated
+                    // (DrawSettingsTab sets .enabled = !authenticated),
+                    // and username/password inputs are ONLY laid out
+                    // in the unauthenticated branch — so gate each
+                    // hit-test on its current enabled flag to avoid
+                    // showing an I-beam over a stale/hidden rect.
+                    bool overInput =
+                        (urlInput_.enabled && urlInput_.rect.Contains(mx, my)) ||
+                        (usernameInput_.enabled && usernameInput_.rect.Contains(mx, my)) ||
+                        (passwordInput_.enabled && passwordInput_.rect.Contains(mx, my));
+                    if (overInput) {
+                        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                        return TRUE;
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd_, msg, wParam, lParam);
+        }
         case WM_CLOSE:
             Hide();
             return 0;

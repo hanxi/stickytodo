@@ -89,6 +89,24 @@ private:
     std::vector<models::AuditLog> auditLogs_;
     bool logsLoaded_ = false;
 
+    // In-flight flags for async network buttons. Set to true when the
+    // Test / Login / History fetch kicks off, cleared when the async
+    // callback lands on the UI thread. While `*InFlight_` is true:
+    //   • the corresponding button's `enabled` is forced to false in
+    //     DrawSettingsTab (which grays it out and, via
+    //     Button::HandleMouse's early-return on !enabled, also
+    //     swallows further clicks — guarding against double-fire)
+    //   • the connectionStatus_ / History-tab placeholder text
+    //     displays a progress string ("Testing..." / "Logging
+    //     in..." / "Loading...")
+    //
+    // These flags are touched ONLY on the UI thread (the button
+    // click sets them, the PostToUIThread-marshalled completion
+    // callback clears them), so no synchronization is required.
+    bool testInFlight_ = false;
+    bool loginInFlight_ = false;
+    bool auditInFlight_ = false;
+
     static bool classRegistered_;
     static constexpr wchar_t kClassName[] = L"StickyTodo_SettingsWnd";
 };
