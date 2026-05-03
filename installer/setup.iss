@@ -88,10 +88,35 @@ MinVersion=10.0.19041
 ; LicenseFile is picked up conditionally via [Files] below.
 
 [Languages]
-; Offer English + Simplified Chinese because the app UI already ships
-; strings in both (matches macOS's Localizable strings and Web's i18n keys).
-Name: "english";    MessagesFile: "compiler:Default.isl"
-Name: "simplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; English-only installer UI is a deliberate simplification.
+;
+; Why not ship additional languages (e.g. Simplified Chinese)?
+;   1. The Chocolatey `innosetup` package on the GitHub Actions windows-2022
+;      runner only installs `compiler:Default.isl`. Non-English .isl files
+;      ship in a separate `innosetup-unofficial-languages` download and
+;      pinning a specific URL / checksum there is fragile across runner
+;      image refreshes. We observed CI failing with
+;        "Couldn't open include file
+;         C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl"
+;      exactly for this reason.
+;   2. The installer wizard only surfaces ~4 strings users actually read
+;      (license accept, install dir, Start Menu group, "Launch" checkbox
+;      on the final page). Translating those is marginal UX value.
+;   3. The app runtime's language is independent of the installer's
+;      language — stickytodo.exe picks its UI strings from its own
+;      resources, so a Chinese-speaking user still gets a Chinese app
+;      after an English installer walk-through.
+;   4. Aligns with the macOS DMG build which is also single-language
+;      (the DMG just shows an Applications symlink; no wizard to
+;      translate). Keeping both packaging paths symmetric minimises the
+;      matrix of "installer language × app language" combinations the
+;      release process has to reason about.
+;
+; If we ever need a localised wizard, the right path is to bundle the
+; required .isl files into the repo (under installer/languages/) and
+; reference them by path here rather than relying on the Inno Setup
+; installation's Languages\ directory — that gives us hermetic builds.
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 ; Optional Desktop shortcut — off by default on per-user installs to keep
