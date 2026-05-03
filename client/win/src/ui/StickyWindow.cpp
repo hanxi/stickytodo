@@ -17,33 +17,52 @@ namespace stickytodo::ui {
 namespace {
 
 /// Widths of the three per-row action buttons shown on hover.
+// Action-button icon slot size / gap at 96-DPI baseline. Multiplied by
+// `dpi` at use sites; see ComputeRowLayout for the full scaling chain.
 constexpr float kActionIconSize = 22.0f;
 constexpr float kActionGap = 4.0f;
 constexpr int   kActionCount = 3; // check / edit / delete (or restore)
 
 /// Compose the row rectangle in scroll-content coordinates.
 /// rowTop is y-offset from the top of the scrollable content area (excluding titleBar + filterBar).
+///
+/// All fields are in **physical pixels** — callers must pass a
+/// physical-pixel `contentWidth` and `rowTop`, and the `dpi` used to
+/// scale the Theme constants must match the `dpi` the frame is
+/// being rendered with. This keeps draw-time and hit-test-time
+/// geometry in lock-step.
 struct RowLayout {
-    float rowTop;     // y in content coords
+    float rowTop;     // y in content coords (physical pixels)
     float rowHeight;
     float priorityBarRight;
     float checkboxLeft;
     float textLeft;
     float textRight;  // text region right edge (before action buttons)
     float actionsLeft;
+    // Echo the DPI used to build this layout so callers hit-testing
+    // against these fields can reuse it without calling GetDpiScale
+    // themselves (e.g. HitTestRow below scales kActionIconSize).
+    float dpi;
+    float checkboxSize;   // Theme::kCheckboxSize * dpi
+    float actionIconSize; // kActionIconSize * dpi
+    float actionGap;      // kActionGap * dpi
 };
 
-static RowLayout ComputeRowLayout(float contentWidth, float rowTop) {
+static RowLayout ComputeRowLayout(float contentWidth, float rowTop, float dpi) {
     RowLayout L{};
     L.rowTop = rowTop;
-    L.rowHeight = Theme::kTodoRowHeight;
-    L.priorityBarRight = Theme::kPriorityBarWidth;
-    L.checkboxLeft = Theme::kPadding + Theme::kPriorityBarWidth;
-    L.textLeft = L.checkboxLeft + Theme::kCheckboxSize + 8.0f;
+    L.dpi = dpi;
+    L.rowHeight = Theme::kTodoRowHeight * dpi;
+    L.priorityBarRight = Theme::kPriorityBarWidth * dpi;
+    L.checkboxSize = Theme::kCheckboxSize * dpi;
+    L.actionIconSize = kActionIconSize * dpi;
+    L.actionGap = kActionGap * dpi;
+    L.checkboxLeft = (Theme::kPadding + Theme::kPriorityBarWidth) * dpi;
+    L.textLeft = L.checkboxLeft + L.checkboxSize + 8.0f * dpi;
 
-    float actionsWidth = kActionCount * kActionIconSize + (kActionCount - 1) * kActionGap;
-    L.actionsLeft = contentWidth - Theme::kPadding - Theme::kScrollbarWidth - actionsWidth;
-    L.textRight = L.actionsLeft - 6.0f;
+    float actionsWidth = kActionCount * L.actionIconSize + (kActionCount - 1) * L.actionGap;
+    L.actionsLeft = contentWidth - Theme::kPadding * dpi - Theme::kScrollbarWidth * dpi - actionsWidth;
+    L.textRight = L.actionsLeft - 6.0f * dpi;
     return L;
 }
 
@@ -303,6 +322,17 @@ void StickyWindow::LoadData() {
 // Painting
 // ---------------------------------------------------------------------------
 
+void StickyWindow::RefreshLayoutMetrics() {
+    // Recompute physical-pixel title/filter bar heights from the
+    // current monitor DPI. Called at the top of OnPaint so every
+    // hit-test that runs between this paint and the next reads the
+    // same numbers the frame was rendered with. Also safe to call
+    // more often — it's just two multiplies.
+    float dpi = hwnd_ ? D2DRenderer::GetDpiScale(hwnd_) : 1.0f;
+    titleBarHeight_ = 32.0f * dpi;
+    filterBarHeight_ = 28.0f * dpi;
+}
+
 void StickyWindow::OnPaint() {
     if (!renderTarget_) {
         CreateRenderTarget();
@@ -314,6 +344,10 @@ void StickyWindow::OnPaint() {
 
     IDWriteFactory* dw = app->GetRenderer()->GetDWriteFactory();
     float dpi = D2DRenderer::GetDpiScale(hwnd_);
+    // Refresh DPI-aware layout cache so title/filter bar hit-tests
+    // that run between this paint and the next see values matching
+    // what we're about to draw.
+    RefreshLayoutMetrics();
 
     codec::RgbaColor bgColor = codec::StickyCodec::ParseBgColor(stickyNote_.bg_color);
     D2D1_COLOR_F d2dBgColor = D2D1::ColorF(
@@ -378,11 +412,18 @@ LRESULT StickyWindow::OnNcHitTest(int x, int y) {
     RECT rc;
     GetClientRect(hwnd_, &rc);
 
-    int margin = 16;
+    // Resize grip margin — scale by dpi so the corner hit target
+    // matches the visual weight of the window chrome at high DPI.
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
+    int margin = static_cast<int>(16.0f * dpi);
     if (pt.x >= rc.right - margin && pt.y >= rc.bottom - margin) {
         return HTBOTTOMRIGHT;
     }
 
+    // titleBarHeight_ is the physical-pixel value refreshed at the
+    // top of every OnPaint via RefreshLayoutMetrics(). Reading the
+    // cache here (rather than recomputing) guarantees this hit-test
+    // matches the geometry DrawTitleBar used for the last frame.
     if (pt.y < static_cast<LONG>(titleBarHeight_)) {
         float fx = static_cast<float>(pt.x);
         float fy = static_cast<float>(pt.y);
@@ -415,6 +456,13 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float width = static_cast<float>(rc.right - rc.left);
+    // DPI-aware constants. titleBarHeight_ is already physical pixels
+    // (refreshed by RefreshLayoutMetrics in OnPaint); every other
+    // size/offset below comes from a 96-DPI baseline literal × dpi.
+    const float btnSize = 24.0f * dpi;
+    const float btnTop = 4.0f * dpi;
+    const float btnGap = 4.0f * dpi;   // 28px slot = 24 btn + 4 gap at 96-DPI
+    const float btnSlot = btnSize + btnGap;
 
     // Darkened title bar overlay
     ID2D1SolidColorBrush* brush = nullptr;
@@ -427,19 +475,34 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
 
     // Title label. Reserve enough horizontal space for the four right-aligned
     // buttons: close (×) + settings (⚙) + plus (+) + trash (🗑). Each button
-    // is 24px wide with ~4px gap, so 138px total (32 + 28 + 28 + 28 + slack).
+    // occupies btnSlot pixels (including its gap); reserve 4 slots + trailing
+    // padding so the title never overlaps a button even at extreme DPI.
+    // The +12*dpi gives the visual breathing room between title text and
+    // the first button.
+    const float buttonsReserved = 4 * btnSlot + 12.0f * dpi;
     Label titleLabel;
-    titleLabel.rect = {Theme::kPadding, 0, width - 138.0f, titleBarHeight_};
+    titleLabel.rect = {Theme::kPadding * dpi, 0,
+                       width - buttonsReserved, titleBarHeight_};
     titleLabel.text = Utf8ToWide(stickyNote_.title);
     titleLabel.fontSize = Theme::kFontSizeTitle;
     titleLabel.bold = true;
     titleLabel.color = Theme::TextPrimary();
     titleLabel.Draw(rt, dw, dpi);
 
+    // Button rects: right-aligned, spaced by btnSlot. close > settings > plus > trash
+    // (trash is drawn conditionally below, but its slot index stays reserved in the
+    // x math so the other three don't shift when hover state flips).
+    // The "+8*dpi" in closeX is the right-edge breathing room before the
+    // window border (≈ 8px at 96-DPI).
+    const float closeX    = width - btnSize - 8.0f * dpi;
+    const float settingsX = closeX - btnSlot;
+    const float plusX     = settingsX - btnSlot;
+    const float trashX    = plusX - btnSlot;
+
     // Close button (top-right). "Close" here means closing the window locally
     // — it does NOT delete the sticky from the server. The trash button to
     // the left is the destructive action (DELETE /api/sticky-notes/:id).
-    closeButton_.rect = {width - 32.0f, 4.0f, 24.0f, 24.0f};
+    closeButton_.rect = {closeX, btnTop, btnSize, btnSize};
     closeButton_.text = L"\u00D7"; // ×
     closeButton_.onClick = [this]() {
         if (auto* app = GetApp()) {
@@ -449,7 +512,7 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
     closeButton_.Draw(rt, dw, dpi);
 
     // Settings button
-    settingsButton_.rect = {width - 60.0f, 4.0f, 24.0f, 24.0f};
+    settingsButton_.rect = {settingsX, btnTop, btnSize, btnSize};
     settingsButton_.text = L"\u2699"; // ⚙
     settingsButton_.onClick = [this]() {
         if (auto* app = GetApp()) {
@@ -459,7 +522,7 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
     settingsButton_.Draw(rt, dw, dpi);
 
     // "+" new-todo button (left of settings)
-    plusButton_.rect = {width - 88.0f, 4.0f, 24.0f, 24.0f};
+    plusButton_.rect = {plusX, btnTop, btnSize, btnSize};
     plusButton_.text = L"\u002B"; // +
     plusButton_.onClick = [this]() { BeginDraft(); };
     plusButton_.Draw(rt, dw, dpi);
@@ -496,23 +559,32 @@ void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
 // ---------------------------------------------------------------------------
 
 void StickyWindow::DrawDraftRow(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi, float width, float rowY) {
+    // DPI note: `rowY` is already in physical pixels (caller computed
+    // it from DrawTodoList which uses titleBarHeight_ cache + rowHeight*dpi).
+    // All Theme::k* and literal px values below are 96-DPI baselines
+    // multiplied by `dpi` here at the use site.
+    const float padX = Theme::kPadding * dpi;
+    const float priBarW = Theme::kPriorityBarWidth * dpi;
+    const float cbSize = Theme::kCheckboxSize * dpi;
+    const float rowH = Theme::kTodoRowHeight * dpi;
+    const float scrollbarW = Theme::kScrollbarWidth * dpi;
+    const float inputH = Theme::kInputHeight * dpi;
+
     // Left: placeholder circle (unclickable; symmetry with TodoRow checkbox).
     ID2D1SolidColorBrush* borderBrush = nullptr;
     rt->CreateSolidColorBrush(Theme::CheckboxBorder(), &borderBrush);
     if (borderBrush) {
-        float cx = Theme::kPadding + Theme::kPriorityBarWidth + Theme::kCheckboxSize * 0.5f;
-        float cy = rowY + Theme::kTodoRowHeight * 0.5f;
-        D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), Theme::kCheckboxSize * 0.45f,
-                                             Theme::kCheckboxSize * 0.45f);
-        rt->DrawEllipse(circle, borderBrush, 1.5f);
+        float cx = padX + priBarW + cbSize * 0.5f;
+        float cy = rowY + rowH * 0.5f;
+        D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), cbSize * 0.45f, cbSize * 0.45f);
+        rt->DrawEllipse(circle, borderBrush, 1.5f * dpi);
         borderBrush->Release();
     }
 
     // TextBox occupying the rest of the row.
-    float textLeft = Theme::kPadding + Theme::kPriorityBarWidth + Theme::kCheckboxSize + 8.0f;
-    float tbHeight = Theme::kInputHeight;
-    float tbY = rowY + (Theme::kTodoRowHeight - tbHeight) * 0.5f;
-    draftBox_.rect = {textLeft, tbY, width - textLeft - Theme::kPadding - Theme::kScrollbarWidth, tbHeight};
+    float textLeft = padX + priBarW + cbSize + 8.0f * dpi;
+    float tbY = rowY + (rowH - inputH) * 0.5f;
+    draftBox_.rect = {textLeft, tbY, width - textLeft - padX - scrollbarW, inputH};
     if (draftBox_.placeholder.empty()) {
         // 待办内容，回车保存 / Esc 取消
         draftBox_.placeholder = L"\u5F85\u529E\u5185\u5BB9\uFF0C\u56DE\u8F66\u4FDD\u5B58 / Esc \u53D6\u6D88";
@@ -530,15 +602,27 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
     float width = static_cast<float>(rc.right - rc.left);
     float height = static_cast<float>(rc.bottom - rc.top);
 
+    // titleBarHeight_ and FilterBarHeight() already return physical
+    // pixels (populated by RefreshLayoutMetrics in OnPaint). All
+    // per-row sizes derived from Theme::k* are still 96-DPI baselines
+    // and must be scaled by dpi explicitly below.
     float listTop = titleBarHeight_;
     float listHeight = height - titleBarHeight_ - FilterBarHeight();
     if (listHeight < 0) listHeight = 0;
 
     scrollView_.rect = {0, listTop, width, listHeight};
+    // Propagate current DPI so ScrollView's internal constants
+    // (scrollbar width, thumb min-height, wheel step) scale with the
+    // frame. Set BEFORE contentHeight / scrollOffset are used by
+    // HandleMouse/HandleWheel/DrawScrollbar — i.e. at the top of
+    // every paint so all reads see the same value.
+    scrollView_.dpi = dpi;
+
+    const float rowHeight = Theme::kTodoRowHeight * dpi;
 
     // Content height accounts for optional draft row sitting above the todos.
-    float draftRowH = drafting_ ? Theme::kTodoRowHeight : 0.0f;
-    scrollView_.contentHeight = draftRowH + static_cast<float>(todos_.size()) * Theme::kTodoRowHeight;
+    float draftRowH = drafting_ ? rowHeight : 0.0f;
+    scrollView_.contentHeight = draftRowH + static_cast<float>(todos_.size()) * rowHeight;
 
     scrollView_.BeginContent(rt);
 
@@ -547,13 +631,13 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
 
     if (drafting_) {
         DrawDraftRow(rt, dw, dpi, width, y);
-        y += Theme::kTodoRowHeight;
+        y += rowHeight;
     }
 
     for (size_t i = 0; i < todos_.size(); ++i) {
         const auto& todo = todos_[i];
-        float rowY = y + static_cast<float>(i) * Theme::kTodoRowHeight;
-        RowLayout L = ComputeRowLayout(width, rowY);
+        float rowY = y + static_cast<float>(i) * rowHeight;
+        RowLayout L = ComputeRowLayout(width, rowY, dpi);
 
         // Priority color bar
         if (todo.priority > 0) {
@@ -569,8 +653,8 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
         // Checkbox (soft-deleted rows render a disabled square).
         if (!todo.IsDeleted()) {
             CheckBox cb;
-            cb.rect = {L.checkboxLeft, rowY + (L.rowHeight - Theme::kCheckboxSize) / 2.0f,
-                       Theme::kCheckboxSize, Theme::kCheckboxSize};
+            cb.rect = {L.checkboxLeft, rowY + (L.rowHeight - L.checkboxSize) / 2.0f,
+                       L.checkboxSize, L.checkboxSize};
             cb.checked = todo.IsDone();
             cb.Draw(rt, dw, dpi);
         } else {
@@ -579,18 +663,19 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
             rt->CreateSolidColorBrush(Theme::TextPlaceholder(), &brush);
             if (brush) {
                 D2D1_RECT_F box = D2D1::RectF(
-                    L.checkboxLeft, rowY + (L.rowHeight - Theme::kCheckboxSize) / 2.0f,
-                    L.checkboxLeft + Theme::kCheckboxSize,
-                    rowY + (L.rowHeight + Theme::kCheckboxSize) / 2.0f);
-                rt->DrawRectangle(box, brush, 1.0f);
+                    L.checkboxLeft, rowY + (L.rowHeight - L.checkboxSize) / 2.0f,
+                    L.checkboxLeft + L.checkboxSize,
+                    rowY + (L.rowHeight + L.checkboxSize) / 2.0f);
+                rt->DrawRectangle(box, brush, 1.0f * dpi);
                 brush->Release();
             }
         }
 
         // Title: TextBox when editing this row, otherwise Label.
         if (editingRowIndex_ == static_cast<int>(i)) {
-            float tbY = rowY + (L.rowHeight - Theme::kInputHeight) * 0.5f;
-            editBox_.rect = {L.textLeft, tbY, L.textRight - L.textLeft, Theme::kInputHeight};
+            float inputH = Theme::kInputHeight * dpi;
+            float tbY = rowY + (L.rowHeight - inputH) * 0.5f;
+            editBox_.rect = {L.textLeft, tbY, L.textRight - L.textLeft, inputH};
             editBox_.Draw(rt, dw, dpi);
         } else {
             Label titleLabel;
@@ -602,23 +687,23 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
             titleLabel.Draw(rt, dw, dpi);
         }
 
-        // Hover actions: three 22x22 icon buttons on the right.
-        // We only use Label for drawing (hit-testing happens via per-frame rect math in OnLButtonDown).
-        // Deleted rows collapse slots 1 and 2 (only show "restore" in slot 3) to mirror the macOS UX.
+        // Hover actions: three icon slots on the right. All sizes come
+        // from the RowLayout (which already scaled them by dpi) so the
+        // hit-test math in HitTestRow stays in sync automatically.
         if (static_cast<int>(i) == hoveredRowIndex_ && editingRowIndex_ != static_cast<int>(i)) {
             float ax = L.actionsLeft;
-            float ay = rowY + (L.rowHeight - kActionIconSize) * 0.5f;
+            float ay = rowY + (L.rowHeight - L.actionIconSize) * 0.5f;
 
             // Slot 1: complete / reopen
             if (!todo.IsDeleted()) {
                 Label l;
-                l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+                l.rect = {ax, ay, L.actionIconSize, L.actionIconSize};
                 l.text = todo.IsDone() ? L"\u21BA" : L"\u2713"; // ↺ / ✓
                 l.fontSize = Theme::kFontSizeBody;
                 l.color = Theme::TextSecondary();
                 l.Draw(rt, dw, dpi);
             }
-            ax += kActionIconSize + kActionGap;
+            ax += L.actionIconSize + L.actionGap;
 
             // Slot 2: edit title. Prefer U+270F (PENCIL) over U+270E (LOWER
             // RIGHT PENCIL) — the latter is not covered by Segoe UI on older
@@ -626,19 +711,19 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
             // Segoe UI Symbol since Vista, so we get consistent glyphs.
             if (!todo.IsDeleted()) {
                 Label l;
-                l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+                l.rect = {ax, ay, L.actionIconSize, L.actionIconSize};
                 l.text = L"\u270F"; // ✏
                 l.fontSize = Theme::kFontSizeBody;
                 l.color = Theme::TextSecondary();
                 l.Draw(rt, dw, dpi);
             }
-            ax += kActionIconSize + kActionGap;
+            ax += L.actionIconSize + L.actionGap;
 
             // Slot 3: delete / restore. Use ✕ (U+2716) instead of the 🗑 emoji because
             // Segoe UI does not ship emoji glyphs — DirectWrite would fall back and
             // render tofu. ✕ is monochrome and always available in Segoe UI Symbol.
             Label l;
-            l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+            l.rect = {ax, ay, L.actionIconSize, L.actionIconSize};
             l.text = todo.IsDeleted() ? L"\u21B6" : L"\u2716"; // ↶ / ✖
             l.fontSize = Theme::kFontSizeBody;
             l.color = Theme::TextSecondary();
@@ -649,10 +734,11 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
         ID2D1SolidColorBrush* sepBrush = nullptr;
         rt->CreateSolidColorBrush(Theme::Separator(), &sepBrush);
         if (sepBrush) {
-            float sepY = rowY + L.rowHeight - 0.5f;
-            rt->DrawLine(D2D1::Point2F(Theme::kPadding, sepY),
-                          D2D1::Point2F(width - Theme::kPadding, sepY),
-                          sepBrush, 0.5f);
+            float sepY = rowY + L.rowHeight - 0.5f * dpi;
+            float padX = Theme::kPadding * dpi;
+            rt->DrawLine(D2D1::Point2F(padX, sepY),
+                          D2D1::Point2F(width - padX, sepY),
+                          sepBrush, 0.5f * dpi);
             sepBrush->Release();
         }
     }
@@ -683,9 +769,10 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
         Label placeholder;
         // Center vertically in the list area; horizontally the Label's
         // own DWRITE_TEXT_ALIGNMENT_CENTER handles centering across
-        // the full width.
-        float phY = listTop + (listHeight - Theme::kTodoRowHeight) * 0.5f;
-        placeholder.rect = {0, phY, width, Theme::kTodoRowHeight};
+        // the full width. rowHeight is already physical pixels (see top
+        // of DrawTodoList where we computed `rowHeight = Theme::kTodoRowHeight * dpi`).
+        float phY = listTop + (listHeight - rowHeight) * 0.5f;
+        placeholder.rect = {0, phY, width, rowHeight};
         placeholder.text = msg;
         placeholder.fontSize = Theme::kFontSizeBody;
         placeholder.color = Theme::TextPlaceholder();
@@ -702,8 +789,18 @@ void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float
 // ---------------------------------------------------------------------------
 
 void StickyWindow::DrawFilterButton(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi, float width, float height) {
+    // FilterBarHeight() is already physical pixels (cached via
+    // RefreshLayoutMetrics). Theme::kPadding is a 96-DPI baseline
+    // and must be scaled by `dpi`. The 2px top inset / 4px vertical
+    // deflation are also 96-DPI baselines.
+    const float padX = Theme::kPadding * dpi;
+    const float barInsetY = 2.0f * dpi;
+    const float barDeflateY = 4.0f * dpi;
+
     float barY = height - FilterBarHeight();
-    filterButton_.rect = {Theme::kPadding, barY + 2.0f, width - Theme::kPadding * 2.0f, FilterBarHeight() - 4.0f};
+    filterButton_.rect = {padX, barY + barInsetY,
+                           width - padX * 2.0f,
+                           FilterBarHeight() - barDeflateY};
     filterButton_.text = BuildFilterSummary(filter_);
     filterButton_.onClick = [this]() { ShowFilterEditor(); };
     filterButton_.Draw(rt, dw, dpi);
@@ -730,28 +827,34 @@ struct RowHitTest {
 
 /// Locate which row / which zone a client-area point belongs to.
 /// contentY = clientY + scrollOffset (i.e. point in scroll-content coord system).
+///
+/// All inputs are in **physical pixels**. `dpi` is used exclusively
+/// to scale the 96-DPI Theme constants / per-row row height so the
+/// arithmetic matches the geometry DrawTodoList produced for the same
+/// frame.
 static RowHitTest HitTestRow(float mx, float contentY, float contentWidth,
-                             float listTop, bool drafting,
+                             float listTop, bool drafting, float dpi,
                              const std::vector<models::Todo>& todos) {
     RowHitTest r;
+    float rowHeight = Theme::kTodoRowHeight * dpi;
     float y = listTop;
-    if (drafting) y += Theme::kTodoRowHeight;
+    if (drafting) y += rowHeight;
 
     if (contentY < y) return r;
 
-    int idx = static_cast<int>((contentY - y) / Theme::kTodoRowHeight);
+    int idx = static_cast<int>((contentY - y) / rowHeight);
     if (idx < 0 || idx >= static_cast<int>(todos.size())) return r;
 
     r.rowIndex = idx;
-    float rowTop = y + idx * Theme::kTodoRowHeight;
-    float rowBottom = rowTop + Theme::kTodoRowHeight;
-    RowLayout L = ComputeRowLayout(contentWidth, rowTop);
+    float rowTop = y + idx * rowHeight;
+    float rowBottom = rowTop + rowHeight;
+    RowLayout L = ComputeRowLayout(contentWidth, rowTop, dpi);
 
     // Checkbox
     float cbLeft = L.checkboxLeft;
-    float cbTop = rowTop + (L.rowHeight - Theme::kCheckboxSize) / 2.0f;
-    if (mx >= cbLeft && mx < cbLeft + Theme::kCheckboxSize
-        && contentY >= cbTop && contentY < cbTop + Theme::kCheckboxSize) {
+    float cbTop = rowTop + (L.rowHeight - L.checkboxSize) / 2.0f;
+    if (mx >= cbLeft && mx < cbLeft + L.checkboxSize
+        && contentY >= cbTop && contentY < cbTop + L.checkboxSize) {
         r.zone = RowHitTest::Zone::Checkbox;
         return r;
     }
@@ -760,11 +863,11 @@ static RowHitTest HitTestRow(float mx, float contentY, float contentWidth,
     // depending on hover state — we still return the zone unconditionally so
     // keyboard/focus logic can reuse this helper in the future).
     float ax = L.actionsLeft;
-    float ay = rowTop + (L.rowHeight - kActionIconSize) * 0.5f;
+    float ay = rowTop + (L.rowHeight - L.actionIconSize) * 0.5f;
     auto inSlot = [&](int slot) {
-        float left = ax + slot * (kActionIconSize + kActionGap);
-        return mx >= left && mx < left + kActionIconSize
-            && contentY >= ay && contentY < ay + kActionIconSize;
+        float left = ax + slot * (L.actionIconSize + L.actionGap);
+        return mx >= left && mx < left + L.actionIconSize
+            && contentY >= ay && contentY < ay + L.actionIconSize;
     };
     if (inSlot(0)) { r.zone = RowHitTest::Zone::ActionComplete; return r; }
     if (inSlot(1)) { r.zone = RowHitTest::Zone::ActionEdit;     return r; }
@@ -886,6 +989,33 @@ LRESULT StickyWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 DestroyWindow(hwnd_);
             }
             return 0;
+        case WM_DPICHANGED: {
+            // User moved the sticky to a different-DPI monitor (or
+            // the system scaling changed). lParam carries a RECT*
+            // pre-scaled by Win32 for the new DPI — adopt it so the
+            // window keeps its visual size / position on the new
+            // monitor. Then proactively refresh the physical-pixel
+            // layout cache so any WM_NCHITTEST arriving before the
+            // next WM_PAINT sees the new titleBarHeight_ /
+            // filterBarHeight_ (otherwise clicks in the first ~16 ms
+            // after the move could hit the old threshold).
+            RECT* suggested = reinterpret_cast<RECT*>(lParam);
+            if (suggested) {
+                SetWindowPos(hwnd_, nullptr,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            RefreshLayoutMetrics();
+            // Also invalidate any persisted frame bookkeeping in
+            // AppState so the sticky's new physical rect is saved,
+            // not the pre-move one — piggyback on the existing
+            // SaveFramePosition() helper which reads GetWindowRect.
+            SaveFramePosition();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         case WM_DESTROY:
             // Notify App so it can erase its unique_ptr entry. Must happen
             // before clearing hwnd_ since App doesn't take the HWND here —
@@ -952,16 +1082,20 @@ void StickyWindow::OnMouseMove(int x, int y) {
     scrollView_.HandleMouse(WM_MOUSEMOVE, fx, fy);
 
     // Row hover — translate client y into content coords by adding scrollOffset.
+    // titleBarHeight_ / FilterBarHeight() already return physical pixels;
+    // pass the current DPI to HitTestRow so it scales the internal
+    // Theme::k* constants to match the rendered geometry.
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float contentWidth = static_cast<float>(rc.right - rc.left);
     float listTop = titleBarHeight_;
     float listBottom = static_cast<float>(rc.bottom - rc.top) - FilterBarHeight();
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
 
     int newHover = -1;
     if (fy >= listTop && fy < listBottom) {
         float contentY = fy + scrollView_.scrollOffset;
-        auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, todos_);
+        auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, dpi, todos_);
         newHover = hit.rowIndex;
     }
     if (newHover != hoveredRowIndex_) {
@@ -1052,8 +1186,11 @@ void StickyWindow::OnLButtonDown(int x, int y) {
         return;
     }
 
+    // Match the DPI used by the last paint frame so row-index arithmetic
+    // inside HitTestRow is consistent with the rendered rowHeight.
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
     float contentY = fy + scrollView_.scrollOffset;
-    auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, todos_);
+    auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, dpi, todos_);
     if (hit.rowIndex < 0) {
         // Empty row gap → same as blank-area click: commit in-flight editors.
         if (drafting_) CommitDraft();

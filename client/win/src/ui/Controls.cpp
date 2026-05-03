@@ -26,7 +26,13 @@ void Button::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     ID2D1SolidColorBrush* brush = nullptr;
     rt->CreateSolidColorBrush(bgColor, &brush);
     if (brush) {
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), Theme::kCornerRadius, Theme::kCornerRadius);
+        // DPI-aware corner radius: Theme::kCornerRadius is a 96-DPI
+        // baseline (6 px). Without dpi scaling, a 36 px-tall button
+        // at 150 % DPI (54 px tall physical) would still round at 6
+        // physical pixels → visually flat corners. × dpi keeps the
+        // corner's *visual* roundness constant across DPI.
+        float cr = Theme::kCornerRadius * dpi;
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), cr, cr);
         rt->FillRoundedRectangle(rr, brush);
         brush->Release();
     }
@@ -88,11 +94,17 @@ std::wstring TextBox::GetDisplayText() const {
 }
 
 void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
+    // DPI-aware constants — 96-DPI baselines for this control's
+    // chrome (corner radius, border stroke, horizontal text inset).
+    const float kCorner = 4.0f * dpi;
+    const float kBorderStroke = 1.0f * dpi;
+    const float kTextInset = 8.0f * dpi;
+
     // Background
     ID2D1SolidColorBrush* bgBrush = nullptr;
     rt->CreateSolidColorBrush(Theme::InputBackground(), &bgBrush);
     if (bgBrush) {
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), 4.0f, 4.0f);
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), kCorner, kCorner);
         rt->FillRoundedRectangle(rr, bgBrush);
         bgBrush->Release();
     }
@@ -102,8 +114,8 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     D2D1_COLOR_F borderColor = focused ? Theme::CheckboxFill() : Theme::InputBorder();
     rt->CreateSolidColorBrush(borderColor, &borderBrush);
     if (borderBrush) {
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), 4.0f, 4.0f);
-        rt->DrawRoundedRectangle(rr, borderBrush, 1.0f);
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rect.ToD2D(), kCorner, kCorner);
+        rt->DrawRoundedRectangle(rr, borderBrush, kBorderStroke);
         borderBrush->Release();
     }
 
@@ -122,8 +134,8 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
         format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
         D2D1_RECT_F textRect = rect.ToD2D();
-        textRect.left += 8.0f;
-        textRect.right -= 8.0f;
+        textRect.left += kTextInset;
+        textRect.right -= kTextInset;
 
         ID2D1SolidColorBrush* textBrush = nullptr;
         rt->CreateSolidColorBrush(textColor, &textBrush);
@@ -196,9 +208,13 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
                     // doesn't touch the input border. hitMetrics.height
                     // is the line height of the char; we use it when
                     // available for proper font metrics alignment.
+                    // Fallback caret height: subtract a 96-DPI 8-px
+                    // vertical inset (4 px top + 4 px bottom) scaled
+                    // to physical pixels so the caret doesn't touch
+                    // the input border at any DPI.
                     float caretHeight = hitMetrics.height > 0.0f
                         ? hitMetrics.height
-                        : (textRect.bottom - textRect.top - 8.0f);
+                        : (textRect.bottom - textRect.top - 8.0f * dpi);
                     float caretTop = textRect.top +
                         ((textRect.bottom - textRect.top) - caretHeight) * 0.5f;
                     float caretBottom = caretTop + caretHeight;
@@ -207,14 +223,20 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
                     rt->CreateSolidColorBrush(Theme::TextPrimary(),
                                               &caretBrush);
                     if (caretBrush) {
-                        // Offset by 0.5px for crisp 1-px line on
-                        // pixel-aligned rendering (D2D antialiases
-                        // lines; the half-pixel offset avoids the
-                        // classic "blurry 2-pixel" artifact).
+                        // Caret visuals scale with DPI:
+                        //   • half-pixel offset for crisp line (must
+                        //     be half of the *physical* stroke width,
+                        //     so 0.5 px * dpi).
+                        //   • stroke width 1 px * dpi so the caret
+                        //     stays visible (a hairline at 1 phys px
+                        //     under 200 % DPI is sub-pixel-dim after
+                        //     antialiasing).
+                        float halfPx = 0.5f * dpi;
+                        float strokeW = 1.0f * dpi;
                         rt->DrawLine(
-                            D2D1::Point2F(absX + 0.5f, caretTop),
-                            D2D1::Point2F(absX + 0.5f, caretBottom),
-                            caretBrush, 1.0f);
+                            D2D1::Point2F(absX + halfPx, caretTop),
+                            D2D1::Point2F(absX + halfPx, caretBottom),
+                            caretBrush, strokeW);
                         caretBrush->Release();
                     }
                 }
@@ -327,7 +349,15 @@ void CheckBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const 
     // in Button::Draw above (`if (!enabled) bgColor.a *= 0.5f`).
     const float alphaScale = enabled ? 1.0f : 0.5f;
 
-    float boxSize = Theme::kCheckboxSize;
+    // DPI-aware dimensions. kCheckboxSize is a 96-DPI baseline; the
+    // corner radius, border stroke and checkmark stroke are all
+    // 96-DPI baseline px too. The label-offset "6 px gap" between
+    // the box and its text label also scales.
+    const float boxSize = Theme::kCheckboxSize * dpi;
+    const float kCorner = 3.0f * dpi;
+    const float kBorderStroke = 1.5f * dpi;
+    const float kCheckStroke = 2.0f * dpi;
+    const float kLabelGap = 6.0f * dpi;
     float boxY = rect.y + (rect.height - boxSize) / 2.0f;
 
     D2D1_RECT_F boxRect = D2D1::RectF(rect.x, boxY, rect.x + boxSize, boxY + boxSize);
@@ -339,11 +369,12 @@ void CheckBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const 
         fillColor.a *= alphaScale;
         rt->CreateSolidColorBrush(fillColor, &fillBrush);
         if (fillBrush) {
-            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(boxRect, 3.0f, 3.0f);
+            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(boxRect, kCorner, kCorner);
             rt->FillRoundedRectangle(rr, fillBrush);
             fillBrush->Release();
         }
-        // Checkmark (simple line)
+        // Checkmark (simple line). All points are derived from `boxSize`
+        // so the mark automatically scales with the box itself.
         ID2D1SolidColorBrush* checkBrush = nullptr;
         D2D1_COLOR_F checkColor = Theme::CheckboxCheck();
         checkColor.a *= alphaScale;
@@ -355,8 +386,8 @@ void CheckBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const 
             D2D1_POINT_2F p1 = D2D1::Point2F(cx - s * 0.6f, cy);
             D2D1_POINT_2F p2 = D2D1::Point2F(cx - s * 0.1f, cy + s * 0.5f);
             D2D1_POINT_2F p3 = D2D1::Point2F(cx + s * 0.7f, cy - s * 0.4f);
-            rt->DrawLine(p1, p2, checkBrush, 2.0f);
-            rt->DrawLine(p2, p3, checkBrush, 2.0f);
+            rt->DrawLine(p1, p2, checkBrush, kCheckStroke);
+            rt->DrawLine(p2, p3, checkBrush, kCheckStroke);
             checkBrush->Release();
         }
     } else {
@@ -366,8 +397,8 @@ void CheckBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const 
         borderColor.a *= alphaScale;
         rt->CreateSolidColorBrush(borderColor, &borderBrush);
         if (borderBrush) {
-            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(boxRect, 3.0f, 3.0f);
-            rt->DrawRoundedRectangle(rr, borderBrush, 1.5f);
+            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(boxRect, kCorner, kCorner);
+            rt->DrawRoundedRectangle(rr, borderBrush, kBorderStroke);
             borderBrush->Release();
         }
     }
@@ -381,7 +412,7 @@ void CheckBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const 
         if (format) {
             format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             D2D1_RECT_F labelRect = D2D1::RectF(
-                rect.x + boxSize + 6.0f, rect.y,
+                rect.x + boxSize + kLabelGap, rect.y,
                 rect.x + rect.width, rect.y + rect.height
             );
             ID2D1SolidColorBrush* textBrush = nullptr;
@@ -417,7 +448,10 @@ bool CheckBox::HandleMouse(UINT msg, float mx, float my) {
 // ---------- ScrollView ----------
 
 D2D1_RECT_F ScrollView::GetContentClipRect() const {
-    return D2D1::RectF(rect.x, rect.y, rect.x + rect.width - Theme::kScrollbarWidth, rect.y + rect.height);
+    // Scrollbar width is a 96-DPI baseline, scaled by the `dpi` member
+    // set by the owning window before every paint/hit-test batch.
+    float sbW = Theme::kScrollbarWidth * dpi;
+    return D2D1::RectF(rect.x, rect.y, rect.x + rect.width - sbW, rect.y + rect.height);
 }
 
 float ScrollView::MaxScroll() const {
@@ -426,7 +460,9 @@ float ScrollView::MaxScroll() const {
 }
 
 bool ScrollView::HandleWheel(float delta) {
-    float newOffset = scrollOffset - delta * 40.0f;
+    // Step of 40 px at 96-DPI (≈ one row of text); scale by dpi so
+    // the scroll "speed" stays consistent across DPI.
+    float newOffset = scrollOffset - delta * 40.0f * dpi;
     newOffset = std::clamp(newOffset, 0.0f, MaxScroll());
     if (newOffset != scrollOffset) {
         scrollOffset = newOffset;
@@ -436,8 +472,10 @@ bool ScrollView::HandleWheel(float delta) {
 }
 
 bool ScrollView::HandleMouse(UINT msg, float mx, float my) {
-    // Scrollbar is on the right edge of the control
-    float sbX = rect.x + rect.width - Theme::kScrollbarWidth;
+    // Scrollbar is on the right edge of the control. Width scales
+    // with dpi so hit-test region matches what DrawScrollbar draws.
+    float sbW = Theme::kScrollbarWidth * dpi;
+    float sbX = rect.x + rect.width - sbW;
     bool inScrollbar = mx >= sbX && mx < rect.x + rect.width && my >= rect.y && my < rect.y + rect.height;
 
     if (msg == WM_LBUTTONDOWN && inScrollbar) {
@@ -466,29 +504,37 @@ bool ScrollView::HandleMouse(UINT msg, float mx, float my) {
 void ScrollView::DrawScrollbar(ID2D1RenderTarget* rt) const {
     if (contentHeight <= rect.height) return; // No scrollbar needed
 
-    float sbX = rect.x + rect.width - Theme::kScrollbarWidth;
+    // DPI-aware chrome. kScrollbarWidth is a 96-DPI baseline; the
+    // 20-px minimum thumb, 1-px track margins and 3-px corner radius
+    // all scale with dpi so the bar keeps its visual weight.
+    const float sbW = Theme::kScrollbarWidth * dpi;
+    const float kMinThumbH = 20.0f * dpi;
+    const float kThumbInset = 1.0f * dpi;
+    const float kThumbCorner = 3.0f * dpi;
+
+    float sbX = rect.x + rect.width - sbW;
     float trackHeight = rect.height;
 
     // Track
     ID2D1SolidColorBrush* trackBrush = nullptr;
     rt->CreateSolidColorBrush(Theme::ScrollbarTrack(), &trackBrush);
     if (trackBrush) {
-        D2D1_RECT_F trackRect = D2D1::RectF(sbX, rect.y, sbX + Theme::kScrollbarWidth, rect.y + trackHeight);
+        D2D1_RECT_F trackRect = D2D1::RectF(sbX, rect.y, sbX + sbW, rect.y + trackHeight);
         rt->FillRectangle(trackRect, trackBrush);
         trackBrush->Release();
     }
 
     // Thumb
     float thumbRatio = rect.height / contentHeight;
-    float thumbHeight = std::max(trackHeight * thumbRatio, 20.0f);
+    float thumbHeight = std::max(trackHeight * thumbRatio, kMinThumbH);
     float thumbY = rect.y + (scrollOffset / MaxScroll()) * (trackHeight - thumbHeight);
 
     ID2D1SolidColorBrush* thumbBrush = nullptr;
     rt->CreateSolidColorBrush(Theme::ScrollbarThumb(), &thumbBrush);
     if (thumbBrush) {
         D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
-            D2D1::RectF(sbX + 1, thumbY, sbX + Theme::kScrollbarWidth - 1, thumbY + thumbHeight),
-            3.0f, 3.0f
+            D2D1::RectF(sbX + kThumbInset, thumbY, sbX + sbW - kThumbInset, thumbY + thumbHeight),
+            kThumbCorner, kThumbCorner
         );
         rt->FillRoundedRectangle(rr, thumbBrush);
         thumbBrush->Release();

@@ -54,11 +54,40 @@ bool TrayIcon::Create() {
     nid_.uID = 1;
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_SHOWTIP;
     nid_.uCallbackMessage = WM_TRAYICON;
-    nid_.hIcon = LoadIconW(hInstance_, MAKEINTRESOURCEW(IDI_APPICON));
+
+    // DPI-aware tray icon: the system-tray area wants SM_CXSMICON /
+    // SM_CYSMICON (16 px at 96-DPI, 20 px at 125 %, 24 px at 150 %,
+    // 32 px at 200 %). LoadIconW always returns SM_CXICON (32 px
+    // baseline) which Windows then down-scales for the tray — that
+    // down-scale is bilinear and looks blurry on HiDPI displays.
+    //
+    // Fix: use LoadImageW with the exact small-icon metrics for the
+    // system DPI (we pick the system DPI here because the tray
+    // itself lives on the primary monitor and isn't easily per-hwnd
+    // DPI-aware; if the user moves the taskbar to a different DPI
+    // monitor they'll see the baseline-scaled variant, which is still
+    // acceptable fallback). `LR_SHARED` makes the system manage the
+    // HICON's lifetime — we MUST NOT call DestroyIcon on it, so the
+    // Destroy() path below is adjusted accordingly.
+    UINT sysDpi = GetDpiForSystem();
+    if (sysDpi == 0) sysDpi = 96;
+    int cxSmall = GetSystemMetricsForDpi(SM_CXSMICON, sysDpi);
+    int cySmall = GetSystemMetricsForDpi(SM_CYSMICON, sysDpi);
+    nid_.hIcon = static_cast<HICON>(LoadImageW(
+        hInstance_, MAKEINTRESOURCEW(IDI_APPICON),
+        IMAGE_ICON, cxSmall, cySmall,
+        LR_DEFAULTCOLOR | LR_SHARED));
     if (!nid_.hIcon) {
-        // Fallback to system icon if our icon fails to load
-        nid_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        // Fallback to system icon if our resource fails to load.
+        // Also LR_SHARED so Destroy() treats both paths identically.
+        nid_.hIcon = static_cast<HICON>(LoadImageW(
+            nullptr, MAKEINTRESOURCEW(OIC_SAMPLE),
+            IMAGE_ICON, cxSmall, cySmall,
+            LR_DEFAULTCOLOR | LR_SHARED));
     }
+    // Track whether we own the HICON's lifetime. With LR_SHARED the
+    // system manages it; if both LoadImageW calls fail we end up with
+    // a null icon, and Destroy() has nothing to clean up either way.
     StringCchCopyW(nid_.szTip, ARRAYSIZE(nid_.szTip), L"StickyTodo");
     nid_.uVersion = NOTIFYICON_VERSION_4;
 
@@ -77,10 +106,11 @@ void TrayIcon::Destroy() {
     if (!created_) return;
 
     Shell_NotifyIconW(NIM_DELETE, &nid_);
-    if (nid_.hIcon) {
-        DestroyIcon(nid_.hIcon);
-        nid_.hIcon = nullptr;
-    }
+    // Icon lifetime: Create() uses LoadImageW with LR_SHARED, so
+    // the system owns the HICON — calling DestroyIcon on it is
+    // undefined behaviour (MSDN: "Do not use this function to
+    // destroy a shared icon."). Just null the handle.
+    nid_.hIcon = nullptr;
     if (hwnd_) {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;

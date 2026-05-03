@@ -91,6 +91,15 @@ struct CheckBox {
 };
 
 /// Vertical scroll view container. Handles scroll offset and mouse wheel.
+///
+/// DPI awareness: the outer rect / contentHeight / scrollOffset are
+/// expressed in **physical pixels** (identical to every other
+/// Control in this file — the mouse messages deliver physical pixels
+/// under PerMonitorV2 and GetClientRect returns physical pixels).
+/// The `dpi` field is set by the owning window right before calling
+/// Draw / HandleMouse / HandleWheel so that internal constants like
+/// the scrollbar width, thumb minimum height and wheel step can be
+/// scaled correctly without changing the public API signatures.
 struct ScrollView {
     ControlRect rect;
     float contentHeight = 0;    // Total height of scrollable content
@@ -98,6 +107,11 @@ struct ScrollView {
     bool thumbDragging = false;
     float dragStartY = 0;
     float dragStartOffset = 0;
+    // Populated by the owning window (read each frame from
+    // D2DRenderer::GetDpiScale) before Draw/hit-test. Defaults to
+    // 1.0 for 96-DPI so callers that forget to set it still render
+    // identically to the pre-DPI-aware baseline.
+    float dpi = 1.0f;
 
     /// Get the visible content area (clipped).
     D2D1_RECT_F GetContentClipRect() const;

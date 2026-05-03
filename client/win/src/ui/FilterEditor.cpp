@@ -173,17 +173,31 @@ bool FilterEditor::ShowModal(HWND owner, HINSTANCE hInstance, models::Filter& fi
     // Center dialog over its owner. GetWindowRect gives screen coords — the
     // math is identical regardless of DPI because we're feeding screen
     // coordinates back into CreateWindowExW.
+    //
+    // DPI scaling: kDialogWidth/kDialogHeight are 96-DPI baseline values
+    // (480×560). Under PerMonitorV2 awareness, the sizes we pass to
+    // CreateWindowExW are physical pixels — so at 150% we need 720×840,
+    // otherwise the content laid out at `Theme::k* × dpi` would overflow
+    // a sub-size window. We sample DPI from the owner window (which is
+    // already on a specific monitor) rather than the system, so the
+    // dialog matches the monitor the parent sticky is sitting on.
+    UINT createDpi = GetDpiForWindow(owner);
+    if (createDpi == 0) createDpi = 96;
+    float createScale = static_cast<float>(createDpi) / 96.0f;
+    int scaledW = static_cast<int>(kDialogWidth * createScale);
+    int scaledH = static_cast<int>(kDialogHeight * createScale);
+
     RECT ownerRect{};
     GetWindowRect(owner, &ownerRect);
-    int cx = (ownerRect.left + ownerRect.right) / 2 - kDialogWidth / 2;
-    int cy = (ownerRect.top + ownerRect.bottom) / 2 - kDialogHeight / 2;
+    int cx = (ownerRect.left + ownerRect.right) / 2 - scaledW / 2;
+    int cy = (ownerRect.top + ownerRect.bottom) / 2 - scaledH / 2;
 
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         kClassName,
         L"\u7B5B\u9009\u7F16\u8F91",  // 筛选编辑
         WS_POPUPWINDOW | WS_CAPTION | WS_VISIBLE,
-        cx, cy, kDialogWidth, kDialogHeight,
+        cx, cy, scaledW, scaledH,
         owner, nullptr, hInstance,
         &impl  // delivered via WM_NCCREATE below
     );
@@ -243,6 +257,25 @@ LRESULT CALLBACK FilterEditorWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         case WM_LBUTTONUP:   OnLButtonUp(impl, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)); return 0;
         case WM_CHAR:        OnChar(impl, static_cast<wchar_t>(wParam)); return 0;
         case WM_KEYDOWN:     OnKeyDown(impl, wParam, lParam); return 0;
+
+        case WM_DPICHANGED: {
+            // Adopt Win32's DPI-scaled suggested rect. The next
+            // WM_PAINT will re-run LayoutAndDraw, which reads the
+            // current DPI via D2DRenderer::GetDpiScale(impl->hwnd)
+            // and re-scales every rect / font — i.e. the dialog
+            // immediately reflows on the new monitor without any
+            // extra plumbing here.
+            RECT* suggested = reinterpret_cast<RECT*>(lParam);
+            if (suggested) {
+                SetWindowPos(hwnd, nullptr,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
 
         case WM_SETCURSOR: {
             // I-beam cursor over tag / keyword TextBoxes. Both are
@@ -430,15 +463,28 @@ void LayoutAndDraw(Impl* impl) {
     rt->BeginDraw();
     rt->Clear(Theme::WindowBackground());
 
-    // ---- Header row (固定高度 40px) ----
-    const float kHeaderHeight = 40.0f;
-    const float kBtn = Theme::kButtonHeight;
-    const float kPad = Theme::kPadding;
-    const float kPadL = Theme::kPaddingLarge;
+    // ---- Header row (固定高度 40px @ 96-DPI) ----
+    //
+    // DPI-aware layout: every size / offset below is multiplied by
+    // `dpi` at the use site so hit-test rects (Button::rect /
+    // TextBox::rect read verbatim by HandleMouse) land on the same
+    // physical pixel grid as the rendered geometry. The Win32
+    // mouse messages (WM_LBUTTONDOWN etc.) deliver coords in
+    // physical pixels under PerMonitorV2 awareness.
+    const float kHeaderHeight = 40.0f * dpi;
+    const float kBtn = Theme::kButtonHeight * dpi;
+    const float kPad = Theme::kPadding * dpi;
+    const float kPadL = Theme::kPaddingLarge * dpi;
+    const float kBtnW = 64.0f * dpi;          // header button width
+    const float kSegGap = 4.0f * dpi;         // segmented-picker gap
+    const float kSectionHeaderH = 20.0f * dpi;
+    const float kSectionHeaderStep = 22.0f * dpi;
+    const float kCheckboxRowH = 22.0f * dpi;
+    const float kStepperBtnW = 32.0f * dpi;
 
     // 取消 (left). Rects are recomputed per-frame to survive OS-driven
     // resize; callbacks were bound once in InitControls.
-    impl->cancelButton_.rect = {kPadL, (kHeaderHeight - kBtn) * 0.5f, 64.0f, kBtn};
+    impl->cancelButton_.rect = {kPadL, (kHeaderHeight - kBtn) * 0.5f, kBtnW, kBtn};
     impl->cancelButton_.Draw(rt, dw, dpi);
 
     // "筛选" title (center)
@@ -453,21 +499,23 @@ void LayoutAndDraw(Impl* impl) {
     }
 
     // 保存 (right)
-    impl->saveButton_.rect = {W - kPadL - 64.0f, (kHeaderHeight - kBtn) * 0.5f, 64.0f, kBtn};
+    impl->saveButton_.rect = {W - kPadL - kBtnW, (kHeaderHeight - kBtn) * 0.5f, kBtnW, kBtn};
     impl->saveButton_.Draw(rt, dw, dpi);
 
     // 重置 (left of 保存)
-    impl->resetButton_.rect = {W - kPadL - 64.0f - kPad - 64.0f,
-                               (kHeaderHeight - kBtn) * 0.5f, 64.0f, kBtn};
+    impl->resetButton_.rect = {W - kPadL - kBtnW - kPad - kBtnW,
+                               (kHeaderHeight - kBtn) * 0.5f, kBtnW, kBtn};
     impl->resetButton_.Draw(rt, dw, dpi);
 
-    // Separator under header
+    // Separator under header. Stroke width 1.0f*dpi so the line keeps
+    // its visual weight at high DPI (otherwise it would be a hairline
+    // that sub-pixel anti-aliases to near invisibility).
     {
         ID2D1SolidColorBrush* sep = nullptr;
         rt->CreateSolidColorBrush(Theme::Separator(), &sep);
         if (sep) {
             rt->DrawLine(D2D1::Point2F(0, kHeaderHeight),
-                         D2D1::Point2F(W, kHeaderHeight), sep, 1.0f);
+                         D2D1::Point2F(W, kHeaderHeight), sep, 1.0f * dpi);
             sep->Release();
         }
     }
@@ -476,16 +524,17 @@ void LayoutAndDraw(Impl* impl) {
     float y = kHeaderHeight + kPadL;
     const float xLabel = kPadL;
     const float contentW = W - 2 * kPadL;
+    const float inputH = Theme::kInputHeight * dpi;
 
     auto drawSectionHeader = [&](const wchar_t* text) {
         Label h;
-        h.rect = {xLabel, y, contentW, 20.0f};
+        h.rect = {xLabel, y, contentW, kSectionHeaderH};
         h.text = text;
         h.fontSize = Theme::kFontSizeSmall;
         h.bold = true;
         h.color = Theme::TextSecondary();
         h.Draw(rt, dw, dpi);
-        y += 22.0f;
+        y += kSectionHeaderStep;
     };
 
     // --- 状态 ---
@@ -497,9 +546,9 @@ void LayoutAndDraw(Impl* impl) {
         // machine, so mouse interaction can freely transition without
         // clobbering the "currently chosen status" indicator. The flag
         // itself is updated via ApplyStatusSelection, never here.
-        float segW = (contentW - 2 * 4.0f) / 3.0f; // 4px gap × 2
+        float segW = (contentW - 2 * kSegGap) / 3.0f;
         for (int i = 0; i < 3; ++i) {
-            impl->statusSegments_[i].rect = {xLabel + i * (segW + 4.0f), y, segW, kBtn};
+            impl->statusSegments_[i].rect = {xLabel + i * (segW + kSegGap), y, segW, kBtn};
             impl->statusSegments_[i].Draw(rt, dw, dpi);
         }
         y += kBtn + kPadL;
@@ -507,23 +556,23 @@ void LayoutAndDraw(Impl* impl) {
 
     // --- 标签与关键词 ---
     drawSectionHeader(L"\u6807\u7B7E\u4E0E\u5173\u952E\u8BCD"); // 标签与关键词
-    impl->tagBox_.rect = {xLabel, y, contentW, Theme::kInputHeight};
+    impl->tagBox_.rect = {xLabel, y, contentW, inputH};
     impl->tagBox_.Draw(rt, dw, dpi);
-    y += Theme::kInputHeight + kPad;
+    y += inputH + kPad;
 
-    impl->keywordBox_.rect = {xLabel, y, contentW, Theme::kInputHeight};
+    impl->keywordBox_.rect = {xLabel, y, contentW, inputH};
     impl->keywordBox_.Draw(rt, dw, dpi);
-    y += Theme::kInputHeight + kPadL;
+    y += inputH + kPadL;
 
     // --- 软删 ---
     drawSectionHeader(L"\u8F6F\u5220"); // 软删
-    impl->includeDeletedBox_.rect = {xLabel, y, contentW, 22.0f};
+    impl->includeDeletedBox_.rect = {xLabel, y, contentW, kCheckboxRowH};
     impl->includeDeletedBox_.Draw(rt, dw, dpi);
-    y += 22.0f + kPad;
+    y += kCheckboxRowH + kPad;
 
-    impl->onlyDeletedBox_.rect = {xLabel, y, contentW, 22.0f};
+    impl->onlyDeletedBox_.rect = {xLabel, y, contentW, kCheckboxRowH};
     impl->onlyDeletedBox_.Draw(rt, dw, dpi);
-    y += 22.0f + kPadL;
+    y += kCheckboxRowH + kPadL;
 
     // --- 分页 ---
     drawSectionHeader(L"\u5206\u9875"); // 分页
@@ -531,12 +580,11 @@ void LayoutAndDraw(Impl* impl) {
         // Stepper layout:  [−]  每页 NN 条  [+]. Callbacks were bound once
         // in InitControls; only rect + enabled (clamp feedback) are
         // recomputed per-frame.
-        const float stepperBtnW = 32.0f;
-        impl->pageSizeMinus_.rect = {xLabel, y, stepperBtnW, kBtn};
+        impl->pageSizeMinus_.rect = {xLabel, y, kStepperBtnW, kBtn};
         impl->pageSizeMinus_.enabled = (impl->draft.page_size > 10);
         impl->pageSizeMinus_.Draw(rt, dw, dpi);
 
-        impl->pageSizePlus_.rect = {xLabel + contentW - stepperBtnW, y, stepperBtnW, kBtn};
+        impl->pageSizePlus_.rect = {xLabel + contentW - kStepperBtnW, y, kStepperBtnW, kBtn};
         impl->pageSizePlus_.enabled = (impl->draft.page_size < 200);
         impl->pageSizePlus_.Draw(rt, dw, dpi);
 
@@ -546,7 +594,7 @@ void LayoutAndDraw(Impl* impl) {
         impl->pageSizeLabelCache = buf;
 
         Label pgLabel;
-        pgLabel.rect = {xLabel + stepperBtnW, y, contentW - 2 * stepperBtnW, kBtn};
+        pgLabel.rect = {xLabel + kStepperBtnW, y, contentW - 2 * kStepperBtnW, kBtn};
         pgLabel.text = impl->pageSizeLabelCache;
         pgLabel.fontSize = Theme::kFontSizeBody;
         pgLabel.color = Theme::TextPrimary();

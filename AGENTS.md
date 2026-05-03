@@ -395,6 +395,39 @@ Bundle 和命名（真值来自 `client/win/CMakeLists.txt` + `src/res/app.rc` +
 3. **删除确认 "N/Y/Cancel" 三选一**：`IDYES = 直接删` / `IDNO = 删除并不再提示（写 HKCU）` / `IDCANCEL = 放弃`——与 macOS 的 3-way `alert` 三按钮形态对齐（macOS 的 `@AppStorage` ↔ Windows 的 `Preferences` 封装）
 4. **Frame 不跨端**：`UpsertSticky` 请求体里 `frame` 字段恒 `"{}"`，frame 只走 `FrameStore` 本机持久化
 
+#### 4.3.x DPI 布局契约（PerMonitorV2）
+
+`app.manifest` 声明 `PerMonitorV2` + `main.cpp` 调 `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`。这决定了**整个客户端的坐标空间都是物理像素**（不是 96-DPI 虚拟像素）：
+
+- `GetClientRect` / `GetWindowRect` 返回物理像素
+- `WM_MOUSEMOVE` / `WM_LBUTTON*` 的 `GET_X_LPARAM(lParam)` 是物理像素
+- `WM_DPICHANGED` lParam 里的 suggested rect 已经是新 DPI 的物理像素
+
+因此**所有 rect 摆放、hit-test 比较、字体尺寸都必须用物理像素**。强制约定：
+
+1. **`Theme::kXxx` 是 96-DPI 基准值**（`kPadding = 8`, `kTodoRowHeight = 36`, `kButtonHeight = 32`, `kCheckboxSize = 18`, `kCornerRadius = 6`, `kScrollbarWidth = 10`, `kInputHeight = 28` 等）。**使用处一律 `× dpi`**，禁止裸用
+2. **字面 float 像素值也是 96-DPI 基准**（`4.0f`, `8.0f`, `22.0f`, `24.0f`, `32.0f`, `40.0f` 等出现在 rect / 坐标 / 线宽 / 圆角里的数字）。**使用处一律 `× dpi`**。alpha / 比例因子（`0.5f` alpha、`0.3f` 勾线相对尺寸、`2.0f` 滚动速度比例）**不是 px，不要乘**
+3. **`dpi` 来源**：`D2DRenderer::GetDpiScale(hwnd) = GetDpiForWindow(hwnd) / 96.0f`。OnPaint 开头取一次，传到所有 Draw 函数参数里
+4. **Controls::Draw 内部硬编码 px 也必须 × dpi**：TextBox 的 8px inset / 4px 圆角 / 1px 边框 / 0.5px caret 偏移；CheckBox 的 kCheckboxSize / 3px 圆角 / 1.5px/2px 描边 / 6px 标签间距；Button 的 kCornerRadius；ScrollView 的 kScrollbarWidth / 20px 最小滑块 / 40px 滚轮步长 / 1px 滑块 inset / 3px 圆角。**唯一例外**是字体 — `CreateTextFormat` 的 fontSize 传 `fontSize * dpi`，DirectWrite 的布局引擎本身按物理像素渲染
+5. **ScrollView 特殊处理**：因为 `HandleMouse` / `HandleWheel` / `DrawScrollbar` / `GetContentClipRect` 没有 `dpi` 参数，ScrollView 有一个 `float dpi = 1.0f` 成员。**使用方必须在 OnPaint 开头赋值**（`scrollView_.dpi = dpi;` / `historyScroll_.dpi = dpi;`），否则滚动条宽度 / 滚轮速度 / 最小滑块高度会以 1.0 渲染，hit-test 与绘制错位
+6. **`StickyWindow::titleBarHeight_` / `filterBarHeight_` 是物理像素缓存**，由 `RefreshLayoutMetrics()` 在每次 OnPaint 开头刷新。OnNcHitTest / OnMouseMove / OnLButtonDown 直接读缓存，**不要再乘 dpi**（缓存本身已是物理像素）。其他 Theme::k* 读取处仍需 × dpi
+7. **`ComputeRowLayout(width, rowTop, dpi)` 必须传 dpi**，返回的 `RowLayout` 所有字段（含新增的 `checkboxSize`/`actionIconSize`/`actionGap`）都是物理像素。`HitTestRow(..., dpi, todos)` 同样接 dpi，与 Draw 使用同一 dpi 保证绘制 / 点击几何完全对齐
+8. **窗口创建尺寸必须 × dpi**：`SettingsWindow::Create` / `FilterEditor::ShowModal` 里 `CreateWindowExW` 的宽高参数是物理像素，直接传 `kXxxWidth`（96-DPI）会得到一个只覆盖左上角 `1/dpi²` 面积的"小窗"。固定模式：`GetDpiForWindow(owner)` 或 `GetDpiForSystem()` → `createScale = dpi/96` → `scaledW = kXxxWidth * createScale`
+9. **`WM_DPICHANGED` 必须响应**：SettingsWindow / StickyWindow / FilterEditor 三个 WndProc 都接了。标准处理 = 采纳 lParam 的建议 rect（`SetWindowPos(..., SWP_NOZORDER | SWP_NOACTIVATE)`）+ `InvalidateRect`。StickyWindow 额外调 `RefreshLayoutMetrics()` + `SaveFramePosition()` 确保缓存即时刷新 + 新帧位置持久化。**TrayIcon 是 message-only window，不需要处理 WM_DPICHANGED**
+10. **TrayIcon 图标 DPI 感知**：用 `LoadImageW(IDI_APPICON, IMAGE_ICON, GetSystemMetricsForDpi(SM_CXSMICON, sysDpi), ..., LR_DEFAULTCOLOR | LR_SHARED)`，**不是** `LoadIconW`（后者强制加载 SM_CXICON = 32px 基准，托盘区再被双线性缩成 16/20/24px 会糊）。`LR_SHARED` 让系统管生命周期，**不要调 `DestroyIcon`**（MSDN: "Do not use this function to destroy a shared icon"）
+
+**调试 DPI 问题的快速清单**（按出现概率排序）：
+
+| 症状 | 根因定位 |
+|---|---|
+| 按钮可见但点不到 | hit-test 侧的 rect / 阈值没 × dpi，与 Draw 的 rect 错位 |
+| 窗口尺寸对但内容挤在左上角 | 窗口 create 时 kXxxWidth 没 × createScale |
+| 控件间距过密 / 文字压在一起 | y 步进字面值（`y += 22.0f`）没 × dpi |
+| 整个窗口"小一圈" | 某个 Draw 函数漏给 rect × dpi |
+| 第一次渲染正常，移动到另一屏显示器后错乱 | WM_DPICHANGED 没处理，或处理了但没触发全量重绘 |
+| 滚动条点不中 / 滚轮巨慢 | ScrollView::dpi 没被使用方赋值，默认 1.0 |
+| 托盘图标模糊 | 还在用 `LoadIconW` 而非 `LoadImageW + SM_CXSMICON` |
+
 ### 4.2 macOS 客户端（client/mac/）
 
 技术栈：**Swift 5.9 + SwiftUI + Combine + Keychain Services**。`@Published` 在多数视图里以 SwiftUI 的 `@EnvironmentObject` / `@ObservedObject` 方式消费；只有 `StickyWindowBridge` 显式 `import Combine` 用 `sink` + `AnyCancellable` 直接订阅——因为它不是 View，挂在 SwiftUI 生命周期里会在 MenuBarExtra 面板折叠时失去响应

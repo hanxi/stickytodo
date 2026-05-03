@@ -79,11 +79,29 @@ bool SettingsWindow::CreateWindow_() {
     }
 
     DWORD style = WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX;
+    // Scale initial window size by the current monitor DPI so the
+    // content area matches the (96-DPI) layout we perform in
+    // DrawSettingsTab × dpi. On a 150% display this yields 780×630
+    // rather than 520×420; without the scaling the Win11 default
+    // (per-monitor v2 aware) window would show a full-sized window
+    // frame but a content area's worth of controls crammed into the
+    // top-left ~520×420 sub-region.
+    //
+    // We sample DPI from the PRIMARY monitor's implied window context
+    // because the HWND doesn't exist yet (we're about to create it).
+    // GetDpiForSystem() is good enough for the initial create — the
+    // subsequent WM_DPICHANGED handler (if any) would resize. Most
+    // users never move the window between monitors so one-shot DPI
+    // at creation is the pragmatic choice here.
+    UINT createDpi = GetDpiForSystem();
+    float createScale = static_cast<float>(createDpi) / 96.0f;
+    int scaledW = static_cast<int>(Theme::kSettingsWidth * createScale);
+    int scaledH = static_cast<int>(Theme::kSettingsHeight * createScale);
     hwnd_ = CreateWindowExW(
         0, kClassName, L"StickyTodo - Settings",
         style,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        Theme::kSettingsWidth, Theme::kSettingsHeight,
+        scaledW, scaledH,
         nullptr, nullptr, hInstance_, this
     );
 
@@ -164,11 +182,17 @@ void SettingsWindow::OnLButtonDown(int x, int y) {
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
 
-    // Tab clicking
+    // Tab clicking. The tab bar is drawn with height `kTabHeight*dpi`
+    // (see DrawTabs → FillRectangle uses Theme::kTabHeight*dpi), so
+    // hit-testing must use the same scaled threshold. Without *dpi
+    // the tab band on a 150% display would be only ~21 px tall for
+    // clicks but ~32 px tall visually, creating a dead zone above
+    // the rendered tab text.
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float tabWidth = static_cast<float>(rc.right - rc.left) / 3.0f;
-    if (fy < Theme::kTabHeight) {
+    if (fy < Theme::kTabHeight * dpi) {
         if (fx < tabWidth) activeTab_ = Tab::Settings;
         else if (fx < tabWidth * 2) {
             activeTab_ = Tab::History;
@@ -223,10 +247,17 @@ void SettingsWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
 }
 
 void SettingsWindow::DrawTabs(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
+    // DPI note: `width` comes straight from GetClientRect, which under
+    // PerMonitorV2 returns *physical* pixels — already correct. But
+    // Theme::kTabHeight is a 96-DPI baseline and must be scaled by
+    // dpi to match the physical pixel grid. The hit-test in
+    // OnLButtonDown uses the same `Theme::kTabHeight * dpi` formula,
+    // keeping draw and hit-test perfectly aligned.
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float width = static_cast<float>(rc.right - rc.left);
     float tabWidth = width / 3.0f;
+    float tabHeight = Theme::kTabHeight * dpi;
 
     const wchar_t* tabNames[] = {L"Settings", L"History", L"About"};
     Tab tabs[] = {Tab::Settings, Tab::History, Tab::About};
@@ -238,7 +269,7 @@ void SettingsWindow::DrawTabs(ID2D1RenderTarget* rt, IDWriteFactory* dw, float d
         ID2D1SolidColorBrush* bgBrush = nullptr;
         rt->CreateSolidColorBrush(isActive ? Theme::TabActive() : Theme::TabInactive(), &bgBrush);
         if (bgBrush) {
-            D2D1_RECT_F tabRect = D2D1::RectF(tx, 0, tx + tabWidth, Theme::kTabHeight);
+            D2D1_RECT_F tabRect = D2D1::RectF(tx, 0, tx + tabWidth, tabHeight);
             rt->FillRectangle(tabRect, bgBrush);
             bgBrush->Release();
         }
@@ -256,7 +287,7 @@ void SettingsWindow::DrawTabs(ID2D1RenderTarget* rt, IDWriteFactory* dw, float d
             ID2D1SolidColorBrush* textBrush = nullptr;
             rt->CreateSolidColorBrush(Theme::TextPrimary(), &textBrush);
             if (textBrush) {
-                D2D1_RECT_F textRect = D2D1::RectF(tx, 0, tx + tabWidth, Theme::kTabHeight);
+                D2D1_RECT_F textRect = D2D1::RectF(tx, 0, tx + tabWidth, tabHeight);
                 rt->DrawText(tabNames[i], static_cast<UINT32>(wcslen(tabNames[i])),
                               format, textRect, textBrush);
                 textBrush->Release();
@@ -269,34 +300,49 @@ void SettingsWindow::DrawTabs(ID2D1RenderTarget* rt, IDWriteFactory* dw, float d
     ID2D1SolidColorBrush* sepBrush = nullptr;
     rt->CreateSolidColorBrush(Theme::Separator(), &sepBrush);
     if (sepBrush) {
-        rt->DrawLine(D2D1::Point2F(0, Theme::kTabHeight),
-                      D2D1::Point2F(width, Theme::kTabHeight), sepBrush, 1.0f);
+        rt->DrawLine(D2D1::Point2F(0, tabHeight),
+                      D2D1::Point2F(width, tabHeight), sepBrush, 1.0f);
         sepBrush->Release();
     }
 }
 
 void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
-    float y = Theme::kTabHeight + Theme::kPaddingLarge;
-    float x = Theme::kPaddingLarge;
-    float w = static_cast<float>(Theme::kSettingsWidth) - 2 * Theme::kPaddingLarge - 20.0f;
+    // DPI-aware layout: Theme::kXxx are all 96-DPI baseline values;
+    // every coordinate / size below is multiplied by `dpi` so the
+    // physical pixel rects match the `fontSize * dpi` rendered text
+    // that Controls::*::Draw produces internally. Hit-testing in
+    // OnLButtonDown sees the same physical-pixel rect via the
+    // control's own `rect` member (we mutate it each frame here).
+    //
+    // Width: take the actual client area rather than Theme::kSettingsWidth
+    // so the layout adapts to user-resized windows (OnResize triggers a
+    // full repaint). The window is created at `kSettingsWidth * dpi` but
+    // may be enlarged.
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float clientW = static_cast<float>(rc.right - rc.left);
+
+    float y = (Theme::kTabHeight + Theme::kPaddingLarge) * dpi;
+    float x = Theme::kPaddingLarge * dpi;
+    float w = clientW - 2.0f * x - 20.0f * dpi;
 
     auto* app = GetApp();
     bool authenticated = app && app->GetState() && app->GetState()->IsAuthenticated();
 
     // "Server URL" label
     Label urlLabel;
-    urlLabel.rect = {x, y, w, 20.0f};
+    urlLabel.rect = {x, y, w, 20.0f * dpi};
     urlLabel.text = L"Server URL";
     urlLabel.fontSize = Theme::kFontSizeSmall;
     urlLabel.color = Theme::TextSecondary();
     urlLabel.Draw(rt, dw, dpi);
-    y += 22.0f;
+    y += 22.0f * dpi;
 
     // URL input
-    urlInput_.rect = {x, y, w, Theme::kInputHeight};
+    urlInput_.rect = {x, y, w, Theme::kInputHeight * dpi};
     urlInput_.enabled = !authenticated;
     urlInput_.Draw(rt, dw, dpi);
-    y += Theme::kInputHeight + Theme::kPadding;
+    y += (Theme::kInputHeight + Theme::kPadding) * dpi;
 
     // Test connection button.
     //
@@ -306,7 +352,7 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
     // "grayed out" cue courtesy of Button::Draw's alpha halving. The
     // inflight flag is cleared by the UI-thread completion callback
     // posted via AppState::TestConnectionAsync → PostToUIThread.
-    testButton_.rect = {x, y, 140.0f, Theme::kButtonHeight};
+    testButton_.rect = {x, y, 140.0f * dpi, Theme::kButtonHeight * dpi};
     testButton_.enabled = !testInFlight_;
     testButton_.onClick = [this]() { DoTestConnection(); };
     testButton_.Draw(rt, dw, dpi);
@@ -314,63 +360,65 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
     // Connection status text
     if (!connectionStatus_.empty()) {
         Label statusLbl;
-        statusLbl.rect = {x + 150.0f, y, w - 150.0f, Theme::kButtonHeight};
+        statusLbl.rect = {x + 150.0f * dpi, y,
+                           w - 150.0f * dpi, Theme::kButtonHeight * dpi};
         statusLbl.text = connectionStatus_;
         statusLbl.fontSize = Theme::kFontSizeSmall;
         statusLbl.color = Theme::TextSecondary();
         statusLbl.Draw(rt, dw, dpi);
     }
-    y += Theme::kButtonHeight + Theme::kPaddingLarge;
+    y += (Theme::kButtonHeight + Theme::kPaddingLarge) * dpi;
 
     if (!authenticated) {
         // Username label + input
         Label userLabel;
-        userLabel.rect = {x, y, w, 20.0f};
+        userLabel.rect = {x, y, w, 20.0f * dpi};
         userLabel.text = L"Username";
         userLabel.fontSize = Theme::kFontSizeSmall;
         userLabel.color = Theme::TextSecondary();
         userLabel.Draw(rt, dw, dpi);
-        y += 22.0f;
+        y += 22.0f * dpi;
 
-        usernameInput_.rect = {x, y, w, Theme::kInputHeight};
+        usernameInput_.rect = {x, y, w, Theme::kInputHeight * dpi};
         usernameInput_.Draw(rt, dw, dpi);
-        y += Theme::kInputHeight + Theme::kPadding;
+        y += (Theme::kInputHeight + Theme::kPadding) * dpi;
 
         // Password label + input
         Label passLabel;
-        passLabel.rect = {x, y, w, 20.0f};
+        passLabel.rect = {x, y, w, 20.0f * dpi};
         passLabel.text = L"Password";
         passLabel.fontSize = Theme::kFontSizeSmall;
         passLabel.color = Theme::TextSecondary();
         passLabel.Draw(rt, dw, dpi);
-        y += 22.0f;
+        y += 22.0f * dpi;
 
-        passwordInput_.rect = {x, y, w, Theme::kInputHeight};
+        passwordInput_.rect = {x, y, w, Theme::kInputHeight * dpi};
         passwordInput_.Draw(rt, dw, dpi);
-        y += Theme::kInputHeight + Theme::kPaddingLarge;
+        y += (Theme::kInputHeight + Theme::kPaddingLarge) * dpi;
 
         // Login button — gated on !loginInFlight_, see testButton_
         // above for the identical rationale.
-        loginButton_.rect = {x, y, 100.0f, Theme::kButtonHeight};
+        loginButton_.rect = {x, y, 100.0f * dpi, Theme::kButtonHeight * dpi};
         loginButton_.enabled = !loginInFlight_;
         loginButton_.onClick = [this]() { DoLogin(); };
         loginButton_.Draw(rt, dw, dpi);
+        y += (Theme::kButtonHeight + Theme::kPaddingLarge) * dpi;
     } else {
         // Logged in state
         Label loggedInLabel;
-        loggedInLabel.rect = {x, y, w, 24.0f};
+        loggedInLabel.rect = {x, y, w, 24.0f * dpi};
         std::string username = app->GetState()->GetUsername();
         loggedInLabel.text = L"Logged in as: " + std::wstring(username.begin(), username.end());
         loggedInLabel.fontSize = Theme::kFontSizeBody;
         loggedInLabel.color = Theme::TextPrimary();
         loggedInLabel.Draw(rt, dw, dpi);
-        y += 32.0f;
+        y += 32.0f * dpi;
 
         // Logout button
-        logoutButton_.rect = {x, y, 100.0f, Theme::kButtonHeight};
+        logoutButton_.rect = {x, y, 100.0f * dpi, Theme::kButtonHeight * dpi};
         logoutButton_.onClick = [this]() { DoLogout(); };
         logoutButton_.Draw(rt, dw, dpi);
-        y += Theme::kButtonHeight + Theme::kPaddingLarge;
+        y += (Theme::kButtonHeight + Theme::kPaddingLarge) * dpi;
     }
 
     // --------- 通用 section — delete-confirm toggles (mirrors macOS) ---------
@@ -387,16 +435,16 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
     // are per-machine, not per-session: a logged-out user who previously
     // silenced a dialog should still be able to re-enable it.
     Label generalHeader;
-    generalHeader.rect = {x, y, w, 20.0f};
+    generalHeader.rect = {x, y, w, 20.0f * dpi};
     generalHeader.text = L"\u901A\u7528"; // 通用
     generalHeader.fontSize = Theme::kFontSizeSmall;
     generalHeader.bold = true;
     generalHeader.color = Theme::TextSecondary();
     generalHeader.Draw(rt, dw, dpi);
-    y += 24.0f;
+    y += 24.0f * dpi;
 
     // Row 1: sticky delete confirmation
-    showStickyDeleteConfirmBox_.rect = {x, y, w, 22.0f};
+    showStickyDeleteConfirmBox_.rect = {x, y, w, 22.0f * dpi};
     showStickyDeleteConfirmBox_.label = L"\u5220\u9664\u4FBF\u7B7E\u524D\u5F39\u51FA\u786E\u8BA4"; // 删除便签前弹出确认
     showStickyDeleteConfirmBox_.checked = !ShouldSkipStickyDeleteConfirm();
     showStickyDeleteConfirmBox_.onToggle = [](bool showConfirm) {
@@ -404,10 +452,10 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
         SetSkipStickyDeleteConfirm(!showConfirm);
     };
     showStickyDeleteConfirmBox_.Draw(rt, dw, dpi);
-    y += 22.0f + Theme::kPadding;
+    y += (22.0f + Theme::kPadding) * dpi;
 
     // Row 2: todo delete confirmation
-    showTodoDeleteConfirmBox_.rect = {x, y, w, 22.0f};
+    showTodoDeleteConfirmBox_.rect = {x, y, w, 22.0f * dpi};
     showTodoDeleteConfirmBox_.label = L"\u5220\u9664\u5F85\u529E\u524D\u5F39\u51FA\u786E\u8BA4"; // 删除待办前弹出确认
     showTodoDeleteConfirmBox_.checked = !ShouldSkipTodoDeleteConfirm();
     showTodoDeleteConfirmBox_.onToggle = [](bool showConfirm) {
@@ -417,8 +465,11 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
 }
 
 void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
-    float y = Theme::kTabHeight + Theme::kPadding;
-    float x = Theme::kPaddingLarge;
+    // DPI-aware: all layout constants multiplied by dpi (same rationale
+    // as DrawSettingsTab above). `width` / `height` from GetClientRect
+    // are already physical pixels and stay raw.
+    float y = (Theme::kTabHeight + Theme::kPadding) * dpi;
+    float x = Theme::kPaddingLarge * dpi;
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float width = static_cast<float>(rc.right - rc.left);
@@ -429,7 +480,7 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
 
     if (!authenticated) {
         Label hint;
-        hint.rect = {x, y + 40.0f, width - 2 * x, 40.0f};
+        hint.rect = {x, y + 40.0f * dpi, width - 2 * x, 40.0f * dpi};
         hint.text = L"Please login in the Settings tab to view history.";
         hint.fontSize = Theme::kFontSizeBody;
         hint.color = Theme::TextSecondary();
@@ -439,7 +490,7 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
 
     if (auditLogs_.empty()) {
         Label hint;
-        hint.rect = {x, y + 40.0f, width - 2 * x, 40.0f};
+        hint.rect = {x, y + 40.0f * dpi, width - 2 * x, 40.0f * dpi};
         // Three distinct empty states:
         //   • auditInFlight_ → request is mid-flight, show "Loading..."
         //     so the user knows the blank space isn't a bug.
@@ -461,9 +512,18 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
         return;
     }
 
+    // Per-row height in physical pixels. Row content: 4px top pad +
+    // 18px action + 2px gap + 16px info + 8px bottom pad ≈ 48px
+    // at 96-DPI baseline.
+    const float rowHeight = 48.0f * dpi;
+
     // Scroll view for audit logs
     historyScroll_.rect = {0, y, width, height - y};
-    historyScroll_.contentHeight = static_cast<float>(auditLogs_.size()) * 48.0f;
+    // Propagate DPI so ScrollView's internal scrollbar/thumb/wheel
+    // constants render and hit-test at physical-pixel scale.
+    historyScroll_.dpi = dpi;
+    historyScroll_.contentHeight =
+        static_cast<float>(auditLogs_.size()) * rowHeight;
 
     historyScroll_.BeginContent(rt);
 
@@ -471,7 +531,7 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
     for (const auto& log : auditLogs_) {
         // Action
         Label actionLabel;
-        actionLabel.rect = {x, rowY + 4.0f, width - 2 * x, 18.0f};
+        actionLabel.rect = {x, rowY + 4.0f * dpi, width - 2 * x, 18.0f * dpi};
         actionLabel.text = std::wstring(log.action.begin(), log.action.end());
         actionLabel.fontSize = Theme::kFontSizeBody;
         actionLabel.bold = true;
@@ -481,7 +541,7 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
         // Timestamp + actor
         std::string info = log.created_at + " by " + log.actor;
         Label infoLabel;
-        infoLabel.rect = {x, rowY + 24.0f, width - 2 * x, 16.0f};
+        infoLabel.rect = {x, rowY + 24.0f * dpi, width - 2 * x, 16.0f * dpi};
         infoLabel.text = std::wstring(info.begin(), info.end());
         infoLabel.fontSize = Theme::kFontSizeSmall;
         infoLabel.color = Theme::TextSecondary();
@@ -491,12 +551,12 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
         ID2D1SolidColorBrush* sepBrush = nullptr;
         rt->CreateSolidColorBrush(Theme::Separator(), &sepBrush);
         if (sepBrush) {
-            float sepLineY = rowY + 47.0f;
+            float sepLineY = rowY + 47.0f * dpi;
             rt->DrawLine(D2D1::Point2F(x, sepLineY), D2D1::Point2F(width - x, sepLineY), sepBrush, 0.5f);
             sepBrush->Release();
         }
 
-        rowY += 48.0f;
+        rowY += rowHeight;
     }
 
     historyScroll_.EndContent(rt);
@@ -504,44 +564,45 @@ void SettingsWindow::DrawHistoryTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, f
 }
 
 void SettingsWindow::DrawAboutTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
-    float y = Theme::kTabHeight + Theme::kPaddingLarge;
-    float x = Theme::kPaddingLarge;
+    // DPI-aware layout (same rationale as DrawSettingsTab / DrawHistoryTab).
+    float y = (Theme::kTabHeight + Theme::kPaddingLarge) * dpi;
+    float x = Theme::kPaddingLarge * dpi;
     RECT rc;
     GetClientRect(hwnd_, &rc);
     float width = static_cast<float>(rc.right - rc.left);
 
     // App name
     Label nameLabel;
-    nameLabel.rect = {x, y, width - 2 * x, 28.0f};
+    nameLabel.rect = {x, y, width - 2 * x, 28.0f * dpi};
     nameLabel.text = L"StickyTodo";
     nameLabel.fontSize = Theme::kFontSizeHeading;
     nameLabel.bold = true;
     nameLabel.color = Theme::TextPrimary();
     nameLabel.Draw(rt, dw, dpi);
-    y += 36.0f;
+    y += 36.0f * dpi;
 
     // Version
     Label versionLabel;
-    versionLabel.rect = {x, y, width - 2 * x, 20.0f};
+    versionLabel.rect = {x, y, width - 2 * x, 20.0f * dpi};
     versionLabel.text = L"Version 1.0.0 (Windows)";
     versionLabel.fontSize = Theme::kFontSizeBody;
     versionLabel.color = Theme::TextSecondary();
     versionLabel.Draw(rt, dw, dpi);
-    y += 28.0f;
+    y += 28.0f * dpi;
 
     // Description
     Label descLabel;
-    descLabel.rect = {x, y, width - 2 * x, 40.0f};
+    descLabel.rect = {x, y, width - 2 * x, 40.0f * dpi};
     descLabel.text = L"Desktop sticky notes with cloud sync. "
                      L"Keeps your TODO items visible and in sync across devices.";
     descLabel.fontSize = Theme::kFontSizeBody;
     descLabel.color = Theme::TextPrimary();
     descLabel.Draw(rt, dw, dpi);
-    y += 52.0f;
+    y += 52.0f * dpi;
 
     // Links
     Label linksLabel;
-    linksLabel.rect = {x, y, width - 2 * x, 60.0f};
+    linksLabel.rect = {x, y, width - 2 * x, 60.0f * dpi};
     linksLabel.text = L"GitHub: https://github.com/hanxi/stickytodo\n"
                       L"License: MIT";
     linksLabel.fontSize = Theme::kFontSizeSmall;
@@ -784,6 +845,28 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_ERASEBKGND:
             return 1;
+        case WM_DPICHANGED: {
+            // Monitor DPI changed (user dragged the window to a
+            // different-DPI display, or the system-wide scaling
+            // factor changed). Under PerMonitorV2 awareness, Win32
+            // suggests a new window rect in lParam that's correctly
+            // scaled for the new DPI — we adopt it verbatim so the
+            // window stays visually the same size / position on the
+            // new monitor. The subsequent WM_SIZE will trigger a
+            // repaint, during which DrawSettingsTab's `× dpi`
+            // arithmetic will pick up the new DPI from
+            // D2DRenderer::GetDpiScale(hwnd_).
+            RECT* suggested = reinterpret_cast<RECT*>(lParam);
+            if (suggested) {
+                SetWindowPos(hwnd_, nullptr,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         default:
             return DefWindowProcW(hwnd_, msg, wParam, lParam);
     }

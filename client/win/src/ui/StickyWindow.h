@@ -96,7 +96,18 @@ private:
     void ShowFilterEditor();
 
     // Layout helpers
-    float FilterBarHeight() const { return 28.0f; }
+    // Returns the filter bar height in physical pixels. Reads the
+    // DPI-aware cache populated by RefreshLayoutMetrics(). Safe to
+    // call from both drawing (after OnPaint refreshed the cache)
+    // and hit-test paths (which also ran through at least one
+    // OnPaint before the user could click).
+    float FilterBarHeight() const { return filterBarHeight_; }
+
+    // Refreshes titleBarHeight_ / filterBarHeight_ from the current
+    // monitor DPI. Called at the top of OnPaint so every subsequent
+    // hit-test through the frame sees the same values the frame was
+    // rendered with. Cheap — two multiplies and a GetDpiForWindow.
+    void RefreshLayoutMetrics();
 
     HINSTANCE hInstance_;
     HWND hwnd_ = nullptr;
@@ -118,7 +129,21 @@ private:
                              // while the cursor is hovering the title bar
                              // (mirrors macOS StickyView's hover-fade trash).
     Button filterButton_;
-    float titleBarHeight_ = 32.0f;
+
+    // ---- DPI-aware layout cache ----
+    //
+    // These are *physical pixel* values refreshed at the top of every
+    // OnPaint by `RefreshLayoutMetrics()` from the current monitor
+    // DPI. We keep them as members (rather than recomputing on every
+    // caller) because OnNcHitTest / OnMouseMove / OnLButtonDown all
+    // need the same thresholds and those handlers don't have easy
+    // access to a cached `dpi` local. The initial 96-DPI values are
+    // used only for hit-tests that arrive before the first OnPaint
+    // (WM_GETMINMAXINFO, WM_NCHITTEST during window creation) — on
+    // those early messages the window isn't visible yet anyway, so
+    // any minor mis-hit is harmless.
+    float titleBarHeight_ = 32.0f;   // physical pixels
+    float filterBarHeight_ = 28.0f;  // physical pixels
 
     // True while the cursor is inside the title-bar band. Drives the
     // hover-fade trash button (only drawn / hit-tested when this flag is
