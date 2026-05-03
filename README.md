@@ -12,7 +12,7 @@
 [![Daily Visitors](https://api.visitorbadge.io/api/daily?path=hanxi%2Fstickytodo&label=daily%20visitor&countColor=%232ccce4&style=flat)](https://visitorbadge.io/status?path=hanxi%2Fstickytodo)
 [![Total Visitors](https://api.visitorbadge.io/api/visitors?path=hanxi%2Fstickytodo&label=total%20visitor&countColor=%232ccce4&style=flat)](https://visitorbadge.io/status?path=hanxi%2Fstickytodo)
 
-一个自托管的多便签 TODO 工具：单账号 JWT 鉴权、浏览器即开即用、macOS 原生菜单栏客户端。
+一个自托管的多便签 TODO 工具：单账号 JWT 鉴权、浏览器即开即用、macOS 原生菜单栏客户端、Windows 原生桌面客户端。
 
 <p align="center">
   <a href="https://github.com/hanxi/stickytodo">🏠 GitHub</a> •
@@ -32,9 +32,9 @@
 - 单账号登录（用户名 / 密码通过环境变量配置）
 - TODO 增删改 / 完成 / 软删除 / 恢复
 - 单条 TODO 变更历史 + 全局操作审计日志
-- 多便签：Web 网格布局 / macOS 每便签一窗，支持独立筛选、颜色、置顶
-- **跨端实时同步**（WebSocket `/api/ws`）：在任一端（浏览器 / macOS 客户端）新建、修改、删除一条 TODO 或便签，其他已登录在线的客户端会在 ~300ms 去抖窗口后自动刷新（客户端侧去抖窗口 + 服务端 hub 即时广播），无需手动按刷新；网络断连后自动指数退避重连并全量拉取
-- 便签本身**跨端同步**（服务端是唯一数据源）；macOS 端的便签**窗口位置**仅保存在本机 UserDefaults，不跨端同步（浏览器"便签"本质是 Card 也不需要位置）
+- 多便签：Web 网格布局 / macOS 每便签一窗 / Windows 每便签一窗（Win32 + Direct2D 原生自绘），支持独立筛选、颜色、置顶
+- **跨端实时同步**（WebSocket `/api/ws`）：在任一端（浏览器 / macOS 客户端 / Windows 客户端）新建、修改、删除一条 TODO 或便签，其他已登录在线的客户端会在 ~300ms 去抖窗口后自动刷新（客户端侧去抖窗口 + 服务端 hub 即时广播），无需手动按刷新；网络断连后自动指数退避重连并全量拉取
+- 便签本身**跨端同步**（服务端是唯一数据源）；macOS 端的便签**窗口位置**仅保存在本机 UserDefaults、Windows 端的便签**窗口位置**仅保存在本机 `%LocalAppData%\stickytodo\frames.json`，均不跨端同步（浏览器"便签"本质是 Card 也不需要位置）
 - 后端单二进制部署，Web UI 通过 `go:embed` 内嵌，零额外静态资源
 
 ## 前置依赖
@@ -46,6 +46,7 @@
 | 用 Docker 部署后端 + 浏览器访问 Web UI | Docker 20.10+ 且内置 Compose V2（`docker compose` 子命令，非旧版 `docker-compose` 脚本）|
 | 本地源码跑后端 | Go 1.25+（与 `server/go.mod` 对齐） |
 | 从源码构建 macOS 客户端 | macOS 13+、**完整 Xcode 15+**（非 Command Line Tools；仓库在 Xcode 26.4 下验证） |
+| 从源码构建 Windows 客户端 | Windows 10 20H1+（`10.0.19041`）、**Visual Studio 2022** 的"使用 C++ 的桌面开发"工作负载（提供 MSVC v143 + Windows 10/11 SDK）、CMake ≥ 3.25、Ninja、vcpkg（需把 `VCPKG_ROOT` 环境变量指向 vcpkg 仓库根）；可选 **Inno Setup 6**（仅为本地打 `setup.exe` 时需要，缺失可通过 `--skip-installer` 跳过）|
 | 本地开发 Web 客户端 | Node.js **18 / 20 / 22+** 之一、npm（Vite 5 官方只支持 `^18 \|\| ^20 \|\| >=22`，奇数 major 不受支持；`client/web/package.json` 未强制 `engines` 字段，自行遵守即可）|
 
 > 💡 **JWT 密钥免配置**：server 首次启动时生成 32 字节随机熵、hex 编码后（DB 里 64 字符）持久化到 SQLite `app_secrets` 表的 `key='jwt_secret'` 行，重启复用；想强制失效所有 token，删掉该行重启即可。
@@ -136,6 +137,42 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 
 登录后回到菜单栏面板点「新建便签」（⌘N）即可。更多操作 / 快捷键见 [client/mac/README.md](./client/mac/README.md)。
 
+## 运行 Windows 客户端
+
+**A. 下载安装包或免安装包**（Releases 里二选一）
+
+- `stickytodo-setup-<version>.exe`（Inno Setup 6 安装器，推荐）：双击运行，默认 per-user 安装到 `%LocalAppData%\Programs\StickyTodo`（不弹 UAC）；若想装到 `%ProgramFiles%\StickyTodo` 并供本机所有用户使用，在安装向导勾选"为所有用户安装"（会提示 UAC）。安装器最低要求 Windows 10 20H1（`10.0.19041`）。卸载通过"设置 → 应用 → 已安装的应用"或开始菜单里的"Uninstall StickyTodo"。
+- `stickytodo-<version>-windows-x64.zip`（免安装 portable zip）：解压任意目录，直接双击解压后的 `stickytodo.exe` 运行；不写注册表（除了便签去重确认偏好），便签窗口位置缓存写在 `%LocalAppData%\stickytodo\frames.json`，JWT token 走 Windows Credential Manager（卸载时若想清理残留，手动删这两处即可）。
+
+两种方式**均无代码签名**，首次运行时 SmartScreen 会弹"Windows 已保护你的电脑"警告，点击"**更多信息 → 仍要运行**"即可（后续启动不再提示）。下载后建议先用同目录的 `SHA256SUMS` 校验完整性：
+
+```powershell
+# PowerShell（Windows 自带）
+Get-FileHash stickytodo-setup-<version>.exe -Algorithm SHA256
+# 对比 SHA256SUMS 里对应文件名的那一行即可
+```
+
+**B. 从源码构建**
+
+在 **Git Bash / MSYS2 shell** 下执行（需要先让 `VCPKG_ROOT` 指向本地 vcpkg 仓库根 —— CMD 下用 `set VCPKG_ROOT=C:\path\to\vcpkg`、PowerShell 下用 `$env:VCPKG_ROOT = "C:\path\to\vcpkg"`、Git Bash 下用 `export VCPKG_ROOT=/c/path/to/vcpkg`）：
+
+```bash
+cd client/win
+cmake --preset debug               # 配置（vcpkg 自动拉 nlohmann-json + cppwinrt + gtest）
+cmake --build --preset debug       # 编译
+./build/debug/stickytodo.exe       # 运行
+```
+
+或一键打 portable zip（不需要 Inno Setup）：
+
+```bash
+# 从仓库根，Git Bash / MSYS2 下执行
+VERSION=dev bash scripts/package-win-client.sh --skip-installer
+# 产物在 dist/win-client/stickytodo-dev-windows-x64.zip
+```
+
+**首次使用**：应用以系统托盘图标（屏幕右下角）常驻，无任务栏入口。**右键点击**托盘图标（或**双击**，等价于右键 → `Settings`）打开托盘菜单；未登录态菜单只有 `Settings` / `Quit` 两项，选 `Settings` 进入设置窗口。设置窗口顶部有 3 个 Tab：`Settings` / `History` / `About`，登录相关表单都在 **`Settings` Tab** 下——依次填写服务端地址（`Server URL` 输入框，例 `http://127.0.0.1:8080`；可先点 `Test Connection` 按钮验证 `GET /health` 可达）、`Username`、`Password`，然后点 `Login` 按钮登录。登录成功后托盘菜单会多出 `New Sticky Note` / `Logout` 两项，选 `New Sticky Note` 即可打开一张便签窗口；`History` Tab 显示全局审计日志，`About` Tab 显示版本号等元信息。JWT 经 Windows Credential Manager 加密持久化（target name `stickytodo/<username>`），关掉客户端再打开会自动登录；便签窗口位置（x/y/width/height）在 `%LocalAppData%\stickytodo\frames.json` 里自动保存。
+
 ## 配置项
 
 全部通过环境变量传入，与后端 `.env.example` 一致：
@@ -154,7 +191,7 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 
 ## 文档索引
 
-- [AGENTS.md](./AGENTS.md)：项目架构、模块边界、开发约定、构建发布链路
+- [AGENTS.md](./AGENTS.md)：项目架构、模块边界、开发约定、构建发布链路（Windows 客户端架构细节见其中 §4.3、打包与 Inno Setup 纪律见 §7.8）
 - [server/README.md](./server/README.md)：后端 API 清单、配置、测试
 - [client/mac/README.md](./client/mac/README.md)：macOS 客户端架构、快捷键
 - [client/web/README.md](./client/web/README.md)：Web 客户端架构、本地开发、embed 约定

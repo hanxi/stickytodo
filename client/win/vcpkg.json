@@ -1,0 +1,17 @@
+{
+  "name": "stickytodo-win",
+  "version-string": "1.0.0",
+  "description": "StickyTodo Windows native client (Win32 + C++/WinRT + Direct2D)",
+  "dependencies": [
+    "nlohmann-json",
+    "cppwinrt"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build unit tests (codec + models JSON roundtrip) using Google Test.",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
+}

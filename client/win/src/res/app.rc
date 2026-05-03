@@ -1,0 +1,48 @@
+// app.rc — Resource script for StickyTodo Windows client
+
+#include <windows.h>
+
+// ---------- Application Icon ----------
+// IDI_APPICON is the main application icon shown in taskbar, tray, etc.
+#define IDI_APPICON 101
+
+IDI_APPICON ICON "icons\\stickytodo.ico"
+
+// ---------- Version Information ----------
+#define VER_MAJOR 1
+#define VER_MINOR 0
+#define VER_PATCH 0
+#define VER_BUILD 0
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION    VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+    PRODUCTVERSION VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+    FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+    FILEFLAGS      0
+    FILEOS         VOS_NT_WINDOWS32
+    FILETYPE       VFT_APP
+    FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "StickyTodo"
+            VALUE "FileDescription",  "StickyTodo Desktop Client"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "stickytodo"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "stickytodo.exe"
+            VALUE "ProductName",      "StickyTodo"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+// ---------- Manifest ----------
+// Embed the application manifest for DPI awareness + UTF-8 + Common Controls v6
+1 RT_MANIFEST "app.manifest"

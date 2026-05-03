@@ -1,0 +1,1321 @@
+#include "ui/StickyWindow.h"
+#include "ui/D2DRenderer.h"
+#include "ui/Theme.h"
+#include "ui/Preferences.h"
+#include "ui/FilterEditor.h"
+#include "App.h"
+#include "core/AppState.h"
+#include "codec/StickyCodec.h"
+
+#include <windowsx.h>
+#include <algorithm>
+
+#include "models/Filter.h"
+
+namespace stickytodo::ui {
+
+namespace {
+
+/// Widths of the three per-row action buttons shown on hover.
+constexpr float kActionIconSize = 22.0f;
+constexpr float kActionGap = 4.0f;
+constexpr int   kActionCount = 3; // check / edit / delete (or restore)
+
+/// Compose the row rectangle in scroll-content coordinates.
+/// rowTop is y-offset from the top of the scrollable content area (excluding titleBar + filterBar).
+struct RowLayout {
+    float rowTop;     // y in content coords
+    float rowHeight;
+    float priorityBarRight;
+    float checkboxLeft;
+    float textLeft;
+    float textRight;  // text region right edge (before action buttons)
+    float actionsLeft;
+};
+
+static RowLayout ComputeRowLayout(float contentWidth, float rowTop) {
+    RowLayout L{};
+    L.rowTop = rowTop;
+    L.rowHeight = Theme::kTodoRowHeight;
+    L.priorityBarRight = Theme::kPriorityBarWidth;
+    L.checkboxLeft = Theme::kPadding + Theme::kPriorityBarWidth;
+    L.textLeft = L.checkboxLeft + Theme::kCheckboxSize + 8.0f;
+
+    float actionsWidth = kActionCount * kActionIconSize + (kActionCount - 1) * kActionGap;
+    L.actionsLeft = contentWidth - Theme::kPadding - Theme::kScrollbarWidth - actionsWidth;
+    L.textRight = L.actionsLeft - 6.0f;
+    return L;
+}
+
+/// Convert std::string (UTF-8 assumed) to std::wstring via MultiByteToWideChar.
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return L"";
+    int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring out(sz, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), out.data(), sz);
+    return out;
+}
+
+static std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return "";
+    int sz = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(sz, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), out.data(), sz, nullptr, nullptr);
+    return out;
+}
+
+static std::wstring BuildFilterSummary(const models::Filter& f) {
+    if (f.IsEmpty()) return L"\u2630 \u5168\u90E8"; // ☰ 全部
+    std::wstring out = L"\u2630 ";
+    bool first = true;
+    auto sep = [&]() {
+        if (!first) out += L" \u00B7 ";
+        first = false;
+    };
+    if (f.status == "pending")      { sep(); out += L"\u672A\u5B8C\u6210"; }    // 未完成
+    else if (f.status == "done")    { sep(); out += L"\u5DF2\u5B8C\u6210"; }    // 已完成
+    if (!f.tag.empty())             { sep(); out += L"#" + Utf8ToWide(f.tag); }
+    if (!f.keyword.empty())         { sep(); out += L"\"" + Utf8ToWide(f.keyword) + L"\""; }
+    // Prefix "≤ " (U+2264 plus space) before the due_before timestamp.
+    if (!f.due_before.empty())      { sep(); out += L"\u2264 " + Utf8ToWide(f.due_before); }
+    if (f.include_deleted)          { sep(); out += L"\u542B\u5DF2\u5220"; }    // 含已删
+    if (f.only_deleted)             { sep(); out += L"\u4EC5\u5DF2\u5220"; }    // 仅已删
+    return out;
+}
+
+} // namespace
+
+bool StickyWindow::classRegistered_ = false;
+
+StickyWindow::StickyWindow(HINSTANCE hInstance, const std::string& stickyId)
+    : hInstance_(hInstance), stickyId_(stickyId)
+{
+}
+
+StickyWindow::~StickyWindow() {
+    DiscardRenderTarget();
+    if (hwnd_) {
+        DestroyWindow(hwnd_);
+        hwnd_ = nullptr;
+    }
+}
+
+bool StickyWindow::Create() {
+    if (!classRegistered_) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = hInstance_;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = kClassName;
+        if (!RegisterClassExW(&wc)) return false;
+        classRegistered_ = true;
+    }
+
+    auto* app = GetApp();
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    int w = Theme::kStickyDefaultWidth, h = Theme::kStickyDefaultHeight;
+
+    if (app && app->GetState()) {
+        auto frame = app->GetState()->GetFrameStore()->Load(stickyId_);
+        if (frame.has_value()) {
+            x = static_cast<int>(frame->x);
+            y = static_cast<int>(frame->y);
+            w = static_cast<int>(frame->width);
+            h = static_cast<int>(frame->height);
+        }
+    }
+
+    hwnd_ = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        kClassName,
+        L"StickyTodo",
+        WS_POPUP | WS_THICKFRAME,
+        x, y, w, h,
+        nullptr, nullptr, hInstance_, this
+    );
+
+    if (!hwnd_) return false;
+
+    CreateRenderTarget();
+    LoadData();
+
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd_);
+
+    return true;
+}
+
+void StickyWindow::BringToFront() {
+    if (hwnd_) {
+        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    }
+}
+
+void StickyWindow::Refresh() {
+    LoadData();
+    if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::CreateRenderTarget() {
+    if (renderTarget_) return;
+    auto* app = GetApp();
+    if (app && app->GetRenderer()) {
+        renderTarget_ = app->GetRenderer()->CreateRenderTarget(hwnd_);
+    }
+}
+
+void StickyWindow::DiscardRenderTarget() {
+    if (renderTarget_) {
+        renderTarget_->Release();
+        renderTarget_ = nullptr;
+    }
+}
+
+void StickyWindow::LoadData() {
+    auto* app = GetApp();
+    if (!app || !app->GetState()) return;
+
+    // AppState::GetStickies() returns by value (see AppState.h) — it
+    // must, because the authoritative vector is guarded by a mutex and
+    // the returned snapshot is the caller's safe copy. Bind by value,
+    // not by `const auto&`: the latter only works by virtue of C++'s
+    // temporary-lifetime-extension rule and silently obscures the fact
+    // that we're holding a full vector copy on the stack.
+    auto stickies = app->GetState()->GetStickies();
+    for (const auto& s : stickies) {
+        if (s.id == stickyId_) {
+            stickyNote_ = s;
+            break;
+        }
+    }
+
+    filter_ = codec::StickyCodec::JsonToFilter(stickyNote_.filter);
+
+    auto result = app->GetState()->GetHttp()->ListTodos(filter_);
+    if (result.has_value()) {
+        todos_ = std::move(result->items);
+    }
+
+    // Any in-flight draft/edit state must not outlive a data reload.
+    CancelDraft();
+    CancelTitleEdit();
+    hoveredRowIndex_ = -1;
+}
+
+// ---------------------------------------------------------------------------
+// Painting
+// ---------------------------------------------------------------------------
+
+void StickyWindow::OnPaint() {
+    if (!renderTarget_) {
+        CreateRenderTarget();
+        if (!renderTarget_) return;
+    }
+
+    auto* app = GetApp();
+    if (!app || !app->GetRenderer()) return;
+
+    IDWriteFactory* dw = app->GetRenderer()->GetDWriteFactory();
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
+
+    codec::RgbaColor bgColor = codec::StickyCodec::ParseBgColor(stickyNote_.bg_color);
+    D2D1_COLOR_F d2dBgColor = D2D1::ColorF(
+        static_cast<float>(bgColor.red),
+        static_cast<float>(bgColor.green),
+        static_cast<float>(bgColor.blue),
+        static_cast<float>(bgColor.alpha)
+    );
+
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float width = static_cast<float>(rc.right - rc.left);
+    float height = static_cast<float>(rc.bottom - rc.top);
+
+    renderTarget_->BeginDraw();
+    renderTarget_->Clear(d2dBgColor);
+
+    DrawTitleBar(renderTarget_, dw, dpi);
+    DrawTodoList(renderTarget_, dw, dpi);
+    DrawFilterButton(renderTarget_, dw, dpi, width, height);
+
+    HRESULT hr = renderTarget_->EndDraw();
+    if (hr == D2DERR_RECREATE_TARGET) {
+        DiscardRenderTarget();
+    }
+}
+
+void StickyWindow::OnResize() {
+    if (renderTarget_) {
+        RECT rc;
+        GetClientRect(hwnd_, &rc);
+        D2D1_SIZE_U size = D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top);
+        renderTarget_->Resize(size);
+    }
+    SaveFramePosition();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::OnMove() {
+    SaveFramePosition();
+}
+
+void StickyWindow::SaveFramePosition() {
+    if (!hwnd_) return;
+    auto* app = GetApp();
+    if (!app || !app->GetState()) return;
+
+    RECT rc;
+    GetWindowRect(hwnd_, &rc);
+    core::FrameRect frame;
+    frame.x = static_cast<double>(rc.left);
+    frame.y = static_cast<double>(rc.top);
+    frame.width = static_cast<double>(rc.right - rc.left);
+    frame.height = static_cast<double>(rc.bottom - rc.top);
+    app->GetState()->GetFrameStore()->Save(stickyId_, frame);
+}
+
+LRESULT StickyWindow::OnNcHitTest(int x, int y) {
+    POINT pt = {x, y};
+    ScreenToClient(hwnd_, &pt);
+
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+
+    int margin = 16;
+    if (pt.x >= rc.right - margin && pt.y >= rc.bottom - margin) {
+        return HTBOTTOMRIGHT;
+    }
+
+    if (pt.y < static_cast<LONG>(titleBarHeight_)) {
+        float fx = static_cast<float>(pt.x);
+        float fy = static_cast<float>(pt.y);
+        // Any region covered by a title-bar button must report HTCLIENT so
+        // Win32 delivers regular WM_LBUTTONDOWN to us instead of treating the
+        // click as a window drag. trashButton_ is only interactive while the
+        // title bar is hovered, but Win32 runs OnNcHitTest *before* the hover
+        // flag is updated for the current message, so we check its rect
+        // unconditionally — the rect is stable across frames (DrawTitleBar
+        // rewrites it every paint but always to the same screen coordinates
+        // when titleBarHovered_ is true; when false the rect is zero-width
+        // and Contains() naturally returns false).
+        if (closeButton_.rect.Contains(fx, fy)
+            || settingsButton_.rect.Contains(fx, fy)
+            || plusButton_.rect.Contains(fx, fy)
+            || trashButton_.rect.Contains(fx, fy)) {
+            return HTCLIENT;
+        }
+        return HTCAPTION;
+    }
+
+    return HTCLIENT;
+}
+
+// ---------------------------------------------------------------------------
+// Title bar + buttons
+// ---------------------------------------------------------------------------
+
+void StickyWindow::DrawTitleBar(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float width = static_cast<float>(rc.right - rc.left);
+
+    // Darkened title bar overlay
+    ID2D1SolidColorBrush* brush = nullptr;
+    rt->CreateSolidColorBrush(Theme::StickyTitleBar(), &brush);
+    if (brush) {
+        D2D1_RECT_F titleRect = D2D1::RectF(0, 0, width, titleBarHeight_);
+        rt->FillRectangle(titleRect, brush);
+        brush->Release();
+    }
+
+    // Title label. Reserve enough horizontal space for the four right-aligned
+    // buttons: close (×) + settings (⚙) + plus (+) + trash (🗑). Each button
+    // is 24px wide with ~4px gap, so 138px total (32 + 28 + 28 + 28 + slack).
+    Label titleLabel;
+    titleLabel.rect = {Theme::kPadding, 0, width - 138.0f, titleBarHeight_};
+    titleLabel.text = Utf8ToWide(stickyNote_.title);
+    titleLabel.fontSize = Theme::kFontSizeTitle;
+    titleLabel.bold = true;
+    titleLabel.color = Theme::TextPrimary();
+    titleLabel.Draw(rt, dw, dpi);
+
+    // Close button (top-right). "Close" here means closing the window locally
+    // — it does NOT delete the sticky from the server. The trash button to
+    // the left is the destructive action (DELETE /api/sticky-notes/:id).
+    closeButton_.rect = {width - 32.0f, 4.0f, 24.0f, 24.0f};
+    closeButton_.text = L"\u00D7"; // ×
+    closeButton_.onClick = [this]() {
+        if (auto* app = GetApp()) {
+            app->CloseStickyWindow(stickyId_);
+        }
+    };
+    closeButton_.Draw(rt, dw, dpi);
+
+    // Settings button
+    settingsButton_.rect = {width - 60.0f, 4.0f, 24.0f, 24.0f};
+    settingsButton_.text = L"\u2699"; // ⚙
+    settingsButton_.onClick = [this]() {
+        if (auto* app = GetApp()) {
+            app->ShowSettings();
+        }
+    };
+    settingsButton_.Draw(rt, dw, dpi);
+
+    // "+" new-todo button (left of settings)
+    plusButton_.rect = {width - 88.0f, 4.0f, 24.0f, 24.0f};
+    plusButton_.text = L"\u002B"; // +
+    plusButton_.onClick = [this]() { BeginDraft(); };
+    plusButton_.Draw(rt, dw, dpi);
+
+    // Trash (delete sticky) — mirrors macOS StickyView's hover-fade trash
+    // button: only drawn and interactive while the cursor is over the title
+    // bar, so it's not a persistent visual destroyer. When hidden, we zero
+    // its rect so OnNcHitTest / OnLButtonDown naturally skip it.
+    if (titleBarHovered_) {
+        trashButton_.rect = {width - 116.0f, 4.0f, 24.0f, 24.0f};
+        trashButton_.text = L"\U0001F5D1"; // 🗑 (U+1F5D1 WASTEBASKET) — Segoe
+                                           // UI Emoji on Windows 10+ renders
+                                           // it monochrome at this size; on
+                                           // older systems DirectWrite falls
+                                           // back to tofu, but the adjacent
+                                           // hover-only UX already signals
+                                           // destructive intent.
+        trashButton_.onClick = [this]() { DoDeleteSticky(); };
+        trashButton_.Draw(rt, dw, dpi);
+    } else {
+        trashButton_.rect = {0.0f, 0.0f, 0.0f, 0.0f};
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draft row (inline new-todo input, above list)
+// ---------------------------------------------------------------------------
+
+void StickyWindow::DrawDraftRow(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi, float width, float rowY) {
+    // Left: placeholder circle (unclickable; symmetry with TodoRow checkbox).
+    ID2D1SolidColorBrush* borderBrush = nullptr;
+    rt->CreateSolidColorBrush(Theme::CheckboxBorder(), &borderBrush);
+    if (borderBrush) {
+        float cx = Theme::kPadding + Theme::kPriorityBarWidth + Theme::kCheckboxSize * 0.5f;
+        float cy = rowY + Theme::kTodoRowHeight * 0.5f;
+        D2D1_ELLIPSE circle = D2D1::Ellipse(D2D1::Point2F(cx, cy), Theme::kCheckboxSize * 0.45f,
+                                             Theme::kCheckboxSize * 0.45f);
+        rt->DrawEllipse(circle, borderBrush, 1.5f);
+        borderBrush->Release();
+    }
+
+    // TextBox occupying the rest of the row.
+    float textLeft = Theme::kPadding + Theme::kPriorityBarWidth + Theme::kCheckboxSize + 8.0f;
+    float tbHeight = Theme::kInputHeight;
+    float tbY = rowY + (Theme::kTodoRowHeight - tbHeight) * 0.5f;
+    draftBox_.rect = {textLeft, tbY, width - textLeft - Theme::kPadding - Theme::kScrollbarWidth, tbHeight};
+    if (draftBox_.placeholder.empty()) {
+        // 待办内容，回车保存 / Esc 取消
+        draftBox_.placeholder = L"\u5F85\u529E\u5185\u5BB9\uFF0C\u56DE\u8F66\u4FDD\u5B58 / Esc \u53D6\u6D88";
+    }
+    draftBox_.Draw(rt, dw, dpi);
+}
+
+// ---------------------------------------------------------------------------
+// TODO list + per-row hover actions
+// ---------------------------------------------------------------------------
+
+void StickyWindow::DrawTodoList(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) {
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float width = static_cast<float>(rc.right - rc.left);
+    float height = static_cast<float>(rc.bottom - rc.top);
+
+    float listTop = titleBarHeight_;
+    float listHeight = height - titleBarHeight_ - FilterBarHeight();
+    if (listHeight < 0) listHeight = 0;
+
+    scrollView_.rect = {0, listTop, width, listHeight};
+
+    // Content height accounts for optional draft row sitting above the todos.
+    float draftRowH = drafting_ ? Theme::kTodoRowHeight : 0.0f;
+    scrollView_.contentHeight = draftRowH + static_cast<float>(todos_.size()) * Theme::kTodoRowHeight;
+
+    scrollView_.BeginContent(rt);
+
+    // y is relative to content origin (== scrollView_.rect.y)
+    float y = listTop;
+
+    if (drafting_) {
+        DrawDraftRow(rt, dw, dpi, width, y);
+        y += Theme::kTodoRowHeight;
+    }
+
+    for (size_t i = 0; i < todos_.size(); ++i) {
+        const auto& todo = todos_[i];
+        float rowY = y + static_cast<float>(i) * Theme::kTodoRowHeight;
+        RowLayout L = ComputeRowLayout(width, rowY);
+
+        // Priority color bar
+        if (todo.priority > 0) {
+            ID2D1SolidColorBrush* priBrush = nullptr;
+            rt->CreateSolidColorBrush(Theme::PriorityColor(todo.priority), &priBrush);
+            if (priBrush) {
+                D2D1_RECT_F bar = D2D1::RectF(0, rowY, L.priorityBarRight, rowY + L.rowHeight);
+                rt->FillRectangle(bar, priBrush);
+                priBrush->Release();
+            }
+        }
+
+        // Checkbox (soft-deleted rows render a disabled square).
+        if (!todo.IsDeleted()) {
+            CheckBox cb;
+            cb.rect = {L.checkboxLeft, rowY + (L.rowHeight - Theme::kCheckboxSize) / 2.0f,
+                       Theme::kCheckboxSize, Theme::kCheckboxSize};
+            cb.checked = todo.IsDone();
+            cb.Draw(rt, dw, dpi);
+        } else {
+            // Draw a faint dashed marker for deleted rows.
+            ID2D1SolidColorBrush* brush = nullptr;
+            rt->CreateSolidColorBrush(Theme::TextPlaceholder(), &brush);
+            if (brush) {
+                D2D1_RECT_F box = D2D1::RectF(
+                    L.checkboxLeft, rowY + (L.rowHeight - Theme::kCheckboxSize) / 2.0f,
+                    L.checkboxLeft + Theme::kCheckboxSize,
+                    rowY + (L.rowHeight + Theme::kCheckboxSize) / 2.0f);
+                rt->DrawRectangle(box, brush, 1.0f);
+                brush->Release();
+            }
+        }
+
+        // Title: TextBox when editing this row, otherwise Label.
+        if (editingRowIndex_ == static_cast<int>(i)) {
+            float tbY = rowY + (L.rowHeight - Theme::kInputHeight) * 0.5f;
+            editBox_.rect = {L.textLeft, tbY, L.textRight - L.textLeft, Theme::kInputHeight};
+            editBox_.Draw(rt, dw, dpi);
+        } else {
+            Label titleLabel;
+            titleLabel.rect = {L.textLeft, rowY, L.textRight - L.textLeft, L.rowHeight};
+            titleLabel.text = Utf8ToWide(todo.title);
+            titleLabel.fontSize = Theme::kFontSizeBody;
+            titleLabel.color = (todo.IsDone() || todo.IsDeleted()) ? Theme::TextSecondary()
+                                                                    : Theme::TextPrimary();
+            titleLabel.Draw(rt, dw, dpi);
+        }
+
+        // Hover actions: three 22x22 icon buttons on the right.
+        // We only use Label for drawing (hit-testing happens via per-frame rect math in OnLButtonDown).
+        // Deleted rows collapse slots 1 and 2 (only show "restore" in slot 3) to mirror the macOS UX.
+        if (static_cast<int>(i) == hoveredRowIndex_ && editingRowIndex_ != static_cast<int>(i)) {
+            float ax = L.actionsLeft;
+            float ay = rowY + (L.rowHeight - kActionIconSize) * 0.5f;
+
+            // Slot 1: complete / reopen
+            if (!todo.IsDeleted()) {
+                Label l;
+                l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+                l.text = todo.IsDone() ? L"\u21BA" : L"\u2713"; // ↺ / ✓
+                l.fontSize = Theme::kFontSizeBody;
+                l.color = Theme::TextSecondary();
+                l.Draw(rt, dw, dpi);
+            }
+            ax += kActionIconSize + kActionGap;
+
+            // Slot 2: edit title. Prefer U+270F (PENCIL) over U+270E (LOWER
+            // RIGHT PENCIL) — the latter is not covered by Segoe UI on older
+            // Windows 10 builds and falls back to tofu. U+270F is carried by
+            // Segoe UI Symbol since Vista, so we get consistent glyphs.
+            if (!todo.IsDeleted()) {
+                Label l;
+                l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+                l.text = L"\u270F"; // ✏
+                l.fontSize = Theme::kFontSizeBody;
+                l.color = Theme::TextSecondary();
+                l.Draw(rt, dw, dpi);
+            }
+            ax += kActionIconSize + kActionGap;
+
+            // Slot 3: delete / restore. Use ✕ (U+2716) instead of the 🗑 emoji because
+            // Segoe UI does not ship emoji glyphs — DirectWrite would fall back and
+            // render tofu. ✕ is monochrome and always available in Segoe UI Symbol.
+            Label l;
+            l.rect = {ax, ay, kActionIconSize, kActionIconSize};
+            l.text = todo.IsDeleted() ? L"\u21B6" : L"\u2716"; // ↶ / ✖
+            l.fontSize = Theme::kFontSizeBody;
+            l.color = Theme::TextSecondary();
+            l.Draw(rt, dw, dpi);
+        }
+
+        // Separator line
+        ID2D1SolidColorBrush* sepBrush = nullptr;
+        rt->CreateSolidColorBrush(Theme::Separator(), &sepBrush);
+        if (sepBrush) {
+            float sepY = rowY + L.rowHeight - 0.5f;
+            rt->DrawLine(D2D1::Point2F(Theme::kPadding, sepY),
+                          D2D1::Point2F(width - Theme::kPadding, sepY),
+                          sepBrush, 0.5f);
+            sepBrush->Release();
+        }
+    }
+
+    scrollView_.EndContent(rt);
+    scrollView_.DrawScrollbar(rt);
+}
+
+// ---------------------------------------------------------------------------
+// Filter bar (bottom): shows filter summary; click to open FilterEditor.
+// ---------------------------------------------------------------------------
+
+void StickyWindow::DrawFilterButton(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi, float width, float height) {
+    float barY = height - FilterBarHeight();
+    filterButton_.rect = {Theme::kPadding, barY + 2.0f, width - Theme::kPadding * 2.0f, FilterBarHeight() - 4.0f};
+    filterButton_.text = BuildFilterSummary(filter_);
+    filterButton_.onClick = [this]() { ShowFilterEditor(); };
+    filterButton_.Draw(rt, dw, dpi);
+}
+
+// ---------------------------------------------------------------------------
+// Hit test helpers (operate on the CURRENT frame layout; safe to call after
+// any OnPaint because every Draw*() writes back its rect into the member).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct RowHitTest {
+    int rowIndex = -1;          // index into todos_ (-1 = miss)
+    enum class Zone {
+        None,
+        Checkbox,
+        Title,
+        ActionComplete,     // slot 1: ✓ / ↺
+        ActionEdit,         // slot 2: ✎
+        ActionDelete,       // slot 3: ✖ / ↶
+    } zone = Zone::None;
+};
+
+/// Locate which row / which zone a client-area point belongs to.
+/// contentY = clientY + scrollOffset (i.e. point in scroll-content coord system).
+static RowHitTest HitTestRow(float mx, float contentY, float contentWidth,
+                             float listTop, bool drafting,
+                             const std::vector<models::Todo>& todos) {
+    RowHitTest r;
+    float y = listTop;
+    if (drafting) y += Theme::kTodoRowHeight;
+
+    if (contentY < y) return r;
+
+    int idx = static_cast<int>((contentY - y) / Theme::kTodoRowHeight);
+    if (idx < 0 || idx >= static_cast<int>(todos.size())) return r;
+
+    r.rowIndex = idx;
+    float rowTop = y + idx * Theme::kTodoRowHeight;
+    float rowBottom = rowTop + Theme::kTodoRowHeight;
+    RowLayout L = ComputeRowLayout(contentWidth, rowTop);
+
+    // Checkbox
+    float cbLeft = L.checkboxLeft;
+    float cbTop = rowTop + (L.rowHeight - Theme::kCheckboxSize) / 2.0f;
+    if (mx >= cbLeft && mx < cbLeft + Theme::kCheckboxSize
+        && contentY >= cbTop && contentY < cbTop + Theme::kCheckboxSize) {
+        r.zone = RowHitTest::Zone::Checkbox;
+        return r;
+    }
+
+    // Action icons (only active region; caller decides whether to dispatch
+    // depending on hover state — we still return the zone unconditionally so
+    // keyboard/focus logic can reuse this helper in the future).
+    float ax = L.actionsLeft;
+    float ay = rowTop + (L.rowHeight - kActionIconSize) * 0.5f;
+    auto inSlot = [&](int slot) {
+        float left = ax + slot * (kActionIconSize + kActionGap);
+        return mx >= left && mx < left + kActionIconSize
+            && contentY >= ay && contentY < ay + kActionIconSize;
+    };
+    if (inSlot(0)) { r.zone = RowHitTest::Zone::ActionComplete; return r; }
+    if (inSlot(1)) { r.zone = RowHitTest::Zone::ActionEdit;     return r; }
+    if (inSlot(2)) { r.zone = RowHitTest::Zone::ActionDelete;   return r; }
+
+    // Title: anywhere between textLeft and textRight, within the row band.
+    if (mx >= L.textLeft && mx < L.textRight
+        && contentY >= rowTop && contentY < rowBottom) {
+        r.zone = RowHitTest::Zone::Title;
+        return r;
+    }
+
+    return r;
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// Message pump
+// ---------------------------------------------------------------------------
+
+LRESULT CALLBACK StickyWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_NCCREATE) {
+        auto cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    auto* self = reinterpret_cast<StickyWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (self && self->hwnd_ == nullptr) {
+        // Early messages (WM_GETMINMAXINFO etc.) may arrive before CreateWindowExW returns.
+        self->hwnd_ = hwnd;
+    }
+    if (self) {
+        return self->HandleMessage(msg, wParam, lParam);
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT StickyWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(hwnd_, &ps);
+            OnPaint();
+            EndPaint(hwnd_, &ps);
+            return 0;
+        }
+        case WM_SIZE:          OnResize(); return 0;
+        case WM_MOVE:          OnMove(); return 0;
+        case WM_MOUSEMOVE:     OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)); return 0;
+        case WM_LBUTTONDOWN:   OnLButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)); return 0;
+        case WM_LBUTTONUP:     OnLButtonUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)); return 0;
+        case WM_MOUSEWHEEL:    OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam)); return 0;
+        case WM_CHAR:          OnChar(static_cast<wchar_t>(wParam)); return 0;
+        case WM_KEYDOWN:       OnKeyDown(wParam, lParam); return 0;
+        case WM_NCHITTEST:     return OnNcHitTest(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_ERASEBKGND:    return 1;  // prevent flicker; OnPaint covers full client area
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        case WM_MOUSELEAVE:
+            // Re-arm on next WM_MOUSEMOVE.
+            mouseTracking_ = false;
+            OnMouseLeave();
+            return 0;
+        case core::WM_STICKYTODO_REFRESH:
+            // Fan-out from AppState::HandleWsEventOnUIThread on todo.*
+            // events, routed precisely via App::PostMessageToAllStickies
+            // (never HWND_BROADCAST). The WS worker thread first posts
+            // WM_STICKYTODO_WS_EVENT to the tray hwnd, which runs the
+            // handler on the UI thread; that handler in turn does the
+            // fan-out, so by the time this case fires we're already on
+            // the UI thread with no cross-thread concerns. Each sticky
+            // filters via its own ListTodos(filter_), so spurious
+            // cross-sticky events only cost one redundant refresh.
+            Refresh();
+            return 0;
+        case core::WM_STICKYTODO_STICKY_UPSERTED:
+            // Server-authoritative sticky metadata changed (title/bg/filter).
+            // LoadData() re-parses stickyNote_.bg_color / filter and re-runs
+            // ListTodos(filter_), which is exactly what we need here.
+            LoadData();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        case core::WM_STICKYTODO_STICKY_DELETED:
+            // Sticky removed server-side. We **must not** synchronously call
+            // App::CloseStickyWindow(stickyId_) from inside WndProc — that
+            // would delete the owning unique_ptr and run `~StickyWindow` on
+            // the current stack frame, leaving `this` dangling before we
+            // return. Instead, call DestroyWindow on our own HWND; Win32
+            // will post WM_DESTROY which we handle below. App cleans up its
+            // map entry via OnStickyWindowDestroyed during that path.
+            if (hwnd_) {
+                DestroyWindow(hwnd_);
+            }
+            return 0;
+        case WM_DESTROY:
+            // Notify App so it can erase its unique_ptr entry. Must happen
+            // before clearing hwnd_ since App doesn't take the HWND here —
+            // it uses the sticky id, which is stable across the lifetime of
+            // this object.
+            if (auto* app = GetApp()) {
+                app->OnStickyWindowDestroyed(stickyId_);
+            }
+            hwnd_ = nullptr;
+            return 0;
+        default:
+            return DefWindowProcW(hwnd_, msg, wParam, lParam);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse handling
+// ---------------------------------------------------------------------------
+
+void StickyWindow::OnMouseMove(int x, int y) {
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+
+    // Arm TrackMouseEvent so Win32 will post WM_MOUSELEAVE when the cursor
+    // exits our client area. Registration is one-shot per WM_MOUSELEAVE
+    // delivery — we flip mouseTracking_ off in OnMouseLeave to re-arm on the
+    // next WM_MOUSEMOVE. Without this, hoveredRowIndex_ / button hover state
+    // would stick when the pointer left the window (e.g. user hovers row 3,
+    // then mouses straight out the side — row 3 would stay highlighted).
+    if (!mouseTracking_) {
+        TRACKMOUSEEVENT tme = {};
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd_;
+        tme.dwHoverTime = HOVER_DEFAULT;
+        if (TrackMouseEvent(&tme)) {
+            mouseTracking_ = true;
+        }
+    }
+
+    // Track title-bar hover so the trash button fades in/out at the right
+    // time. Recompute on every mouse move: cheap, and keeps the flag honest
+    // when the user drags the cursor across the title-bar boundary.
+    bool wasTitleBarHovered = titleBarHovered_;
+    titleBarHovered_ = (fy >= 0.0f && fy < titleBarHeight_);
+    if (wasTitleBarHovered && !titleBarHovered_) {
+        // Leaving the title bar — reset the trash button's state machine so
+        // it doesn't linger in Hover appearance next time the band is
+        // re-entered with the cursor already over some other button.
+        trashButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    }
+
+    // Title bar buttons receive hover first so the state machine (Normal/Hover/Pressed)
+    // tracked inside Button can redraw its background.
+    closeButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    settingsButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    plusButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    if (titleBarHovered_) {
+        trashButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    }
+    filterButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+
+    // Scrollbar drag
+    scrollView_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+
+    // Row hover — translate client y into content coords by adding scrollOffset.
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float contentWidth = static_cast<float>(rc.right - rc.left);
+    float listTop = titleBarHeight_;
+    float listBottom = static_cast<float>(rc.bottom - rc.top) - FilterBarHeight();
+
+    int newHover = -1;
+    if (fy >= listTop && fy < listBottom) {
+        float contentY = fy + scrollView_.scrollOffset;
+        auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, todos_);
+        newHover = hit.rowIndex;
+    }
+    if (newHover != hoveredRowIndex_) {
+        hoveredRowIndex_ = newHover;
+    }
+
+    // Always repaint — buttons track their own hover state, hover indicator is visual.
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::OnMouseLeave() {
+    // Cursor left the client area. Reset every piece of hover state so the
+    // UI doesn't render a stale highlight while the pointer is elsewhere.
+    // We send each Button a synthetic WM_MOUSEMOVE at (-1, -1) — well outside
+    // any possible rect — so Button::HandleMouse flips its state back to
+    // Normal without needing a dedicated "leave" entry point.
+    closeButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    settingsButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    plusButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    trashButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    filterButton_.HandleMouse(WM_MOUSEMOVE, -1.0f, -1.0f);
+    titleBarHovered_ = false;
+    hoveredRowIndex_ = -1;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::OnLButtonDown(int x, int y) {
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+
+    // Title bar: four buttons in the top-right corner. The trash button is
+    // only hit-testable while the title bar is hovered — OnMouseMove sets the
+    // flag, and a left-click always follows at least one WM_MOUSEMOVE onto
+    // the button (mouse can't teleport), so the flag is guaranteed to be true
+    // whenever the cursor is actually over the trash rect on a down-click.
+    if (closeButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy) ||
+        settingsButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy) ||
+        plusButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy) ||
+        (titleBarHovered_ && trashButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy)) ||
+        filterButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy)) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    // Scrollbar track
+    if (scrollView_.HandleMouse(WM_LBUTTONDOWN, fx, fy)) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    // Draft / edit TextBox focus — must be handled before row dispatch
+    // so a click inside the TextBox grabs focus rather than being eaten by
+    // the row logic. Important: draftBox_/editBox_ rects are stored in
+    // *scroll-content* coordinates (because DrawTodoList sets them while
+    // ScrollView::BeginContent has shifted the transform by -scrollOffset).
+    // We must translate the mouse into the same coordinate space before
+    // hit-testing, and we must only do this translation when the click lands
+    // inside the list band (otherwise a click in the title bar at
+    // clientY=10 with scrollOffset=100 would hit a TextBox drawn at
+    // contentY=110 that's not actually visible there).
+    RECT rc;
+    GetClientRect(hwnd_, &rc);
+    float contentWidth = static_cast<float>(rc.right - rc.left);
+    float listTop = titleBarHeight_;
+    float listBottom = static_cast<float>(rc.bottom - rc.top) - FilterBarHeight();
+
+    if (fy >= listTop && fy < listBottom) {
+        float contentFy = fy + scrollView_.scrollOffset;
+        if (drafting_ && draftBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy)) {
+            if (editingRowIndex_ >= 0) CancelTitleEdit();
+            SetFocus(hwnd_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (editingRowIndex_ >= 0 && editBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy)) {
+            SetFocus(hwnd_);
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+    }
+
+    // Row dispatch (below titleBar, above filterBar)
+    if (fy < listTop || fy >= listBottom) {
+        // Click in blank area → commit any in-flight draft/edit ("focus lost" semantics).
+        if (drafting_) CommitDraft();
+        if (editingRowIndex_ >= 0) CommitTitleEdit();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    float contentY = fy + scrollView_.scrollOffset;
+    auto hit = HitTestRow(fx, contentY, contentWidth, listTop, drafting_, todos_);
+    if (hit.rowIndex < 0) {
+        // Empty row gap → same as blank-area click: commit in-flight editors.
+        if (drafting_) CommitDraft();
+        if (editingRowIndex_ >= 0) CommitTitleEdit();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    // If user clicks into a different row while a title edit is active, commit the old one first.
+    if (editingRowIndex_ >= 0 && editingRowIndex_ != hit.rowIndex) {
+        CommitTitleEdit();
+    }
+
+    const auto& todo = todos_[hit.rowIndex];
+    switch (hit.zone) {
+        case RowHitTest::Zone::Checkbox:
+            if (!todo.IsDeleted()) {
+                if (todo.IsDone()) DoReopen(hit.rowIndex);
+                else               DoComplete(hit.rowIndex);
+            }
+            break;
+        case RowHitTest::Zone::ActionComplete:
+            if (!todo.IsDeleted()) {
+                if (todo.IsDone()) DoReopen(hit.rowIndex);
+                else               DoComplete(hit.rowIndex);
+            }
+            break;
+        case RowHitTest::Zone::ActionEdit:
+            if (!todo.IsDeleted()) BeginTitleEdit(static_cast<size_t>(hit.rowIndex));
+            break;
+        case RowHitTest::Zone::ActionDelete:
+            if (todo.IsDeleted()) DoRestore(hit.rowIndex);
+            else                  DoDelete(hit.rowIndex);
+            break;
+        case RowHitTest::Zone::Title:
+            if (!todo.IsDeleted()) BeginTitleEdit(static_cast<size_t>(hit.rowIndex));
+            break;
+        case RowHitTest::Zone::None:
+        default:
+            break;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::OnLButtonUp(int x, int y) {
+    float fx = static_cast<float>(x);
+    float fy = static_cast<float>(y);
+    closeButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    settingsButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    plusButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    // Trash only fires on LBUTTONUP while the title bar is still hovered;
+    // otherwise the click was released outside and should not trigger the
+    // destructive onClick handler.
+    if (titleBarHovered_) {
+        trashButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    }
+    filterButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    scrollView_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::OnMouseWheel(short delta) {
+    float fDelta = static_cast<float>(delta) / WHEEL_DELTA;
+    if (scrollView_.HandleWheel(fDelta)) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+
+void StickyWindow::OnChar(wchar_t ch) {
+    // Route printable characters to whichever TextBox currently owns focus.
+    if (drafting_ && draftBox_.focused) {
+        if (draftBox_.HandleChar(ch)) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return;
+    }
+    if (editingRowIndex_ >= 0 && editBox_.focused) {
+        if (editBox_.HandleChar(ch)) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return;
+    }
+}
+
+void StickyWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
+    // Escape cancels whichever editor is active. Enter commits.
+    // Route other navigation keys to the focused TextBox.
+    if (drafting_ && draftBox_.focused) {
+        if (vk == VK_ESCAPE) {
+            CancelDraft();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (vk == VK_RETURN) {
+            CommitDraft();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (draftBox_.HandleKey(WM_KEYDOWN, vk, lParam)) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return;
+    }
+    if (editingRowIndex_ >= 0 && editBox_.focused) {
+        if (vk == VK_ESCAPE) {
+            CancelTitleEdit();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (vk == VK_RETURN) {
+            CommitTitleEdit();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (editBox_.HandleKey(WM_KEYDOWN, vk, lParam)) {
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draft (new-todo inline input)
+// ---------------------------------------------------------------------------
+
+void StickyWindow::BeginDraft() {
+    // Entering draft mode implicitly commits any in-flight title edit so we never
+    // have two TextBoxes active simultaneously.
+    if (editingRowIndex_ >= 0) CommitTitleEdit();
+
+    drafting_ = true;
+    draftBox_.text.clear();
+    draftBox_.cursorPos = 0;
+    draftBox_.selStart = draftBox_.selEnd = -1;
+    draftBox_.SetFocus(true);
+
+    SetFocus(hwnd_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::CommitDraft() {
+    if (!drafting_) return;
+
+    std::wstring raw = draftBox_.text;
+    // Trim whitespace / control chars on both ends.
+    auto notSpace = [](wchar_t c) { return !(c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'); };
+    auto first = std::find_if(raw.begin(), raw.end(), notSpace);
+    auto last  = std::find_if(raw.rbegin(), raw.rend(), notSpace).base();
+    std::wstring trimmed = (first < last) ? std::wstring(first, last) : std::wstring();
+
+    if (trimmed.empty()) {
+        // Empty draft behaves the same as Esc — per calling convention agreed
+        // with macOS DraftTodoRow.
+        CancelDraft();
+        return;
+    }
+
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) {
+        CancelDraft();
+        return;
+    }
+
+    std::string title = WideToUtf8(trimmed);
+    auto created = app->GetState()->GetHttp()->CreateTodo(title);
+
+    // Exit draft mode regardless of outcome; the user can see the row appear or see
+    // nothing change — WS reconnect will eventually reconcile on failure.
+    drafting_ = false;
+    draftBox_.text.clear();
+    draftBox_.SetFocus(false);
+
+    if (created.has_value()) {
+        // Optimistic local append — the server will also broadcast a todo.created
+        // event which triggers WM_STICKYTODO_REFRESH -> Refresh(), so the duplicate
+        // is merged away by the subsequent ListTodos call.
+        todos_.push_back(*created);
+    }
+
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::CancelDraft() {
+    if (!drafting_) return;
+    drafting_ = false;
+    draftBox_.text.clear();
+    draftBox_.cursorPos = 0;
+    draftBox_.selStart = draftBox_.selEnd = -1;
+    draftBox_.SetFocus(false);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Title in-place edit
+// ---------------------------------------------------------------------------
+
+void StickyWindow::BeginTitleEdit(size_t rowIndex) {
+    if (rowIndex >= todos_.size()) return;
+    if (todos_[rowIndex].IsDeleted()) return;
+
+    if (drafting_) CancelDraft();
+    if (editingRowIndex_ >= 0) CommitTitleEdit();
+
+    editingRowIndex_ = static_cast<int>(rowIndex);
+    editBox_.text = Utf8ToWide(todos_[rowIndex].title);
+    editBox_.cursorPos = static_cast<int>(editBox_.text.size());
+    editBox_.selStart = editBox_.selEnd = -1;
+    editBox_.SetFocus(true);
+
+    SetFocus(hwnd_);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::CommitTitleEdit() {
+    if (editingRowIndex_ < 0 || editingRowIndex_ >= static_cast<int>(todos_.size())) {
+        editingRowIndex_ = -1;
+        editBox_.SetFocus(false);
+        return;
+    }
+
+    models::Todo& todo = todos_[editingRowIndex_];
+    std::wstring raw = editBox_.text;
+    auto notSpace = [](wchar_t c) { return !(c == L' ' || c == L'\t' || c == L'\r' || c == L'\n'); };
+    auto first = std::find_if(raw.begin(), raw.end(), notSpace);
+    auto last  = std::find_if(raw.rbegin(), raw.rend(), notSpace).base();
+    std::wstring trimmed = (first < last) ? std::wstring(first, last) : std::wstring();
+    std::string newTitle = WideToUtf8(trimmed);
+
+    int savingIndex = editingRowIndex_;
+    editingRowIndex_ = -1;
+    editBox_.SetFocus(false);
+    editBox_.text.clear();
+
+    // Empty or unchanged → no-op (matches macOS TodoRow.commitTitleEdit behaviour).
+    if (newTitle.empty() || newTitle == todo.title) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        return;
+    }
+
+    auto updated = app->GetState()->GetHttp()->UpdateTodo(
+        todo.id, newTitle, todo.priority, todo.tag, todo.due_at);
+    if (updated.has_value() && savingIndex >= 0 && savingIndex < static_cast<int>(todos_.size())) {
+        todos_[savingIndex] = *updated;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::CancelTitleEdit() {
+    if (editingRowIndex_ < 0) return;
+    editingRowIndex_ = -1;
+    editBox_.text.clear();
+    editBox_.cursorPos = 0;
+    editBox_.selStart = editBox_.selEnd = -1;
+    editBox_.SetFocus(false);
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Per-row actions
+// ---------------------------------------------------------------------------
+
+void StickyWindow::DoComplete(size_t rowIndex) {
+    if (rowIndex >= todos_.size()) return;
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    auto updated = app->GetState()->GetHttp()->CompleteTodo(todos_[rowIndex].id);
+    if (updated.has_value()) {
+        todos_[rowIndex] = *updated;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::DoReopen(size_t rowIndex) {
+    if (rowIndex >= todos_.size()) return;
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    auto updated = app->GetState()->GetHttp()->ReopenTodo(todos_[rowIndex].id);
+    if (updated.has_value()) {
+        todos_[rowIndex] = *updated;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void StickyWindow::DoDelete(size_t rowIndex) {
+    if (rowIndex >= todos_.size()) return;
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    const auto& todo = todos_[rowIndex];
+
+    // Soft-delete confirmation — matches macOS TodoRow alert, including the
+    // "don't ask again" preference persisted via Preferences (HKCU).
+    // MB_YESNOCANCEL offers three outcomes without pulling in the TaskDialog
+    // API: Yes = delete once; No = delete and never ask again; Cancel = abort.
+    if (!ShouldSkipTodoDeleteConfirm()) {
+        // 确认删除这条待办？\n此操作会放入回收状态，可通过「仅已删除」筛选恢复。
+        // \n[是] 删除  [否] 删除并不再提示  [取消] 放弃
+        std::wstring msg =
+            L"\u786E\u8BA4\u5220\u9664\u8FD9\u6761\u5F85\u529E\uFF1F\n"
+            L"\u6B64\u64CD\u4F5C\u4F1A\u653E\u5165\u56DE\u6536\u72B6\u6001\uFF0C"
+            L"\u53EF\u901A\u8FC7\u300C\u4EC5\u5DF2\u5220\u9664\u300D\u7B5B\u9009\u6062\u590D\u3002\n\n"
+            L"[\u662F] \u5220\u9664    [\u5426] \u5220\u9664\u5E76\u4E0D\u518D\u63D0\u793A    [\u53D6\u6D88] \u653E\u5F03";
+        int reply = MessageBoxW(hwnd_, msg.c_str(), L"StickyTodo",
+                                MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
+        if (reply == IDCANCEL) return;
+        if (reply == IDNO) {
+            // "Delete and don't ask again" — persist preference before deleting.
+            SetSkipTodoDeleteConfirm(true);
+        }
+        // IDYES and IDNO both fall through to actually perform the delete.
+    }
+
+    bool ok = app->GetState()->GetHttp()->DeleteTodo(todo.id);
+    if (ok) {
+        // Optimistic: mark locally as deleted (set deleted_at to a sentinel)
+        // so the row gets the "deleted" style until WS refresh catches up.
+        todos_[rowIndex].deleted_at = std::string("pending");
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Sticky-level delete (trash button in title bar).
+// Mirrors macOS StickyView's trash button: fires DELETE /api/sticky-notes/:id,
+// then lets the server-driven sticky.deleted WS event close our window via
+// WM_STICKYTODO_STICKY_DELETED (which in turn calls DestroyWindow — see the
+// handler in HandleMessage). The confirmation dialog uses a separate
+// preference key (sticky.skipDeleteConfirm on macOS /
+// skipStickyDeleteConfirm in HKCU) so users can independently silence the
+// two dialogs.
+void StickyWindow::DoDeleteSticky() {
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    if (!ShouldSkipStickyDeleteConfirm()) {
+        // 确认删除此便签？\n删除后该便签及其筛选条件将从云端永久移除，无法恢复。
+        // \n[是] 删除  [否] 删除并不再提示  [取消] 放弃
+        std::wstring msg =
+            L"\u786E\u8BA4\u5220\u9664\u6B64\u4FBF\u7B7E\uFF1F\n"
+            L"\u5220\u9664\u540E\u8BE5\u4FBF\u7B7E\u53CA\u5176\u7B5B\u9009\u6761\u4EF6\u5C06"
+            L"\u4ECE\u4E91\u7AEF\u6C38\u4E45\u79FB\u9664\uFF0C\u65E0\u6CD5\u6062\u590D\u3002\n\n"
+            L"[\u662F] \u5220\u9664    [\u5426] \u5220\u9664\u5E76\u4E0D\u518D\u63D0\u793A    [\u53D6\u6D88] \u653E\u5F03";
+        int reply = MessageBoxW(hwnd_, msg.c_str(), L"StickyTodo",
+                                MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
+        if (reply == IDCANCEL) return;
+        if (reply == IDNO) {
+            SetSkipStickyDeleteConfirm(true);
+        }
+    }
+
+    bool ok = app->GetState()->GetHttp()->DeleteSticky(stickyId_);
+    if (!ok) {
+        // HTTP failure — leave the window open. macOS also leaves the sticky
+        // present on failure (the mutation is revoked). No local optimistic
+        // state to unwind here because we haven't modified anything yet.
+        return;
+    }
+
+    // Success: the server broadcast sticky.deleted → AppState →
+    // PostMessageToSticky(WM_STICKYTODO_STICKY_DELETED) will shortly land in
+    // our queue and trigger DestroyWindow. We can also post it immediately to
+    // close faster than waiting for the WS round-trip; the duplicate delivery
+    // is harmless because the handler is idempotent (checks hwnd_ != nullptr).
+    PostMessageW(hwnd_, core::WM_STICKYTODO_STICKY_DELETED, 0, 0);
+}
+
+void StickyWindow::DoRestore(size_t rowIndex) {
+    if (rowIndex >= todos_.size()) return;
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    auto updated = app->GetState()->GetHttp()->RestoreTodo(todos_[rowIndex].id);
+    if (updated.has_value()) {
+        todos_[rowIndex] = *updated;
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+// ---------------------------------------------------------------------------
+// Filter editor entry — opens a modal FilterEditor window. On success the
+// edited filter is serialised into this sticky's filter field via UpsertSticky,
+// then LoadData() re-runs to pull the now-filtered TODO list.
+// ---------------------------------------------------------------------------
+
+void StickyWindow::ShowFilterEditor() {
+    auto* app = GetApp();
+    if (!app || !app->GetState() || !app->GetState()->GetHttp()) return;
+
+    models::Filter edited = filter_;
+    bool ok = FilterEditor::ShowModal(hwnd_, hInstance_, edited);
+    if (!ok) return;
+
+    std::string filterJson = codec::StickyCodec::FilterToJson(edited);
+    auto updated = app->GetState()->GetHttp()->UpsertSticky(
+        stickyId_, stickyNote_.title, stickyNote_.bg_color, filterJson);
+    if (updated.has_value()) {
+        stickyNote_ = *updated;
+    } else {
+        // Persist failed — keep local filter in sync with what the user saw in the editor.
+        stickyNote_.filter = filterJson;
+    }
+    filter_ = edited;
+
+    // Refetch with the new filter.
+    auto todosResult = app->GetState()->GetHttp()->ListTodos(filter_);
+    if (todosResult.has_value()) {
+        todos_ = std::move(todosResult->items);
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+} // namespace stickytodo::ui
+

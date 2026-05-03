@@ -5,11 +5,13 @@
 # .github/workflows/release-branch.yml (for manual branch pre-releases).
 #
 # Jobs (fan-out):
-#   build-web      → web/dist artifact     (ubuntu-latest)
-#   build-server   → 7 cross-compiled bins (ubuntu-latest, needs build-web)
-#   build-mac-dmg  → universal .dmg        (macos-26 + Xcode 26.4.1, needs build-web)
-#   build-docker   → multi-arch image push (ubuntu-latest, needs build-web)
-#   publish-release → gh release upload    (ubuntu-latest, needs all above)
+#   build-web        → web/dist artifact     (ubuntu-latest)
+#   build-server     → 7 cross-compiled bins (ubuntu-latest, needs build-web)
+#   build-mac-dmg    → universal .dmg        (macos-26 + Xcode 26.4.1, needs build-web)
+#   build-win-client → Win32 portable zip +
+#                      Inno Setup .exe       (windows-2022 + vcpkg + Inno Setup)
+#   build-docker     → multi-arch image push (ubuntu-latest, needs build-web)
+#   publish-release  → gh release upload     (ubuntu-latest, needs all above)
 #
 # Inputs let the caller pick the artifact version string, the git tag the
 # release will be attached to, and whether the release is a pre-release.
@@ -211,7 +213,80 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # 4. Detect DOCKERHUB_USERNAME up-front in a tiny dedicated job so we can
+  # 4. Windows native client — Win32 + C++/WinRT + Direct2D.
+  #
+  # Runner / toolchain policy
+  # -------------------------
+  # * `runs-on: windows-2022` (Windows Server 2022 / MSVC 2022 images). We
+  #   deliberately don't use `windows-latest` because that label migrates
+  #   to new Windows versions on GitHub's own schedule — and our client
+  #   targets Windows 10 20H1+, so we want the *oldest-still-supported*
+  #   runner as our build baseline. Binaries built on Server 2022 still
+  #   run on Windows 10 / 11 client editions without issue.
+  # * vcpkg is pre-installed on windows-2022 at C:\vcpkg and exposed via
+  #   the VCPKG_INSTALLATION_ROOT env var. We copy that into VCPKG_ROOT
+  #   because CMakePresets.json references `$env{VCPKG_ROOT}` (the vcpkg
+  #   convention). Alternatively we could use
+  #   microsoft/setup-msbuild + a custom vcpkg checkout, but the preinstalled
+  #   one is already warm-cached and saves ~3 min per run.
+  # * Inno Setup 6 is pre-installed on windows-2022 at
+  #   `C:\Program Files (x86)\Inno Setup 6\ISCC.exe` (via the runner's
+  #   chocolatey bootstrap). package-win-client.sh auto-discovers that
+  #   path — so the step below does not need to pass ISCC explicitly.
+  # * bash (Git Bash) is pre-installed; `shell: bash` on windows-2022
+  #   picks it up automatically.
+  # -------------------------------------------------------------------------
+  build-win-client:
+    name: Build Windows client (x64 zip + Inno Setup installer)
+    runs-on: windows-2022
+    # Windows client doesn't embed the Web UI (it's a native Win32 app, not
+    # a web-hosting server), so it doesn't need the web-dist artifact —
+    # omit `needs: build-web` to let it start in parallel.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup (if missing)
+        shell: pwsh
+        run: |
+          # windows-2022 ships Inno Setup 6 pre-installed at the standard
+          # Program Files (x86) location, but we guard just in case the
+          # runner image rotates the tool out. choco install is a no-op
+          # when the package is already present.
+          if (-not (Test-Path 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe')) {
+            choco install innosetup --no-progress -y
+          } else {
+            Write-Host 'Inno Setup 6 already installed.'
+          }
+
+      - name: Export VCPKG_ROOT
+        shell: bash
+        # The windows-2022 image bootstraps vcpkg and exposes its path via
+        # VCPKG_INSTALLATION_ROOT. CMakePresets.json references VCPKG_ROOT
+        # (the upstream-vcpkg convention), so we mirror it into the shell
+        # env and into GITHUB_ENV so later bash / pwsh steps see it too.
+        run: |
+          echo "VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT:-C:/vcpkg}" >> "$GITHUB_ENV"
+          echo "Using VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT:-C:/vcpkg}"
+
+      - name: Package Windows client
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash scripts/package-win-client.sh
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-client
+          path: |
+            dist/win-client/stickytodo-*-windows-x64.zip
+            dist/win-client/stickytodo-setup-*.exe
+            dist/win-client/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 5. Detect DOCKERHUB_USERNAME up-front in a tiny dedicated job so we can
   #    branch on it using `if: needs.detect-docker-creds.outputs.have == ...`.
   #    GitHub Actions does NOT evaluate `secrets.*` inside a job-level `if:`,
   #    and we want the expensive QEMU-based multi-arch build to be skipped
@@ -240,7 +315,7 @@ jobs:
           fi
 
   # -------------------------------------------------------------------------
-  # 5. Multi-arch Docker image — QEMU + buildx handle amd64/arm64/armv7.
+  # 6. Multi-arch Docker image — QEMU + buildx handle amd64/arm64/armv7.
   #    Only runs when credentials exist (see detect-docker-creds).
   # -------------------------------------------------------------------------
   build-docker:
@@ -293,19 +368,25 @@ jobs:
           cache-to: type=gha,mode=max
 
   # -------------------------------------------------------------------------
-  # 5. Publish a GitHub Release with every artifact above attached.
+  # 7. Publish a GitHub Release with every artifact above attached.
   # -------------------------------------------------------------------------
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     # build-docker is listed as a dependency only for ordering: when it's
     # skipped (docker_image == '') the `always()`-based condition below
-    # still lets this job run. `success()` on server + mac remains required.
-    needs: [build-server, build-mac-dmg, build-docker]
+    # still lets this job run. `success()` on server + mac + win remains
+    # required. Windows uploads live under dist/win-client/ — we scope the
+    # release file patterns narrowly so that SHA256SUMS from *each* job
+    # only contributes entries for *its* artifacts (they're per-platform
+    # files with the same name; both get attached to the release under
+    # their subdir-qualified names via the download step).
+    needs: [build-server, build-mac-dmg, build-win-client, build-docker]
     if: |
       always() &&
       needs.build-server.result == 'success' &&
       needs.build-mac-dmg.result == 'success' &&
+      needs.build-win-client.result == 'success' &&
       (needs.build-docker.result == 'success' || needs.build-docker.result == 'skipped')
     steps:
       - uses: actions/checkout@v4
@@ -322,12 +403,20 @@ jobs:
           name: mac-dmg
           path: dist/mac-client/
 
+      - name: Download Windows client artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: win-client
+          path: dist/win-client/
+
       - name: List artifacts (sanity check)
         run: |
           echo "=== server/ ==="
           ls -la dist/server/ || true
           echo "=== mac-client/ ==="
           ls -la dist/mac-client/ || true
+          echo "=== win-client/ ==="
+          ls -la dist/win-client/ || true
 
       - name: Create / update release
         uses: softprops/action-gh-release@v2
@@ -337,8 +426,18 @@ jobs:
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # Note on multiple SHA256SUMS files: server / mac / win each emit
+          # their own SHA256SUMS scoped to their own artifacts. We upload
+          # all three — softprops/action-gh-release preserves the full
+          # source path's basename, so they'd collide at upload time. To
+          # avoid that, we rename the Windows SHA256SUMS to an unambiguous
+          # per-platform name right before upload. Server + Mac are kept
+          # as-is to avoid changing the existing public download URLs.
           files: |
             dist/server/stickytodo-server-*
             dist/server/SHA256SUMS
             dist/mac-client/stickytodo-*-macos-universal.dmg
             dist/mac-client/SHA256SUMS
+            dist/win-client/stickytodo-*-windows-x64.zip
+            dist/win-client/stickytodo-setup-*.exe
+            dist/win-client/SHA256SUMS
