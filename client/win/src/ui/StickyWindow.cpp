@@ -244,17 +244,30 @@ void StickyWindow::LoadData() {
     todosLoading_ = true;
     app->GetState()->GetHttp()->AsyncListTodos(filter_,
         [this, alive = alive_, myGen]
-        (std::optional<core::HttpClient::TodoListResult> result) {
-            // NOTE: qualifier must be `core::HttpClient::TodoListResult`,
-            // not bare `HttpClient::TodoListResult`, because this file
-            // lives in `namespace stickytodo::ui` and the surrounding
-            // `namespace ui { ... }` does not implicitly reach into
-            // sibling `core::`. models::Todo works without the `core::`
-            // qualifier in other callbacks here because `models` is a
-            // sibling namespace of `ui` under `stickytodo`, and the
-            // other lambdas use `models::Todo` directly (MSVC resolves
-            // `models` via `stickytodo::ui::models` → not found →
-            // `stickytodo::models` → found).
+        (std::optional<core::TodoListResult> result) {
+            // Qualifier is `core::TodoListResult` (namespace member, not
+            // class-nested) to match HttpClient.h's declaration:
+            //
+            //   namespace stickytodo::core {
+            //     struct TodoListResult { ... };   // ← top-level in core
+            //     class HttpClient {
+            //       using TodoListCallback =
+            //         std::function<void(std::optional<TodoListResult>)>;
+            //       // ↑ inside class body, name-lookup finds the
+            //       //   enclosing namespace's TodoListResult, so the
+            //       //   TodoListCallback's real type is
+            //       //   std::function<void(
+            //       //     std::optional<stickytodo::core::TodoListResult>)>
+            //     };
+            //   }
+            //
+            // This file is in `namespace stickytodo::ui`, so to form the
+            // same type we must qualify as `core::TodoListResult` (ADL
+            // / unqualified lookup does NOT reach sibling namespace
+            // `core` from inside `ui`). `models::Todo` in the other
+            // callbacks works for the same reason: `models` is also a
+            // sibling of `ui` under `stickytodo`, and we always qualify
+            // it (never write bare `Todo`).
             // Liveness guard — the StickyWindow may have been destroyed
             // (user closed it / WS sticky.deleted / App shutdown)
             // between AsyncListTodos firing on the worker thread and
