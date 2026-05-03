@@ -244,7 +244,17 @@ void StickyWindow::LoadData() {
     todosLoading_ = true;
     app->GetState()->GetHttp()->AsyncListTodos(filter_,
         [this, alive = alive_, myGen]
-        (std::optional<HttpClient::TodoListResult> result) {
+        (std::optional<core::HttpClient::TodoListResult> result) {
+            // NOTE: qualifier must be `core::HttpClient::TodoListResult`,
+            // not bare `HttpClient::TodoListResult`, because this file
+            // lives in `namespace stickytodo::ui` and the surrounding
+            // `namespace ui { ... }` does not implicitly reach into
+            // sibling `core::`. models::Todo works without the `core::`
+            // qualifier in other callbacks here because `models` is a
+            // sibling namespace of `ui` under `stickytodo`, and the
+            // other lambdas use `models::Todo` directly (MSVC resolves
+            // `models` via `stickytodo::ui::models` → not found →
+            // `stickytodo::models` → found).
             // Liveness guard — the StickyWindow may have been destroyed
             // (user closed it / WS sticky.deleted / App shutdown)
             // between AsyncListTodos firing on the worker thread and
@@ -1519,8 +1529,17 @@ void StickyWindow::DoDelete(size_t rowIndex) {
     // state; the WS-driven refresh will replace it with the
     // server-authoritative row (with a real deleted_at timestamp)
     // shortly.
+    //
+    // `deleted_at` is `std::optional<std::string>` (Todo.h:22 — null
+    // for not-deleted, populated with an ISO8601 string for deleted).
+    // prevDeletedAt must preserve the optional semantics for
+    // rollback: when the user deletes a previously-live todo, the
+    // snapshot is std::nullopt and we must restore that exact state
+    // (not an empty string, which would still count as "deleted" per
+    // IsDeleted()). Copy-capture the optional into the lambda rather
+    // than moving to keep the ctor-initialiser readable.
     uint64_t todoId = todo.id;
-    std::string prevDeletedAt = todos_[rowIndex].deleted_at;
+    std::optional<std::string> prevDeletedAt = todos_[rowIndex].deleted_at;
     todos_[rowIndex].deleted_at = std::string("pending");
     InvalidateRect(hwnd_, nullptr, FALSE);
 
