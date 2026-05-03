@@ -139,17 +139,19 @@ open /tmp/stickytodoBuild/Build/Products/Debug/stickytodo.app
 
 ## 运行 Windows 客户端
 
-**A. 下载安装包或免安装包**（Releases 里二选一）
+**A. 下载安装包或免安装包**（Releases 里按架构选一种）
 
-- `stickytodo-setup-<version>.exe`（Inno Setup 6 安装器，推荐）：双击运行，默认 per-user 安装到 `%LocalAppData%\Programs\StickyTodo`（不弹 UAC）；若想装到 `%ProgramFiles%\StickyTodo` 并供本机所有用户使用，在安装向导勾选"为所有用户安装"（会提示 UAC）。安装器最低要求 Windows 10 20H1（`10.0.19041`）。卸载通过"设置 → 应用 → 已安装的应用"或开始菜单里的"Uninstall StickyTodo"。
-- `stickytodo-<version>-windows-x64.zip`（免安装 portable zip）：解压任意目录，直接双击解压后的 `stickytodo.exe` 运行；不写注册表（除了便签去重确认偏好），便签窗口位置缓存写在 `%LocalAppData%\stickytodo\frames.json`，JWT token 走 Windows Credential Manager（卸载时若想清理残留，手动删这两处即可）。
+**先判断自己的系统架构**：Win11 按 `Win + Pause` 打开"系统信息"，看"系统类型"——`基于 x64 的处理器` → 下载 `x64` 版；`基于 ARM 的处理器` → 下载 `arm64` 版（Surface Pro X / Copilot+ PC / 部分笔记本）。不确定时选 `x64`（Win11 arm64 系统也能通过 x64 emulation 运行）。
 
-两种方式**均无代码签名**，首次运行时 SmartScreen 会弹"Windows 已保护你的电脑"警告，点击"**更多信息 → 仍要运行**"即可（后续启动不再提示）。下载后建议先用同目录的 `SHA256SUMS` 校验完整性：
+- `stickytodo-setup-<version>-x64.exe` / `stickytodo-setup-<version>-arm64.exe`（Inno Setup 6 安装器，推荐）：双击运行，默认 per-user 安装到 `%LocalAppData%\Programs\StickyTodo`（不弹 UAC）；若想装到 `%ProgramFiles%\StickyTodo` 并供本机所有用户使用，在安装向导勾选"为所有用户安装"（会提示 UAC）。安装器最低要求 Windows 10 20H1（`10.0.19041`）。arm64 安装器仅能在原生 arm64 Windows 上运行（不接受 x64 emulation），x64 安装器则可在 native x64 和 Win11-arm64 emulation 两种环境下工作。卸载通过"设置 → 应用 → 已安装的应用"或开始菜单里的"Uninstall StickyTodo"（arm64 版在卸载列表里显示为 `StickyTodo (arm64)` 以便区分）。
+- `stickytodo-<version>-windows-x64.zip` / `stickytodo-<version>-windows-arm64.zip`（免安装 portable zip）：解压任意目录，直接双击解压后的 `stickytodo.exe` 运行；不写注册表（除了便签去重确认偏好），便签窗口位置缓存写在 `%LocalAppData%\stickytodo\frames.json`，JWT token 走 Windows Credential Manager（卸载时若想清理残留，手动删这两处即可）。
+
+两种方式**均无代码签名**，首次运行时 SmartScreen 会弹"Windows 已保护你的电脑"警告，点击"**更多信息 → 仍要运行**"即可（后续启动不再提示）。下载后建议先用同目录的 `SHA256SUMS-<arch>` 校验完整性（x64 看 `SHA256SUMS-x64`，arm64 看 `SHA256SUMS-arm64`）：
 
 ```powershell
 # PowerShell（Windows 自带）
-Get-FileHash stickytodo-setup-<version>.exe -Algorithm SHA256
-# 对比 SHA256SUMS 里对应文件名的那一行即可
+Get-FileHash stickytodo-setup-<version>-x64.exe -Algorithm SHA256
+# 对比 SHA256SUMS-x64 里对应文件名的那一行即可
 ```
 
 **B. 从源码构建**
@@ -169,6 +171,13 @@ cmake --build --preset debug       # 编译
 # 从仓库根，Git Bash / MSYS2 下执行
 VERSION=dev bash scripts/package-win-client.sh --skip-installer
 # 产物在 dist/win-client/stickytodo-dev-windows-x64.zip
+
+# 要打 arm64 版（从 x64 host 交叉编译，需已激活 amd64_arm64 MSVC 环境）：
+VERSION=dev ARCH=arm64 bash scripts/package-win-client.sh --skip-installer
+# 产物在 dist/win-client/stickytodo-dev-windows-arm64.zip
+# 注：本地要走 arm64 交叉编译，需要在 "x64_arm64 Cross Tools Command Prompt"
+# 或等价的 vcvarsall.bat amd64_arm64 环境下启动 Git Bash；
+# 最省心的方式是让 CI（windows-2022 runner）帮你出 arm64 产物。
 ```
 
 **首次使用**：应用以系统托盘图标（屏幕右下角）常驻，无任务栏入口。**右键点击**托盘图标（或**双击**，等价于右键 → `Settings`）打开托盘菜单；未登录态菜单只有 `Settings` / `Quit` 两项，选 `Settings` 进入设置窗口。设置窗口顶部有 3 个 Tab：`Settings` / `History` / `About`，登录相关表单都在 **`Settings` Tab** 下——依次填写服务端地址（`Server URL` 输入框，例 `http://127.0.0.1:8080`；可先点 `Test Connection` 按钮验证 `GET /health` 可达）、`Username`、`Password`，然后点 `Login` 按钮登录。登录成功后托盘菜单会多出 `New Sticky Note` / `Logout` 两项，选 `New Sticky Note` 即可打开一张便签窗口；`History` Tab 显示全局审计日志，`About` Tab 显示版本号等元信息。JWT 经 Windows Credential Manager 加密持久化（target name `stickytodo/<username>`），关掉客户端再打开会自动登录；便签窗口位置（x/y/width/height）在 `%LocalAppData%\stickytodo\frames.json` 里自动保存。

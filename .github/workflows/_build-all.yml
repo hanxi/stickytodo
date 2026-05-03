@@ -237,34 +237,50 @@ jobs:
   #   picks it up automatically.
   # -------------------------------------------------------------------------
   build-win-client:
-    name: Build Windows client (x64 zip + Inno Setup installer)
+    # Matrix expansion: windows-2022 runner × [x64, arm64]. Both legs run
+    # in parallel; `fail-fast: false` lets the arm64 leg finish even if x64
+    # trips an architecture-independent bug (and vice versa) so maintainers
+    # see the full picture, not just the first error.
+    #
+    # arm64 is a CROSS-COMPILE from an x64 host: MSVC's cross tools produce
+    # the arm64 PE, but we cannot execute the resulting binary on the build
+    # machine, so `package-win-client.sh` unconditionally skips ctest for
+    # the arm64 arch (the codec / models tests under src/tests/ exercise
+    # pure C++ logic that is architecture-independent, so x64's passing
+    # test run already guarantees correctness across both architectures).
+    name: Build Windows client (${{ matrix.arch }} zip + Inno Setup installer)
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
     # Windows client doesn't embed the Web UI (it's a native Win32 app, not
     # a web-hosting server), so it doesn't need the web-dist artifact —
     # omit `needs: build-web` to let it start in parallel.
     steps:
       - uses: actions/checkout@v4
 
-      # Activate the MSVC x64 dev environment BEFORE anything else reads PATH.
-      # Rationale: windows-2022 runners have *both* MSVC 2022 at the standard
-      # Visual Studio install path *and* a mingw64 g++ pre-installed at
-      # C:\mingw64\bin that sits early in PATH. Without this step CMake's
-      # compiler auto-detection picks up mingw first (we observed
-      # "-- The CXX compiler identification is GNU 14.2.0" in a prior CI
-      # run), which then fails two ways:
-      #   (a) vcpkg's x64-windows triplet builds nlohmann_json.lib with MSVC
-      #       ABI; linking it with mingw is guaranteed-incompatible.
-      #   (b) mingw's <windows.h> keys UNICODE/_UNICODE off the macro being
-      #       defined — CMake's default cmdline doesn't set them, so
-      #       IDC_ARROW / IDI_APPLICATION expand to narrow-string literals
-      #       that LoadCursorW / LoadIconW reject (observed cl- and mingw-
-      #       only regressions in StickyWindow.cpp / TrayIcon.cpp).
-      # ilammy/msvc-dev-cmd calls `vcvarsall.bat x64` and exports INCLUDE /
-      # LIB / PATH so `cl` is first on PATH for the rest of the job.
-      - name: Activate MSVC x64 dev environment
+      # Activate the matching MSVC dev environment BEFORE anything else
+      # reads PATH. ilammy/msvc-dev-cmd's `arch` input accepts the vcvarsall
+      # keywords directly:
+      #   x64    → `amd64`       (native x64-host, x64-target build)
+      #   arm64  → `amd64_arm64` (x64-host, arm64-target CROSS build)
+      # `amd64_arm64` swaps in MSVC's arm64 codegen while keeping the host
+      # toolchain as amd64 — cl.exe still runs natively on the x64 runner,
+      # it just emits arm64 PE output. This is the only supported way to
+      # build arm64 binaries on GitHub's x64 runners today (they don't
+      # offer a public arm64 Windows runner yet; when they do, we can
+      # switch the arm64 matrix leg to `runs-on: windows-2022-arm64` +
+      # `arch: arm64` for a native build and drop the cross-compile path).
+      #
+      # Rationale for needing this step at all — see the long note above
+      # the Activate step in pre-matrix git history: windows-2022 runners
+      # have mingw64's g++ early on PATH and CMake will pick it up unless
+      # the MSVC environment has been activated first.
+      - name: Activate MSVC dev environment (${{ matrix.arch }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.arch == 'arm64' && 'amd64_arm64' || 'amd64' }}
 
       - name: Install Inno Setup (if missing)
         shell: pwsh
@@ -289,20 +305,29 @@ jobs:
           echo "VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT:-C:/vcpkg}" >> "$GITHUB_ENV"
           echo "Using VCPKG_ROOT=${VCPKG_INSTALLATION_ROOT:-C:/vcpkg}"
 
-      - name: Package Windows client
+      - name: Package Windows client (${{ matrix.arch }})
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+        # ARCH is consumed by scripts/package-win-client.sh — it picks the
+        # matching CMake preset (release-arm64 vs release), the matching
+        # vcpkg triplet (arm64-windows vs x64-windows), the matching iscc
+        # /D defines (AppArch=arm64 vs AppArch=x64), and the matching
+        # artifact filenames (stickytodo-<ver>-windows-<arch>.zip +
+        # stickytodo-setup-<ver>-<arch>.exe).
         run: bash scripts/package-win-client.sh
 
-      - name: Upload Windows artifacts
+      - name: Upload Windows artifacts (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
-          name: win-client
+          # Per-arch artifact names so the two matrix legs never collide at
+          # upload time. publish-release below downloads both names.
+          name: win-client-${{ matrix.arch }}
           path: |
-            dist/win-client/stickytodo-*-windows-x64.zip
-            dist/win-client/stickytodo-setup-*.exe
-            dist/win-client/SHA256SUMS
+            dist/win-client/stickytodo-*-windows-${{ matrix.arch }}.zip
+            dist/win-client/stickytodo-setup-*-${{ matrix.arch }}.exe
+            dist/win-client/SHA256SUMS-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
@@ -424,10 +449,25 @@ jobs:
           name: mac-dmg
           path: dist/mac-client/
 
-      - name: Download Windows client artifacts
+      # Windows artifacts arrive in TWO matrix-produced uploads
+      # (win-client-x64 / win-client-arm64). Download each into the same
+      # `dist/win-client/` directory so the [Create / update release] step
+      # below sees a single flat file set. Collisions are impossible: both
+      # the portable zip and the Inno Setup installer carry the arch
+      # suffix in their filename (stickytodo-<ver>-windows-<arch>.zip,
+      # stickytodo-setup-<ver>-<arch>.exe), and each leg's SHA256SUMS is
+      # also arch-suffixed (SHA256SUMS-x64 / SHA256SUMS-arm64 — see
+      # scripts/package-win-client.sh).
+      - name: Download Windows client artifacts (x64)
         uses: actions/download-artifact@v4
         with:
-          name: win-client
+          name: win-client-x64
+          path: dist/win-client/
+
+      - name: Download Windows client artifacts (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: win-client-arm64
           path: dist/win-client/
 
       - name: List artifacts (sanity check)
@@ -448,17 +488,25 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           # Note on multiple SHA256SUMS files: server / mac / win each emit
-          # their own SHA256SUMS scoped to their own artifacts. We upload
-          # all three — softprops/action-gh-release preserves the full
-          # source path's basename, so they'd collide at upload time. To
-          # avoid that, we rename the Windows SHA256SUMS to an unambiguous
-          # per-platform name right before upload. Server + Mac are kept
-          # as-is to avoid changing the existing public download URLs.
+          # their own SHA256SUMS scoped to their own artifacts, and the
+          # Windows build additionally splits its SHA256SUMS by arch
+          # (SHA256SUMS-x64 / SHA256SUMS-arm64) so the x64 and arm64
+          # matrix legs never race each other. softprops/action-gh-release
+          # preserves the full source path's basename, which means
+          # server's `SHA256SUMS` and mac's `SHA256SUMS` would collide at
+          # upload time if we didn't keep them in separate source dirs —
+          # we keep that separation via the dist/<platform>/ paths below.
+          # The Windows *-x64 / *-arm64 suffixes keep the filenames unique
+          # at the Release level too, so end users can `curl` the arch
+          # they need without guessing which SHA256SUMS covers which zip.
           files: |
             dist/server/stickytodo-server-*
             dist/server/SHA256SUMS
             dist/mac-client/stickytodo-*-macos-universal.dmg
             dist/mac-client/SHA256SUMS
             dist/win-client/stickytodo-*-windows-x64.zip
-            dist/win-client/stickytodo-setup-*.exe
-            dist/win-client/SHA256SUMS
+            dist/win-client/stickytodo-*-windows-arm64.zip
+            dist/win-client/stickytodo-setup-*-x64.exe
+            dist/win-client/stickytodo-setup-*-arm64.exe
+            dist/win-client/SHA256SUMS-x64
+            dist/win-client/SHA256SUMS-arm64

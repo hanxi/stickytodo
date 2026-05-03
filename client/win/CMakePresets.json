@@ -30,32 +30,51 @@
     },
     {
       "name": "debug",
-      "displayName": "Debug",
+      "displayName": "Debug (x64)",
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTS": "ON",
-        "VCPKG_MANIFEST_FEATURES": "tests"
+        "VCPKG_MANIFEST_FEATURES": "tests",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
     {
       "name": "release",
-      "displayName": "Release",
+      "displayName": "Release (x64)",
       "inherits": "default",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "BUILD_TESTS": "OFF"
+        "BUILD_TESTS": "OFF",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "debug-arm64",
+      "displayName": "Debug (arm64)",
+      "inherits": "default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_TESTS": "ON",
+        "VCPKG_MANIFEST_FEATURES": "tests",
+        "VCPKG_TARGET_TRIPLET": "arm64-windows"
+      }
+    },
+    {
+      "name": "release-arm64",
+      "displayName": "Release (arm64)",
+      "inherits": "default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTS": "OFF",
+        "VCPKG_TARGET_TRIPLET": "arm64-windows"
       }
     }
   ],
   "buildPresets": [
-    {
-      "name": "debug",
-      "configurePreset": "debug"
-    },
-    {
-      "name": "release",
-      "configurePreset": "release"
-    }
+    { "name": "debug",         "configurePreset": "debug" },
+    { "name": "release",       "configurePreset": "release" },
+    { "name": "debug-arm64",   "configurePreset": "debug-arm64" },
+    { "name": "release-arm64", "configurePreset": "release-arm64" }
   ]
 }

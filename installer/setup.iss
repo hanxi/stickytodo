@@ -10,6 +10,11 @@
 ;
 ; Build-time inputs (passed via iscc `/D` flags — see scripts/package-win-client.sh):
 ;   AppVersion        = semver, e.g. "1.2.3" or "dev"
+;   AppArch           = target architecture, "x64" or "arm64". Drives
+;                       ArchitecturesAllowed / ArchitecturesInstallIn64BitMode
+;                       below so an x64 installer refuses to run on a
+;                       non-x64 (arm64-only) Windows host, and vice versa,
+;                       instead of silently installing the wrong binary.
 ;   ArtifactDir       = absolute path to the CMake Release build output that
 ;                       contains stickytodo.exe (expected layout:
 ;                       <ArtifactDir>\stickytodo.exe)
@@ -17,20 +22,27 @@
 ;                       README.md / LICENSE / assets/branding/*.ico)
 ;   OutputDir         = absolute path where the .exe installer is written
 ;   OutputBaseName    = desired output filename without `.exe` extension,
-;                       typically stickytodo-setup-<AppVersion>
+;                       typically stickytodo-setup-<AppVersion>-<AppArch>
 ;
 ; Fallback defaults are provided so running iscc on this file standalone
 ; (without wrapper script) still produces *something* buildable for local
-; smoke-test iteration — CI always passes all five `/D` flags explicitly.
+; smoke-test iteration — CI always passes all six `/D` flags explicitly.
 
 #ifndef AppVersion
   #define AppVersion "dev"
 #endif
+#ifndef AppArch
+  #define AppArch "x64"
+#endif
 #ifndef ArtifactDir
   ; Relative to the .iss file when iscc is launched from the repo root —
   ; matches the conventional out-of-source CMake layout used by
-  ; CMakePresets.json (`build/release/`).
-  #define ArtifactDir "..\client\win\build\release"
+  ; CMakePresets.json (`build/release/` for x64, `build/release-arm64/` for arm64).
+  #if AppArch == "arm64"
+    #define ArtifactDir "..\client\win\build\release-arm64"
+  #else
+    #define ArtifactDir "..\client\win\build\release"
+  #endif
 #endif
 #ifndef RepoRoot
   #define RepoRoot ".."
@@ -39,7 +51,7 @@
   #define OutputDir "..\dist\win-client"
 #endif
 #ifndef OutputBaseName
-  #define OutputBaseName "stickytodo-setup-" + AppVersion
+  #define OutputBaseName "stickytodo-setup-" + AppVersion + "-" + AppArch
 #endif
 
 [Setup]
@@ -47,6 +59,12 @@
 ; identity — must NEVER change across versions, otherwise upgrades won't
 ; replace the old entry. Mirrors the macOS Bundle ID pattern (com.hanxi.stickytodo)
 ; wrapped in Inno Setup's GUID form. Generated once and frozen.
+; AppId is shared across architectures on purpose: an x64 install followed
+; by an arm64 install (or vice versa) should replace the existing install,
+; not create a second Add/Remove Programs entry. Users who want both
+; architectures side-by-side are not a real workflow — each host is either
+; x64 OR arm64 at any given time, and the matching architecture's binary is
+; what they should run.
 AppId={{4B5B6C2E-9E7B-4F3D-A8C5-0D6A1B2C3D4E}}
 AppName=StickyTodo
 AppVersion={#AppVersion}
@@ -56,6 +74,31 @@ AppSupportURL=https://github.com/hanxi/stickytodo/issues
 AppUpdatesURL=https://github.com/hanxi/stickytodo/releases
 DefaultDirName={autopf}\StickyTodo
 DefaultGroupName=StickyTodo
+
+; --------- Architecture gating ---------
+; ArchitecturesAllowed refuses to run the wrong-architecture installer on
+; the user's host (pop-up "Setup can't be installed on this architecture"
+; instead of a silent bad-install → confusing crash). "x64compatible"
+; matches both native-x64 Windows and x64 emulation on arm64 Windows —
+; the latter is safe because x64 emulation on Win11-arm64 is the intended
+; fallback for apps that don't ship a native arm64 build. For the arm64
+; installer we use the strict "arm64" keyword so it is ONLY allowed on a
+; real arm64 host and arm64 emulation is never attempted.
+;
+; ArchitecturesInstallIn64BitMode = x64compatible / arm64 switches the
+; installer's `{autopf}`, registry view etc. to the 64-bit variants
+; ({commonpf} → %ProgramFiles% not %ProgramFiles(x86)%, HKLM\SOFTWARE
+; not HKLM\SOFTWARE\WOW6432Node). Without this our 64-bit exe would be
+; deposited under %ProgramFiles(x86)% which is a common packaging-bug
+; anti-pattern (VS Code, Zed, Signal installers all go through the same
+; 64-bit-mode setup).
+#if AppArch == "arm64"
+  ArchitecturesAllowed=arm64
+  ArchitecturesInstallIn64BitMode=arm64
+#else
+  ArchitecturesAllowed=x64compatible
+  ArchitecturesInstallIn64BitMode=x64compatible
+#endif
 ; `auto*` constants resolve based on PrivilegesRequiredOverridesAllowed below:
 ; when user picks "current user only" → {userpf}\StickyTodo under %LocalAppData%\Programs
 ; when user picks "all users" → {commonpf}\StickyTodo under %ProgramFiles%.
@@ -70,8 +113,17 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseName}
 ; UninstallDisplayName is what shows in "Apps & features". Keep it clean —
 ; never embed the version here (same discipline as the macOS .app bundle
-; name guard documented in AGENTS.md §5.3).
-UninstallDisplayName=StickyTodo
+; name guard documented in AGENTS.md §5.3). We DO embed the architecture
+; ("StickyTodo (arm64)" vs "StickyTodo") so users who downloaded the wrong
+; installer can tell at a glance which build is currently present, but
+; without polluting the AppName / Start Menu / desktop shortcut with the
+; arch suffix (those stay "StickyTodo"), matching how Chrome / VS Code /
+; Zoom surface architecture on Windows.
+#if AppArch == "arm64"
+  UninstallDisplayName=StickyTodo (arm64)
+#else
+  UninstallDisplayName=StickyTodo
+#endif
 UninstallDisplayIcon={app}\stickytodo.exe
 ; Close the app before uninstall if it's running — otherwise removing the
 ; exe fails silently and leaves an orphaned tray icon until next reboot.

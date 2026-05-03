@@ -12,6 +12,12 @@
 #
 # Inputs:
 #   env VERSION         Baked into the artifact filename (default: dev).
+#   env ARCH            Target architecture: "x64" (default) or "arm64".
+#                       Picks the matching CMake preset (release / release-arm64)
+#                       and the matching vcpkg triplet. On the x64 CI runner
+#                       "arm64" is a cross-compile: binaries build fine but
+#                       cannot execute, so ctest is skipped automatically for
+#                       arm64 regardless of --skip-tests.
 #   env VCPKG_ROOT      Absolute path to a vcpkg checkout. Required —
 #                       CMakePresets.json references it via $env{VCPKG_ROOT}.
 #   env ISCC            Absolute path to Inno Setup's `iscc.exe`. If unset,
@@ -22,15 +28,15 @@
 #   flag --skip-tests   Skip the gtest run (tests already run in a separate
 #                       job in CI; devs rarely need them inline here).
 #
-# Outputs (under dist/win-client/):
-#   stickytodo-${VERSION}-windows-x64\            Plain unzipped exe folder
+# Outputs (under dist/win-client/), with ${ARCH} resolving to x64 or arm64:
+#   stickytodo-${VERSION}-windows-${ARCH}\        Plain unzipped exe folder
 #       stickytodo.exe                             Clean brand name — same
 #                                                  discipline as macOS .app
 #                                                  (no version embedded).
 #       README.md                                  (copied from repo root)
 #       LICENSE.txt                                (copied from repo root)
-#   stickytodo-${VERSION}-windows-x64.zip          Portable archive
-#   stickytodo-setup-${VERSION}.exe                Inno Setup installer
+#   stickytodo-${VERSION}-windows-${ARCH}.zip      Portable archive
+#   stickytodo-setup-${VERSION}-${ARCH}.exe        Inno Setup installer
 #                                                  (skipped if iscc missing)
 #   SHA256SUMS                                     One line per artifact
 #
@@ -80,12 +86,42 @@ for arg in "$@"; do
 done
 
 VERSION="${VERSION:-dev}"
-ARTIFACT_BASE="stickytodo-${VERSION}-windows-x64"
+
+# ARCH gate: the only two shapes we know how to build. Guard explicitly so a
+# typo like ARCH=amd64 fails loudly instead of quietly falling through to the
+# x64 path and producing mis-labelled artifacts. "x64" is our canonical name
+# (matches the install_prefix pattern used in artifact filenames and in
+# every reference across AGENTS.md / README.md); Microsoft's toolchain
+# naming (amd64, x86_64) is deliberately NOT accepted here.
+ARCH="${ARCH:-x64}"
+case "$ARCH" in
+  x64|arm64) ;;
+  *)
+    echo "package-win-client: unsupported ARCH=\"$ARCH\" (expected: x64 | arm64)" >&2
+    exit 2
+    ;;
+esac
+
+# Pick the matching CMake preset. Presets live in client/win/CMakePresets.json
+# and carry both CMAKE_BUILD_TYPE + VCPKG_TARGET_TRIPLET so we only need to
+# hand cmake the preset name — triplet wiring is declarative, no env gymnastics.
+if [[ "$ARCH" == "arm64" ]]; then
+  RELEASE_PRESET="release-arm64"
+  DEBUG_PRESET="debug-arm64"
+else
+  RELEASE_PRESET="release"
+  DEBUG_PRESET="debug"
+fi
+
+ARTIFACT_BASE="stickytodo-${VERSION}-windows-${ARCH}"
+INSTALLER_BASENAME="stickytodo-setup-${VERSION}-${ARCH}"
 
 echo "==> package-win-client"
 echo "    repo root:     $REPO_ROOT"
 echo "    client dir:    $CLIENT_DIR"
 echo "    version:       $VERSION"
+echo "    arch:          $ARCH"
+echo "    preset:        $RELEASE_PRESET"
 echo "    output dir:    $OUT_DIR"
 
 # ---------- sanity: vcpkg + CMake presets ----------
@@ -134,11 +170,11 @@ if [[ $SKIP_INSTALLER -eq 0 ]]; then
 fi
 
 # ---------- step 1: configure + build Release ----------
-echo "==> [1/5] configure (release preset)"
+echo "==> [1/5] configure ($RELEASE_PRESET preset)"
 cd "$CLIENT_DIR"
-cmake --preset release
+cmake --preset "$RELEASE_PRESET"
 
-echo "==> [2/5] build (release preset)"
+echo "==> [2/5] build ($RELEASE_PRESET preset)"
 # -j 1 forces a SERIAL build — intentionally slow, intentionally noisy. In a
 # previous CI run the output showed "[2/20]..[6/20] Building..." with zero
 # `FAILED:` lines and then "ninja: build stopped: subcommand failed", meaning
@@ -152,41 +188,57 @@ echo "==> [2/5] build (release preset)"
 # --verbose echoes the full cl.exe command line for every TU, which is
 # priceless when triaging "works locally, fails in CI" discrepancies caused
 # by missing -D, missing /I, or MSVC vs vcpkg CRT model mismatches.
-cmake --build --preset release --config Release -j 1 --verbose
+cmake --build --preset "$RELEASE_PRESET" --config Release -j 1 --verbose
 
-EXE_PATH="$CLIENT_DIR/build/release/stickytodo.exe"
+EXE_PATH="$CLIENT_DIR/build/${RELEASE_PRESET}/stickytodo.exe"
 if [[ ! -f "$EXE_PATH" ]]; then
   # Ninja single-config layout puts the exe directly in the build dir.
   # MSBuild multi-config layout would nest it under Release/. Cover both.
-  if [[ -f "$CLIENT_DIR/build/release/Release/stickytodo.exe" ]]; then
-    EXE_PATH="$CLIENT_DIR/build/release/Release/stickytodo.exe"
+  if [[ -f "$CLIENT_DIR/build/${RELEASE_PRESET}/Release/stickytodo.exe" ]]; then
+    EXE_PATH="$CLIENT_DIR/build/${RELEASE_PRESET}/Release/stickytodo.exe"
   else
     echo "package-win-client: could not locate stickytodo.exe after build" >&2
-    echo "                    searched: $CLIENT_DIR/build/release/stickytodo.exe" >&2
-    echo "                    searched: $CLIENT_DIR/build/release/Release/stickytodo.exe" >&2
+    echo "                    searched: $CLIENT_DIR/build/${RELEASE_PRESET}/stickytodo.exe" >&2
+    echo "                    searched: $CLIENT_DIR/build/${RELEASE_PRESET}/Release/stickytodo.exe" >&2
     exit 4
   fi
 fi
 echo "    exe:           $EXE_PATH"
 
 # ---------- step 2: unit tests (optional) ----------
-if [[ $SKIP_TESTS -eq 0 ]]; then
-  echo "==> [3/5] configure + run unit tests (debug preset with BUILD_TESTS=ON)"
+#
+# arm64-on-x64 cross-compile: the windows-2022 GitHub Actions runner is an
+# x64 host, so even though arm64 binaries build cleanly (MSVC's cross tools
+# handle the codegen), they cannot execute on the build machine. Running
+# ctest against arm64 test binaries would hang on Windows' image loader
+# rejecting the wrong architecture. Skip tests automatically in that case
+# — we rely on the x64 matrix leg to exercise the test suite, since the
+# codec / models code under test is architecture-independent C++ anyway.
+if [[ "$ARCH" == "arm64" ]]; then
+  echo "==> [3/5] unit tests skipped (arm64 cross-compile on x64 host)"
+elif [[ $SKIP_TESTS -eq 0 ]]; then
+  echo "==> [3/5] configure + run unit tests ($DEBUG_PRESET preset with BUILD_TESTS=ON)"
   # The `debug` preset already has BUILD_TESTS=ON baked in, which also
   # activates the `tests` vcpkg feature via the CMakeLists wiring. We use
   # it rather than passing -DBUILD_TESTS=ON against the release preset so
   # the test binaries live in a separate build dir and never contaminate
   # the shipping Release output we staged above.
-  cmake --preset debug
-  cmake --build --preset debug --config Debug
-  ( cd "$CLIENT_DIR/build/debug" && ctest --output-on-failure -C Debug )
+  cmake --preset "$DEBUG_PRESET"
+  cmake --build --preset "$DEBUG_PRESET" --config Debug
+  ( cd "$CLIENT_DIR/build/${DEBUG_PRESET}" && ctest --output-on-failure -C Debug )
 else
   echo "==> [3/5] unit tests skipped (--skip-tests)"
 fi
 
 # ---------- step 3: stage artifacts ----------
 echo "==> [4/5] stage artifacts into $OUT_DIR"
-rm -rf "$OUT_DIR"
+# Do NOT rm -rf $OUT_DIR here — the matrix job runs x64 and arm64 in separate
+# GitHub Actions invocations (each has its own fresh $OUT_DIR from
+# `actions/checkout`), so clobbering is unnecessary; and on a developer
+# machine, iterating between `ARCH=x64 ...` and `ARCH=arm64 ...` should
+# accumulate both architectures' artifacts side by side rather than silently
+# delete the other arch on every run. Clean only this arch's staging dir.
+rm -rf "$OUT_DIR/$ARTIFACT_BASE"
 mkdir -p "$OUT_DIR/$ARTIFACT_BASE"
 
 # Copy the exe with a clean brand name. Same rule as the macOS bundle —
@@ -266,13 +318,14 @@ if [[ $SKIP_INSTALLER -eq 0 ]]; then
   MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
     "$ISCC_BIN" \
       "/DAppVersion=$VERSION" \
+      "/DAppArch=$ARCH" \
       "/DArtifactDir=$(to_win "$OUT_DIR/$ARTIFACT_BASE")" \
       "/DRepoRoot=$(to_win "$REPO_ROOT")" \
       "/DOutputDir=$(to_win "$OUT_DIR")" \
-      "/DOutputBaseName=stickytodo-setup-$VERSION" \
+      "/DOutputBaseName=$INSTALLER_BASENAME" \
       "$(to_win "$INSTALLER_DIR/setup.iss")"
 
-  INSTALLER_OUT="$OUT_DIR/stickytodo-setup-$VERSION.exe"
+  INSTALLER_OUT="$OUT_DIR/$INSTALLER_BASENAME.exe"
   if [[ ! -f "$INSTALLER_OUT" ]]; then
     echo "package-win-client: iscc reported success but $INSTALLER_OUT is missing" >&2
     exit 7
@@ -283,27 +336,33 @@ else
 fi
 
 # ---------- step 5: SHA256SUMS ----------
-echo "==> emit SHA256SUMS"
+# Per-architecture sums file: name is suffixed with the arch so the x64 and
+# arm64 matrix legs never race each other in the merged artifact directory,
+# and so downstream `sha256sum -c SHA256SUMS-<arch>` can verify one arch's
+# downloads in isolation. The publish-release job renames / concatenates
+# these if the GitHub Release needs a single canonical SHA256SUMS file.
+SUMS_FILE="SHA256SUMS-${ARCH}"
+echo "==> emit $SUMS_FILE"
 (
   cd "$OUT_DIR"
   # Collect top-level artifact filenames (zip + installer if present);
   # we intentionally do NOT hash the unzipped staging dir contents — the
   # hashes users verify are the downloadable files.
   files=( "$ARTIFACT_BASE.zip" )
-  [[ -f "stickytodo-setup-$VERSION.exe" ]] && files+=( "stickytodo-setup-$VERSION.exe" )
+  [[ -f "$INSTALLER_BASENAME.exe" ]] && files+=( "$INSTALLER_BASENAME.exe" )
 
-  rm -f SHA256SUMS
+  rm -f "$SUMS_FILE"
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${files[@]}" > SHA256SUMS
+    sha256sum "${files[@]}" > "$SUMS_FILE"
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "${files[@]}" > SHA256SUMS
+    shasum -a 256 "${files[@]}" > "$SUMS_FILE"
   elif command -v powershell >/dev/null 2>&1; then
     # PowerShell fallback — format matches GNU sha256sum so users can
     # `sha256sum -c` downstream regardless of which tool produced the file.
-    : > SHA256SUMS
+    : > "$SUMS_FILE"
     for f in "${files[@]}"; do
       h=$(powershell -NoLogo -NoProfile -Command "(Get-FileHash -Algorithm SHA256 '$f').Hash.ToLower()")
-      printf '%s  %s\n' "$h" "$f" >> SHA256SUMS
+      printf '%s  %s\n' "$h" "$f" >> "$SUMS_FILE"
     done
   else
     echo "package-win-client: no hashing tool found (tried sha256sum / shasum / powershell)" >&2
