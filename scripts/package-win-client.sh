@@ -240,13 +240,37 @@ if [[ $SKIP_INSTALLER -eq 0 ]]; then
     fi
   }
 
-  "$ISCC_BIN" \
-    "/DAppVersion=$VERSION" \
-    "/DArtifactDir=$(to_win "$OUT_DIR/$ARTIFACT_BASE")" \
-    "/DRepoRoot=$(to_win "$REPO_ROOT")" \
-    "/DOutputDir=$(to_win "$OUT_DIR")" \
-    "/DOutputBaseName=stickytodo-setup-$VERSION" \
-    "$(to_win "$INSTALLER_DIR/setup.iss")"
+  # CRITICAL: disable MSYS2's automatic argument-path conversion for this
+  # one command.
+  #
+  # Background — on a previous CI run the iscc invocation failed with:
+  #   "You may not specify more than one script filename."
+  #
+  # Root cause: Git Bash on windows-2022 runs under the MSYS2 runtime,
+  # which by default rewrites argv entries that look like POSIX paths
+  # before handing them to a native Win32 executable. When it sees our
+  # /D defines carrying Windows-style values like
+  #   /DArtifactDir=D:\a\stickytodo\stickytodo\dist\win-client\...
+  # MSYS2's heuristic (wrongly) treats the leading `/D` as the root-level
+  # `/D` directory, prepends the Git install prefix, and mangles the
+  # entire argument into something like
+  #   C:/Program Files/Git/DArtifactDir=D:/a/stickytodo/...
+  # iscc then parses that blob as an .iss filename and, because we also
+  # pass the real setup.iss as the last positional argument, it bails
+  # out with the "more than one script filename" error above.
+  #
+  # MSYS2_ARG_CONV_EXCL='*' tells the MSYS runtime to skip the heuristic
+  # entirely for this process, so the /D arguments reach iscc verbatim.
+  # We scope the export to just the iscc invocation so the rest of the
+  # script (which relies on POSIX path semantics) is unaffected.
+  MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 \
+    "$ISCC_BIN" \
+      "/DAppVersion=$VERSION" \
+      "/DArtifactDir=$(to_win "$OUT_DIR/$ARTIFACT_BASE")" \
+      "/DRepoRoot=$(to_win "$REPO_ROOT")" \
+      "/DOutputDir=$(to_win "$OUT_DIR")" \
+      "/DOutputBaseName=stickytodo-setup-$VERSION" \
+      "$(to_win "$INSTALLER_DIR/setup.iss")"
 
   INSTALLER_OUT="$OUT_DIR/stickytodo-setup-$VERSION.exe"
   if [[ ! -f "$INSTALLER_OUT" ]]; then
