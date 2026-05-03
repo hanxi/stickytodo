@@ -5,6 +5,19 @@
 #include "models/AuditLog.h"
 #include "models/Filter.h"
 
+// <windows.h> is required for the HWND typedef used by
+// SetUIThreadTarget(HWND) and the uiThreadTarget_ member. We could
+// forward-declare `struct HWND__; typedef HWND__* HWND;` to avoid
+// dragging the whole Win32 header into every translation unit that
+// includes us, but the project already globally defines
+// WIN32_LEAN_AND_MEAN + NOMINMAX (see CMakeLists.txt), so the
+// compile-time cost is bounded and we avoid the maintenance hazard
+// of a hand-rolled typedef drifting from the SDK's definition.
+//
+// Without this include, TUs like AppState.cpp that include HttpClient.h
+// before any Win32 header fail with C2061 / C3646 on the HWND tokens.
+#include <windows.h>
+
 #include <string>
 #include <vector>
 #include <functional>
