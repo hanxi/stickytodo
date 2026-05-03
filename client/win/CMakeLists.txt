@@ -150,9 +150,41 @@ target_link_libraries(stickytodo PRIVATE
 )
 
 # ---------- Manifest for DPI awareness ----------
+# We ship our own hand-authored application manifest (src/res/app.manifest,
+# pulled in via the `1 RT_MANIFEST "app.manifest"` line in src/res/app.rc)
+# because it carries three pieces of configuration that CMake's default
+# auto-generated manifest CANNOT express:
+#   (1) <dpiAwareness>PerMonitorV2</dpiAwareness>  — Win10 Creators+ opt-in
+#       for per-monitor v2 DPI virtualization (GetDpiForWindow, WM_DPICHANGED
+#       rescale on monitor moves, crisp DWrite at fractional scale factors).
+#   (2) <activeCodePage>UTF-8</activeCodePage>      — Win10 1903+ process
+#       ACP override so A-suffixed Win32 APIs interpret char* as UTF-8
+#       instead of the legacy system locale.
+#   (3) <Microsoft.Windows.Common-Controls v6>      — themed buttons /
+#       edit controls (subclassed in Controls.cpp; without v6 they'd render
+#       with the flat Win 3.x look).
+#
+# Problem: MSVC's link.exe + CMake-invoked mt.exe ALSO tries to inject its
+# own default manifest (resource id=1, type=RT_MANIFEST). Having two
+# RT_MANIFEST resources at id=1 causes cvtres to bail with:
+#   CVTRES : fatal error CVT1100: duplicate resource. type:MANIFEST, name:1
+#   LINK   : fatal error LNK1123: failure during conversion to COFF ...
+#
+# Fix: tell CMake to stop emitting its auto-manifest entirely. MSVC link
+# flag /MANIFEST:NO disables the injection; we also drop VS_DPI_AWARE
+# (a VS-generator-only property that would have triggered the same auto-
+# manifest path via vs_link_exe even with /MANIFEST:NO on Ninja) — the DPI
+# awareness declaration already lives in our .rc-embedded manifest.
 set_target_properties(stickytodo PROPERTIES
-    VS_DPI_AWARE "PerMonitor"
     WIN32_EXECUTABLE TRUE
+)
+target_link_options(stickytodo PRIVATE
+    # /MANIFEST:NO — suppress link.exe's default /manifest emission so the
+    # only RT_MANIFEST resource in the final PE is the one we embed via
+    # src/res/app.rc (`1 RT_MANIFEST "app.manifest"`). Without this flag
+    # MSVC 2022 + Ninja emits both and cvtres errors out with CVT1100
+    # duplicate-resource on the link step.
+    $<$<CXX_COMPILER_ID:MSVC>:/MANIFEST:NO>
 )
 
 # ---------- Tests (optional) ----------
