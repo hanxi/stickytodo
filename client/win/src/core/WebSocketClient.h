@@ -87,6 +87,16 @@ private:
     unsigned long SendAuthFrame(void* hWebSocket);
     std::string BuildWsUrl() const;
 
+    // Guards baseUrl_ / token_ / onSignal_ / onEvent_ against concurrent
+    // access between the UI thread (which calls Set* during login / logout
+    // / callback registration) and the worker thread (which reads them from
+    // ConnectOnce / SendAuthFrame / ReceiveLoop). Must be declared BEFORE
+    // the members it protects so that those members are destroyed first
+    // during ~WebSocketClient (C++ destroys in reverse declaration order),
+    // and must be declared BEFORE workerThread_ so Disconnect()'s join
+    // happens before the mutex goes away.
+    mutable std::mutex mutex_;
+
     std::string baseUrl_;
     std::string token_;
     SignalCallback onSignal_;
