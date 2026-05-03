@@ -139,7 +139,20 @@ cd "$CLIENT_DIR"
 cmake --preset release
 
 echo "==> [2/5] build (release preset)"
-cmake --build --preset release --config Release
+# -j 1 forces a SERIAL build — intentionally slow, intentionally noisy. In a
+# previous CI run the output showed "[2/20]..[6/20] Building..." with zero
+# `FAILED:` lines and then "ninja: build stopped: subcommand failed", meaning
+# the real cl.exe error text got interleaved with surviving jobs' stdout and
+# swallowed by the GitHub Actions log streamer before it could flush. Serial
+# build eliminates the interleave: whichever TU fails is the last thing on
+# screen, so `error C2xxx:` lines are guaranteed to land in the log. The
+# wall-clock cost is ~45 s on windows-2022 (20 TUs, each ~2 s of cl.exe
+# time) — well worth it in exchange for debuggable failures. If / when the
+# Win build is stable, drop -j 1 to let ninja parallelise again.
+# --verbose echoes the full cl.exe command line for every TU, which is
+# priceless when triaging "works locally, fails in CI" discrepancies caused
+# by missing -D, missing /I, or MSVC vs vcpkg CRT model mismatches.
+cmake --build --preset release --config Release -j 1 --verbose
 
 EXE_PATH="$CLIENT_DIR/build/release/stickytodo.exe"
 if [[ ! -f "$EXE_PATH" ]]; then

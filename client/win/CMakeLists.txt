@@ -37,7 +37,43 @@ endif()
 # <windows.h>'s min/max macros from clobbering std::min/std::max in headers
 # we include later; WIN32_LEAN_AND_MEAN trims seldom-used subsystems from
 # <windows.h> for faster compiles and fewer macro collisions.
-add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+#
+# _WIN32_WINNT=0x0A00 / WINVER=0x0A00 pin the API surface to Windows 10 RTM
+# or later. We specifically need the per-monitor v2 DPI API surface
+# (`SetProcessDpiAwarenessContext`, `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`
+# in main.cpp) which the SDK only exposes when _WIN32_WINNT ≥ 0x0605 AND
+# NTDDI_VERSION ≥ NTDDI_WIN10_RS2 (0x0A000003, Creators Update). Setting
+# _WIN32_WINNT=0x0A00 also unblocks the newer WinHTTP WebSocket APIs
+# (WinHttpWebSocketCompleteUpgrade etc. in WebSocketClient.cpp). Without
+# these defines, MSVC would expand those identifiers to "undeclared" and
+# emit C2065 — exactly the kind of error we'd lose to log truncation in CI.
+#
+# _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING: CredentialStore.cpp
+# transitively pulls in <codecvt> (legacy, pre-C++17 wide string helper).
+# MSVC stdlib emits a hard deprecation message unless this macro is set;
+# under /W3 it's a warning not an error, but keeping the TU quiet is both
+# a stability thing (future MSVC may escalate) and a "keep the CI log
+# signal-to-noise high" thing — we've seen the real compile error hide
+# behind pages of deprecation chatter before.
+add_compile_definitions(
+    UNICODE _UNICODE
+    NOMINMAX WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00
+    WINVER=0x0A00
+    NTDDI_VERSION=0x0A000006   # NTDDI_WIN10_19H1 — covers 20H1/21H2/Win11
+    _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+    _CRT_SECURE_NO_WARNINGS    # suppress strncpy / sprintf deprecation
+)
+
+# Force verbose ninja output in CI-style builds: when anything fails, we
+# want the full cl.exe command line and stderr to land in the log BEFORE
+# ninja kills sibling compile jobs. Without this the "ninja: build stopped:
+# subcommand failed" line can show up before the offending TU's stderr has
+# flushed through the GitHub Actions log streamer (we observed exactly
+# this symptom on commit where [1/20] was missing from the log entirely).
+# CMAKE_VERBOSE_MAKEFILE is cheap — it only adds a few KB to the log — and
+# pays for itself the first time a real error shows up.
+set(CMAKE_VERBOSE_MAKEFILE ON)
 
 # ---------- vcpkg dependencies ----------
 find_package(nlohmann_json CONFIG REQUIRED)

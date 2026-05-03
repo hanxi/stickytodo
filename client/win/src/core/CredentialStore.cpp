@@ -3,8 +3,15 @@
 #include <windows.h>
 #include <wincred.h>
 #include <nlohmann/json.hpp>
-#include <codecvt>
-#include <locale>
+
+// advapi32.lib already linked via CMakeLists target_link_libraries — the
+// #pragma comment is redundant under that build but harmless (and kept as
+// a belt-and-braces hint for anyone opening this TU in a standalone VS
+// project). We explicitly do NOT pull in <codecvt> / <locale> even though
+// an earlier revision did: all wide ↔ UTF-8 conversion goes through the
+// MultiByteToWideChar / WideCharToMultiByte pair below, which is faster,
+// more correct (preserves surrogate pairs), and doesn't drag in a
+// deprecated standard header.
 
 #pragma comment(lib, "advapi32.lib")
 
