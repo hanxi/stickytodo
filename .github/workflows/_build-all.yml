@@ -245,6 +245,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Activate the MSVC x64 dev environment BEFORE anything else reads PATH.
+      # Rationale: windows-2022 runners have *both* MSVC 2022 at the standard
+      # Visual Studio install path *and* a mingw64 g++ pre-installed at
+      # C:\mingw64\bin that sits early in PATH. Without this step CMake's
+      # compiler auto-detection picks up mingw first (we observed
+      # "-- The CXX compiler identification is GNU 14.2.0" in a prior CI
+      # run), which then fails two ways:
+      #   (a) vcpkg's x64-windows triplet builds nlohmann_json.lib with MSVC
+      #       ABI; linking it with mingw is guaranteed-incompatible.
+      #   (b) mingw's <windows.h> keys UNICODE/_UNICODE off the macro being
+      #       defined — CMake's default cmdline doesn't set them, so
+      #       IDC_ARROW / IDI_APPLICATION expand to narrow-string literals
+      #       that LoadCursorW / LoadIconW reject (observed cl- and mingw-
+      #       only regressions in StickyWindow.cpp / TrayIcon.cpp).
+      # ilammy/msvc-dev-cmd calls `vcvarsall.bat x64` and exports INCLUDE /
+      # LIB / PATH so `cl` is first on PATH for the rest of the job.
+      - name: Activate MSVC x64 dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install Inno Setup (if missing)
         shell: pwsh
         run: |
