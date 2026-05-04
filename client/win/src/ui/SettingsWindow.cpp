@@ -9,6 +9,31 @@
 
 namespace stickytodo::ui {
 
+namespace {
+
+// Convert a UTF-16 wstring (as stored in Controls::TextBox::text) to UTF-8.
+// Constructing std::string directly from wide iterators (the naive
+// `std::string s(ws.begin(), ws.end())` pattern) silently truncates each
+// wchar_t to char, which MSVC flags as C4244 and corrupts any non-ASCII
+// input. All wstring→string conversions at the HTTP boundary must go
+// through this helper.
+std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return {};
+    int needed = WideCharToMultiByte(
+        CP_UTF8, 0,
+        wide.c_str(), static_cast<int>(wide.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(
+        CP_UTF8, 0,
+        wide.c_str(), static_cast<int>(wide.size()),
+        out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+} // namespace
+
 bool SettingsWindow::classRegistered_ = false;
 
 SettingsWindow::SettingsWindow(HINSTANCE hInstance)
@@ -653,7 +678,11 @@ void SettingsWindow::DrawAboutTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, flo
 void SettingsWindow::DoTestConnection() {
     if (testInFlight_) return;
 
-    std::string url(urlInput_.text.begin(), urlInput_.text.end());
+    // urlInput_.text is std::wstring (UTF-16). Convert via the
+    // WideToUtf8 helper instead of the naive `std::string(ws.begin(),
+    // ws.end())` pattern, which triggers MSVC C4244 and corrupts
+    // non-ASCII bytes.
+    std::string url = WideToUtf8(urlInput_.text);
     if (url.empty()) {
         connectionStatus_ = L"Please enter a URL";
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -690,9 +719,12 @@ void SettingsWindow::DoTestConnection() {
 void SettingsWindow::DoLogin() {
     if (loginInFlight_) return;
 
-    std::string url(urlInput_.text.begin(), urlInput_.text.end());
-    std::string username(usernameInput_.text.begin(), usernameInput_.text.end());
-    std::string password(passwordInput_.text.begin(), passwordInput_.text.end());
+    // Same UTF-16 → UTF-8 rule as DoTestConnection above — go through
+    // WideToUtf8 so password fields with non-ASCII chars survive the
+    // boundary intact (and no C4244 warning).
+    std::string url      = WideToUtf8(urlInput_.text);
+    std::string username = WideToUtf8(usernameInput_.text);
+    std::string password = WideToUtf8(passwordInput_.text);
 
     if (url.empty() || username.empty() || password.empty()) {
         connectionStatus_ = L"Please fill all fields";

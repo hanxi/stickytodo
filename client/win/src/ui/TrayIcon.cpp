@@ -78,16 +78,21 @@ bool TrayIcon::Create() {
         IMAGE_ICON, cxSmall, cySmall,
         LR_DEFAULTCOLOR | LR_SHARED));
     if (!nid_.hIcon) {
-        // Fallback to system icon if our resource fails to load.
-        // Also LR_SHARED so Destroy() treats both paths identically.
-        nid_.hIcon = static_cast<HICON>(LoadImageW(
-            nullptr, MAKEINTRESOURCEW(OIC_SAMPLE),
-            IMAGE_ICON, cxSmall, cySmall,
-            LR_DEFAULTCOLOR | LR_SHARED));
+        // Fallback: load the generic application icon via LoadIconW.
+        // We deliberately DON'T use LoadImageW(nullptr, OIC_SAMPLE, ...)
+        // here because the OIC_* constants are only exposed when the
+        // TU defines OEMRESOURCE before <windows.h> — and flipping
+        // that flag globally would pull in a large set of legacy
+        // GDI/OEM symbols we don't want. LoadIconW always returns a
+        // system-shared HICON (no DestroyIcon needed), so it matches
+        // the LR_SHARED semantics of the primary path above — the
+        // Destroy() path below handles both uniformly.
+        nid_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     }
-    // Track whether we own the HICON's lifetime. With LR_SHARED the
-    // system manages it; if both LoadImageW calls fail we end up with
-    // a null icon, and Destroy() has nothing to clean up either way.
+    // Icon lifetime: both branches above yield a system-shared HICON,
+    // so Destroy() must NOT call DestroyIcon — it just nulls the
+    // handle. If both loads fail we end up with a null icon and
+    // Shell_NotifyIconW(NIM_ADD) below will reject the payload.
     StringCchCopyW(nid_.szTip, ARRAYSIZE(nid_.szTip), L"StickyTodo");
     nid_.uVersion = NOTIFYICON_VERSION_4;
 
