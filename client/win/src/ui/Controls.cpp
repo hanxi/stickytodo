@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>   // iswspace — used for Ctrl+Left/Right word jump
+#include <cstring>   // memcpy — used for clipboard GlobalLock copy
 
 namespace stickytodo::ui {
 
@@ -93,6 +95,77 @@ std::wstring TextBox::GetDisplayText() const {
     return text;
 }
 
+namespace {
+
+// Selection-related local helpers. These are TU-local so TextBox's
+// public surface stays focused on the state machine.
+
+// Build a IDWriteTextFormat identical to the one Draw / HitTestCharIndex
+// use. Factoring it out keeps font metrics perfectly consistent across
+// all three code paths (draw, caret positioning, selection hit-test);
+// if any one of them used a different font / size, clicks would land
+// on the wrong character.
+IDWriteTextFormat* MakeTextBoxFormat(IDWriteFactory* dw, float dpi) {
+    IDWriteTextFormat* format = nullptr;
+    dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR,
+                          DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                          Theme::kFontSizeBody * dpi, L"en-us", &format);
+    if (format) {
+        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+    return format;
+}
+
+} // namespace
+
+int TextBox::HitTestCharIndex(float mx, float dpi, IDWriteFactory* dw) const {
+    // `mx` is the window-client-space X (physical pixels, PerMonitorV2).
+    // We need the character index inside `displayText` that corresponds
+    // to the same pixel column that Draw would render.
+    //
+    // Steps:
+    //   1. Subtract rect.x + kTextInset to get layout-local X.
+    //   2. Build a TextLayout at the same font / size Draw uses.
+    //   3. DWrite's HitTestPoint returns the char index + a trailing
+    //      flag (before/after the midpoint of the char). We snap to
+    //      the nearest boundary so clicking on the right half of a
+    //      char places the caret AFTER it — matches the standard
+    //      OS-wide text input behavior.
+    const float kTextInset = 8.0f * dpi;
+    std::wstring displayText = GetDisplayText();
+    if (displayText.empty() || !dw) return 0;
+
+    IDWriteTextFormat* format = MakeTextBoxFormat(dw, dpi);
+    if (!format) return 0;
+
+    float layoutWidth = rect.width - 2.0f * kTextInset;
+    float layoutHeight = rect.height;
+    IDWriteTextLayout* layout = nullptr;
+    dw->CreateTextLayout(displayText.c_str(),
+                         static_cast<UINT32>(displayText.size()),
+                         format, layoutWidth, layoutHeight, &layout);
+    format->Release();
+    if (!layout) return 0;
+
+    float localX = mx - (rect.x + kTextInset);
+    if (localX < 0.0f) { layout->Release(); return 0; }
+
+    BOOL isTrailing = FALSE, isInside = FALSE;
+    DWRITE_HIT_TEST_METRICS hm = {};
+    HRESULT hr = layout->HitTestPoint(localX, rect.height * 0.5f,
+                                      &isTrailing, &isInside, &hm);
+    layout->Release();
+    if (FAILED(hr)) return static_cast<int>(displayText.size());
+
+    int idx = static_cast<int>(hm.textPosition);
+    if (isTrailing) idx += 1;
+    if (idx < 0) idx = 0;
+    int maxIdx = static_cast<int>(displayText.size());
+    if (idx > maxIdx) idx = maxIdx;
+    return idx;
+}
+
 void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     // DPI-aware constants — 96-DPI baselines for this control's
     // chrome (corner radius, border stroke, horizontal text inset).
@@ -125,17 +198,81 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     const std::wstring& drawText = showPlaceholder ? placeholder : displayText;
     D2D1_COLOR_F textColor = showPlaceholder ? Theme::TextPlaceholder() : Theme::TextPrimary();
 
-    IDWriteTextFormat* format = nullptr;
-    dw->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_REGULAR,
-                          DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                          Theme::kFontSizeBody * dpi, L"en-us", &format);
+    IDWriteTextFormat* format = MakeTextBoxFormat(dw, dpi);
     if (format) {
-        format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
         D2D1_RECT_F textRect = rect.ToD2D();
         textRect.left += kTextInset;
         textRect.right -= kTextInset;
+
+        // ---- Selection highlight (drawn BEFORE the text so glyphs sit
+        // on top of the blue band, not behind it). We compute the pixel
+        // extents of [selStart, selEnd) via the same TextLayout that
+        // Draw uses for caret positioning, guaranteeing pixel-perfect
+        // alignment between what the user sees and what they've
+        // selected. Only rendered when focused+enabled+non-empty
+        // selection — hiding selection on blur matches the Win32 Edit
+        // control default (GWS_OWNERDRAW aside).
+        bool hasSelection = focused && enabled && !showPlaceholder &&
+                            selStart >= 0 && selEnd >= 0 &&
+                            selStart != selEnd;
+        if (hasSelection) {
+            int lo = std::min(selStart, selEnd);
+            int hi = std::max(selStart, selEnd);
+            int textLen = static_cast<int>(drawText.size());
+            lo = std::max(0, std::min(lo, textLen));
+            hi = std::max(0, std::min(hi, textLen));
+
+            IDWriteTextLayout* selLayout = nullptr;
+            float layoutWidth = textRect.right - textRect.left;
+            float layoutHeight = textRect.bottom - textRect.top;
+            dw->CreateTextLayout(drawText.c_str(),
+                                 static_cast<UINT32>(drawText.size()),
+                                 format, layoutWidth, layoutHeight, &selLayout);
+            if (selLayout) {
+                DWRITE_HIT_TEST_METRICS hmLo = {}, hmHi = {};
+                FLOAT xLo = 0, yLo = 0, xHi = 0, yHi = 0;
+                HRESULT hr1 = selLayout->HitTestTextPosition(
+                    static_cast<UINT32>(lo), FALSE, &xLo, &yLo, &hmLo);
+                HRESULT hr2 = selLayout->HitTestTextPosition(
+                    static_cast<UINT32>(hi), FALSE, &xHi, &yHi, &hmHi);
+                if (SUCCEEDED(hr1) && SUCCEEDED(hr2)) {
+                    float selLeft = textRect.left + xLo;
+                    float selRight = textRect.left + xHi;
+                    // Clamp to the visible text rect (so a selection
+                    // that extends past the right edge doesn't draw
+                    // over the input's border/rounded corner).
+                    if (selRight > textRect.right) selRight = textRect.right;
+                    if (selLeft < textRect.left) selLeft = textRect.left;
+                    if (selRight > selLeft) {
+                        // Use Theme::CheckboxFill (accent/brand blue)
+                        // with alpha 0.30 — matches the "subtle-but-
+                        // visible" density of Edit control selection
+                        // on Win11, and reads well on both light and
+                        // dark backgrounds. We reuse CheckboxFill
+                        // rather than adding a new theme entry because
+                        // the selection highlight and the checkbox
+                        // fill serve the same "active affordance"
+                        // role visually.
+                        D2D1_COLOR_F selColor = Theme::CheckboxFill();
+                        selColor.a = 0.30f;
+                        ID2D1SolidColorBrush* selBrush = nullptr;
+                        rt->CreateSolidColorBrush(selColor, &selBrush);
+                        if (selBrush) {
+                            // Vertical extent: full text rect height,
+                            // inset by 2 px * dpi top/bottom so the
+                            // band doesn't touch the control border.
+                            float inset = 2.0f * dpi;
+                            D2D1_RECT_F selRect = D2D1::RectF(
+                                selLeft, textRect.top + inset,
+                                selRight, textRect.bottom - inset);
+                            rt->FillRectangle(selRect, selBrush);
+                            selBrush->Release();
+                        }
+                    }
+                }
+                selLayout->Release();
+            }
+        }
 
         ID2D1SolidColorBrush* textBrush = nullptr;
         rt->CreateSolidColorBrush(textColor, &textBrush);
@@ -248,32 +385,177 @@ void TextBox::Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const {
     }
 }
 
-bool TextBox::HandleMouse(UINT msg, float mx, float my) {
+bool TextBox::HandleMouse(UINT msg, float mx, float my, float dpi,
+                          IDWriteFactory* dw) {
     if (!enabled) return false;
-    if (msg == WM_LBUTTONDOWN) {
-        bool inside = rect.Contains(mx, my);
-        SetFocus(inside);
-        return inside;
+
+    switch (msg) {
+        case WM_LBUTTONDOWN: {
+            bool inside = rect.Contains(mx, my);
+            SetFocus(inside);
+            if (!inside) {
+                // Click outside: focus loss already clears selection
+                // in SetFocus(false); ensure drag flag is also reset
+                // in case a previous LBUTTONUP was missed (can happen
+                // if the host window doesn't forward mouse-release).
+                draggingSelection = false;
+                return false;
+            }
+            // Click inside: place caret at the nearest char boundary
+            // and START a drag-selection. Shift+Click extends the
+            // current selection instead of resetting it (matches
+            // Win32 Edit / NSTextField).
+            int idx = HitTestCharIndex(mx, dpi, dw);
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (shift) {
+                // Extend existing selection (or start one from the
+                // current cursor) to the click point.
+                if (selStart < 0) selStart = cursorPos;
+                selEnd = idx;
+                cursorPos = idx;
+            } else {
+                cursorPos = idx;
+                selStart = idx;
+                selEnd = idx;
+            }
+            draggingSelection = true;
+            return true;
+        }
+        case WM_MOUSEMOVE: {
+            if (!draggingSelection) return false;
+            // Live-extend the selection. Host window MUST have called
+            // SetCapture on LBUTTONDOWN so we still see these messages
+            // even when the cursor leaves `rect` — that's why we do
+            // NOT gate on rect.Contains here.
+            int idx = HitTestCharIndex(mx, dpi, dw);
+            selEnd = idx;
+            cursorPos = idx;
+            return true;
+        }
+        case WM_LBUTTONUP: {
+            if (!draggingSelection) return false;
+            draggingSelection = false;
+            // If the drag didn't move (selStart == selEnd), clear the
+            // selection markers so the caret-only state shows a plain
+            // cursor instead of a zero-width highlight.
+            if (selStart == selEnd) {
+                selStart = selEnd = -1;
+            }
+            return true;
+        }
+        default:
+            return false;
     }
-    return false;
 }
+
+namespace {
+
+// Clipboard helpers — kept TU-local because they're only needed here.
+// OpenClipboard(nullptr) is explicitly allowed by MSDN ("If this
+// parameter is NULL, the open clipboard is associated with the current
+// task"), so we don't need the owning HWND threaded through.
+
+bool CopyToClipboard(const std::wstring& w) {
+    if (!OpenClipboard(nullptr)) return false;
+    EmptyClipboard();
+    // SetClipboardData takes ownership of the HGLOBAL on success, so
+    // the GlobalFree only runs on the failure path.
+    size_t bytes = (w.size() + 1) * sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    bool ok = false;
+    if (h) {
+        if (void* p = GlobalLock(h)) {
+            memcpy(p, w.c_str(), bytes);
+            GlobalUnlock(h);
+            ok = (SetClipboardData(CF_UNICODETEXT, h) != nullptr);
+        }
+        if (!ok) GlobalFree(h);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+std::wstring PasteFromClipboard() {
+    if (!OpenClipboard(nullptr)) return {};
+    std::wstring out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+            out.assign(p);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+    // Strip control chars (newlines, tabs) — TextBox is single-line,
+    // and pasting a multi-line clip into a single-line input should
+    // behave like every other native Win32 Edit: keep only the first
+    // line / printable chars.
+    std::wstring filtered;
+    filtered.reserve(out.size());
+    for (wchar_t ch : out) {
+        if (ch == L'\r' || ch == L'\n') break;
+        if (ch >= 32 || ch == L'\t') filtered.push_back(ch);
+    }
+    return filtered;
+}
+
+} // namespace
 
 bool TextBox::HandleKey(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
     if (!focused || !enabled) return false;
     if (msg != WM_KEYDOWN) return false;
 
+    bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+    // Helper: before moving the caret, anchor selStart at the current
+    // cursor if shift is held and there's no active anchor yet; if
+    // shift is NOT held, collapse any existing selection.
+    auto beginMove = [&]() {
+        if (shift) {
+            if (selStart < 0) selStart = cursorPos;
+        } else {
+            selStart = selEnd = -1;
+        }
+    };
+    auto endMove = [&]() {
+        if (shift) {
+            selEnd = cursorPos;
+        }
+    };
+
     switch (wParam) {
         case VK_LEFT:
-            if (cursorPos > 0) cursorPos--;
+            beginMove();
+            if (ctrl) {
+                // Ctrl+Left: jump to previous word boundary (skip
+                // trailing whitespace, then skip the word itself).
+                while (cursorPos > 0 && iswspace(text[cursorPos - 1])) cursorPos--;
+                while (cursorPos > 0 && !iswspace(text[cursorPos - 1])) cursorPos--;
+            } else if (cursorPos > 0) {
+                cursorPos--;
+            }
+            endMove();
             return true;
         case VK_RIGHT:
-            if (cursorPos < static_cast<int>(text.size())) cursorPos++;
+            beginMove();
+            if (ctrl) {
+                int n = static_cast<int>(text.size());
+                while (cursorPos < n && !iswspace(text[cursorPos])) cursorPos++;
+                while (cursorPos < n && iswspace(text[cursorPos])) cursorPos++;
+            } else if (cursorPos < static_cast<int>(text.size())) {
+                cursorPos++;
+            }
+            endMove();
             return true;
         case VK_HOME:
+            beginMove();
             cursorPos = 0;
+            endMove();
             return true;
         case VK_END:
+            beginMove();
             cursorPos = static_cast<int>(text.size());
+            endMove();
             return true;
         case VK_BACK:
             if (selStart >= 0 && selStart != selEnd) {
@@ -296,10 +578,53 @@ bool TextBox::HandleKey(UINT msg, WPARAM wParam, LPARAM /*lParam*/) {
             if (onSubmit) onSubmit();
             return true;
         case 'A':
-            if (GetKeyState(VK_CONTROL) & 0x8000) {
+            if (ctrl) {
+                int n = static_cast<int>(text.size());
+                if (n == 0) return true;
                 selStart = 0;
-                selEnd = static_cast<int>(text.size());
-                cursorPos = selEnd;
+                selEnd = n;
+                cursorPos = n;
+                return true;
+            }
+            return false;
+        case 'C':
+            if (ctrl) {
+                // Password fields: refuse to copy masked chars to
+                // the clipboard. Returning true still swallows the
+                // accelerator so nothing else processes Ctrl+C.
+                if (isPassword) return true;
+                if (selStart >= 0 && selStart != selEnd) {
+                    int lo = std::min(selStart, selEnd);
+                    int hi = std::max(selStart, selEnd);
+                    CopyToClipboard(text.substr(lo, hi - lo));
+                }
+                return true;
+            }
+            return false;
+        case 'X':
+            if (ctrl) {
+                if (isPassword) return true;
+                if (selStart >= 0 && selStart != selEnd) {
+                    int lo = std::min(selStart, selEnd);
+                    int hi = std::max(selStart, selEnd);
+                    CopyToClipboard(text.substr(lo, hi - lo));
+                    DeleteSelection();
+                    if (onChanged) onChanged(text);
+                }
+                return true;
+            }
+            return false;
+        case 'V':
+            if (ctrl) {
+                std::wstring pasted = PasteFromClipboard();
+                if (pasted.empty()) return true;
+                if (selStart >= 0 && selStart != selEnd) {
+                    DeleteSelection();
+                }
+                text.insert(cursorPos, pasted);
+                cursorPos += static_cast<int>(pasted.size());
+                selStart = selEnd = -1;
+                if (onChanged) onChanged(text);
                 return true;
             }
             return false;

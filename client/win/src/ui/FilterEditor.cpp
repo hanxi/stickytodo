@@ -625,8 +625,15 @@ void OnMouseMove(Impl* impl, int x, int y) {
     for (int i = 0; i < 3; ++i) {
         impl->statusSegments_[i].HandleMouse(WM_MOUSEMOVE, fx, fy);
     }
-    impl->tagBox_.HandleMouse(WM_MOUSEMOVE, fx, fy);
-    impl->keywordBox_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    // TextBox drag-selection: needs dpi + DWrite factory for character
+    // hit-testing. Host has already called SetCapture on LBUTTONDOWN so
+    // MOUSEMOVE keeps flowing even when the cursor leaves the input rect.
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    float dpi = D2DRenderer::GetDpiScale(impl->hwnd);
+    impl->tagBox_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
+    impl->keywordBox_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
     impl->includeDeletedBox_.HandleMouse(WM_MOUSEMOVE, fx, fy);
     impl->onlyDeletedBox_.HandleMouse(WM_MOUSEMOVE, fx, fy);
     impl->pageSizeMinus_.HandleMouse(WM_MOUSEMOVE, fx, fy);
@@ -664,8 +671,20 @@ void OnLButtonDown(Impl* impl, int x, int y) {
     for (int i = 0; i < 3; ++i) {
         impl->statusSegments_[i].HandleMouse(WM_LBUTTONDOWN, fx, fy);
     }
-    impl->tagBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
-    impl->keywordBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
+    // TextBox hit/drag-start: grab SetCapture iff the click actually
+    // landed on a TextBox, so subsequent MOUSEMOVE / LBUTTONUP reach
+    // HandleMouse even if the cursor leaves the input rect during the
+    // drag. ReleaseCapture is in OnLButtonUp below.
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    float dpi = D2DRenderer::GetDpiScale(impl->hwnd);
+    bool gotTextHit =
+        impl->tagBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
+        impl->keywordBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw);
+    if (gotTextHit) {
+        SetCapture(impl->hwnd);
+    }
     impl->includeDeletedBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     impl->onlyDeletedBox_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     impl->pageSizeMinus_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
@@ -690,8 +709,14 @@ void OnLButtonUp(Impl* impl, int x, int y) {
         impl->statusSegments_[i].HandleMouse(WM_LBUTTONUP, fx, fy);
     }
     if (!IsWindow(impl->hwnd)) return;
-    impl->tagBox_.HandleMouse(WM_LBUTTONUP, fx, fy);
-    impl->keywordBox_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    // End any TextBox drag-selection and release the mouse capture.
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    float dpi = D2DRenderer::GetDpiScale(impl->hwnd);
+    impl->tagBox_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    impl->keywordBox_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    if (GetCapture() == impl->hwnd) ReleaseCapture();
     impl->includeDeletedBox_.HandleMouse(WM_LBUTTONUP, fx, fy);
     impl->onlyDeletedBox_.HandleMouse(WM_LBUTTONUP, fx, fy);
     impl->pageSizeMinus_.HandleMouse(WM_LBUTTONUP, fx, fy);

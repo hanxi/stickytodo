@@ -195,6 +195,18 @@ void SettingsWindow::OnMouseMove(int x, int y) {
     testButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
     loginButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
     logoutButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
+    // TextBox drag-selection: forward MOUSEMOVE so the live rubberband
+    // inside each input extends as the user drags (HandleMouse gates
+    // this on `draggingSelection`, so it's a no-op when no drag is in
+    // progress). Host has called SetCapture on LBUTTONDOWN so these
+    // events keep arriving even when the cursor leaves the input rect.
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
+    urlInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
+    usernameInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
+    passwordInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
     // CheckBox hover repaint (fills `hovered` flag — currently only used by
     // the checkbox's own render, but keeping the dispatch consistent with the
     // other controls makes future visual feedback trivial to add).
@@ -228,10 +240,22 @@ void SettingsWindow::OnLButtonDown(int x, int y) {
         return;
     }
 
-    // Forward to controls
-    urlInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
-    usernameInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
-    passwordInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
+    // Forward to controls. TextBox now does click-to-place-caret +
+    // drag-selection-start on LBUTTONDOWN, so it needs dpi + DWrite
+    // factory for character hit-testing. Grab SetCapture so that
+    // subsequent MOUSEMOVE / LBUTTONUP keep flowing even when the
+    // cursor leaves the input rect (otherwise the drag-selection
+    // rubberband would freeze the moment the cursor left the box).
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    bool gotTextHit =
+        urlInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
+        usernameInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
+        passwordInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw);
+    if (gotTextHit) {
+        SetCapture(hwnd_);
+    }
     testButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     loginButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     logoutButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
@@ -246,6 +270,17 @@ void SettingsWindow::OnLButtonDown(int x, int y) {
 void SettingsWindow::OnLButtonUp(int x, int y) {
     float fx = static_cast<float>(x);
     float fy = static_cast<float>(y);
+    // TextBox first: end the drag-selection if one was in progress.
+    // ReleaseCapture is safe to call unconditionally — it's a no-op
+    // when we don't currently hold capture.
+    auto* app = GetApp();
+    IDWriteFactory* dw = (app && app->GetRenderer())
+        ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+    float dpi = D2DRenderer::GetDpiScale(hwnd_);
+    urlInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    usernameInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    passwordInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    if (GetCapture() == hwnd_) ReleaseCapture();
     testButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     loginButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     logoutButton_.HandleMouse(WM_LBUTTONUP, fx, fy);

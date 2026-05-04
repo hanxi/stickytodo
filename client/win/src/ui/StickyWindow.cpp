@@ -1081,6 +1081,27 @@ void StickyWindow::OnMouseMove(int x, int y) {
     // Scrollbar drag
     scrollView_.HandleMouse(WM_MOUSEMOVE, fx, fy);
 
+    // TextBox drag-selection: route MOUSEMOVE to draftBox_ / editBox_
+    // using *content-space* coordinates (the boxes' rect.y was set
+    // inside ScrollView::BeginContent's translated transform). Only
+    // the actively-drafting / actively-editing box gates on
+    // `draggingSelection` internally, so forwarding to both is a
+    // cheap no-op when no drag is in progress.
+    {
+        auto* app = GetApp();
+        IDWriteFactory* dw = (app && app->GetRenderer())
+            ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+        float contentFy = fy + scrollView_.scrollOffset;
+        if (drafting_) {
+            draftBox_.HandleMouse(WM_MOUSEMOVE, fx, contentFy,
+                                  D2DRenderer::GetDpiScale(hwnd_), dw);
+        }
+        if (editingRowIndex_ >= 0) {
+            editBox_.HandleMouse(WM_MOUSEMOVE, fx, contentFy,
+                                 D2DRenderer::GetDpiScale(hwnd_), dw);
+        }
+    }
+
     // Row hover — translate client y into content coords by adding scrollOffset.
     // titleBarHeight_ / FilterBarHeight() already return physical pixels;
     // pass the current DPI to HitTestRow so it scales the internal
@@ -1164,14 +1185,26 @@ void StickyWindow::OnLButtonDown(int x, int y) {
 
     if (fy >= listTop && fy < listBottom) {
         float contentFy = fy + scrollView_.scrollOffset;
-        if (drafting_ && draftBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy)) {
+        // TextBox HandleMouse now takes dpi + DWrite factory for
+        // character hit-testing (click places caret precisely, drag
+        // selects). Grab SetCapture on a TextBox hit so MOUSEMOVE /
+        // LBUTTONUP keep flowing even when the cursor leaves the
+        // input rect during a selection drag — released in
+        // OnLButtonUp below.
+        auto* app = GetApp();
+        IDWriteFactory* dw = (app && app->GetRenderer())
+            ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+        float dpiNow = D2DRenderer::GetDpiScale(hwnd_);
+        if (drafting_ && draftBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy, dpiNow, dw)) {
             if (editingRowIndex_ >= 0) CancelTitleEdit();
             SetFocus(hwnd_);
+            SetCapture(hwnd_);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return;
         }
-        if (editingRowIndex_ >= 0 && editBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy)) {
+        if (editingRowIndex_ >= 0 && editBox_.HandleMouse(WM_LBUTTONDOWN, fx, contentFy, dpiNow, dw)) {
             SetFocus(hwnd_);
+            SetCapture(hwnd_);
             InvalidateRect(hwnd_, nullptr, FALSE);
             return;
         }
@@ -1249,6 +1282,25 @@ void StickyWindow::OnLButtonUp(int x, int y) {
     }
     filterButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     scrollView_.HandleMouse(WM_LBUTTONUP, fx, fy);
+
+    // End any in-flight TextBox drag-selection and release capture.
+    // Use content-space coords (rect.y was set inside ScrollView's
+    // translated transform). ReleaseCapture is a no-op if we don't
+    // currently hold it, so calling unconditionally is safe.
+    {
+        auto* app = GetApp();
+        IDWriteFactory* dw = (app && app->GetRenderer())
+            ? app->GetRenderer()->GetDWriteFactory() : nullptr;
+        float contentFy = fy + scrollView_.scrollOffset;
+        float dpiNow = D2DRenderer::GetDpiScale(hwnd_);
+        if (drafting_) {
+            draftBox_.HandleMouse(WM_LBUTTONUP, fx, contentFy, dpiNow, dw);
+        }
+        if (editingRowIndex_ >= 0) {
+            editBox_.HandleMouse(WM_LBUTTONUP, fx, contentFy, dpiNow, dw);
+        }
+        if (GetCapture() == hwnd_) ReleaseCapture();
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 

@@ -53,6 +53,26 @@ struct Button {
 };
 
 /// Single-line text input control with cursor, selection, and clipboard support.
+///
+/// Selection / clipboard contract:
+///   - Mouse: LBUTTONDOWN places the caret (or anchors a drag selection);
+///     MOUSEMOVE with draggingSelection_=true extends selEnd; LBUTTONUP
+///     ends the drag. The host window MUST forward WM_MOUSEMOVE and
+///     WM_LBUTTONUP to TextBox::HandleMouse and call SetCapture on
+///     LBUTTONDOWN / ReleaseCapture on LBUTTONUP so the drag keeps
+///     working when the cursor leaves the box.
+///   - Keyboard: Shift+arrows/Home/End extend selection. Ctrl+A selects
+///     all. Ctrl+C/X/V use CF_UNICODETEXT on the shared clipboard
+///     (OpenClipboard(nullptr) is fine — MSDN allows a null hwnd to
+///     associate with the current task).
+///   - isPassword=true short-circuits Ctrl+C/X so masked characters
+///     never leave the process.
+///
+/// HandleMouse / HandleKey now need `dpi` and `IDWriteFactory*` because
+/// accurate character hit-testing uses DirectWrite's HitTestPoint at the
+/// same DPI-scaled font size as Draw. Host windows already have both
+/// (OnPaint passes them around), so threading them into the event
+/// handlers is a mechanical change at the call sites.
 struct TextBox {
     ControlRect rect;
     std::wstring text;
@@ -63,11 +83,15 @@ struct TextBox {
     int cursorPos = 0;
     int selStart = -1;
     int selEnd = -1;
+    // Active-drag flag: set on LBUTTONDOWN inside the text area, cleared
+    // on LBUTTONUP. While true, MOUSEMOVE updates selEnd so the user
+    // sees a live selection rubberband (matches Win32 Edit / NSTextField).
+    bool draggingSelection = false;
     std::function<void(const std::wstring&)> onChanged;
     std::function<void()> onSubmit; // Enter key
 
     void Draw(ID2D1RenderTarget* rt, IDWriteFactory* dw, float dpi) const;
-    bool HandleMouse(UINT msg, float mx, float my);
+    bool HandleMouse(UINT msg, float mx, float my, float dpi, IDWriteFactory* dw);
     bool HandleKey(UINT msg, WPARAM wParam, LPARAM lParam);
     bool HandleChar(wchar_t ch);
     void SetFocus(bool f);
@@ -75,6 +99,10 @@ struct TextBox {
 private:
     void DeleteSelection();
     std::wstring GetDisplayText() const;
+    // Pixel X (relative to the render target / window client area) →
+    // char index in `text`. Used by HandleMouse for click-to-place-caret
+    // and drag selection. Returns a value in [0, text.size()].
+    int HitTestCharIndex(float mx, float dpi, IDWriteFactory* dw) const;
 };
 
 /// Checkbox control (square box + optional checkmark).

@@ -47,8 +47,29 @@ ID2D1HwndRenderTarget* D2DRenderer::CreateRenderTarget(HWND hwnd) {
         static_cast<UINT32>(rc.bottom - rc.top)
     );
 
-    // Use default DPI (96) — we handle DPI scaling in drawing code
-    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties();
+    // CRITICAL: force dpiX = dpiY = 96 so D2D treats every coordinate
+    // we hand it as **physical pixels, 1:1**. The default for
+    // D2D1::RenderTargetProperties() is dpiX = dpiY = 0, which means
+    // "use the desktop DPI" — i.e. D2D would itself multiply every
+    // coordinate by `desktopDpi/96`. Combined with our drawing code
+    // that already multiplies every rect / coordinate by
+    // `D2DRenderer::GetDpiScale(hwnd)` (see DrawSettingsTab,
+    // DrawTodoList, etc.), this would produce **double-scaling**
+    // (1.5 × 1.5 = 2.25× on a 125/150 % display): controls render
+    // larger than the window, text overflows, and hit-testing
+    // breaks because the Win32 WM_MOUSE* coordinates are raw
+    // physical pixels (PerMonitorV2) while the visible rects have
+    // been scaled a second time by D2D.
+    //
+    // Pinning the render target to 96 DPI makes the Win32
+    // coordinate space, the D2D drawing space, and our manual
+    // `× dpi` arithmetic all agree on one invariant: **everything
+    // is in physical pixels**. That's also the contract documented
+    // in AGENTS.md §4.3.x.
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        /*dpiX=*/96.0f, /*dpiY=*/96.0f);
     D2D1_HWND_RENDER_TARGET_PROPERTIES hwndProps = D2D1::HwndRenderTargetProperties(hwnd, size);
 
     ID2D1HwndRenderTarget* renderTarget = nullptr;
