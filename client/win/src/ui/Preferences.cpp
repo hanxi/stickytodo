@@ -51,7 +51,15 @@ void WriteDword(const wchar_t* valueName, bool flag) {
 // here (means "direct connection / no proxy"); missing key returns "" too,
 // so callers cannot distinguish "never set" from "explicitly empty" — that
 // is intentional: both should behave as "no proxy".
-std::wstring ReadString(const wchar_t* valueName) {
+//
+// IMPORTANT — naming: do NOT call these `ReadString` / `WriteString`. Both
+// names are macro-defined by `<windows.h>` (the A/W console & GDI families
+// expand `WriteString` → `WriteStringW` etc.), and the macro substitution
+// happens BEFORE C++ name lookup, so a same-named function gets its
+// signature silently rewritten and downstream `std::wstring` references in
+// the same parameter list start failing with bogus "ambiguous wstring"
+// errors. Prefix with `Reg` to dodge the macro entirely.
+std::wstring ReadRegString(const wchar_t* valueName) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRootKey, 0, KEY_READ, &key)
             != ERROR_SUCCESS) {
@@ -77,7 +85,7 @@ std::wstring ReadString(const wchar_t* valueName) {
     return buf;
 }
 
-void WriteString(const wchar_t* valueName, const std::wstring& value) {
+void WriteRegString(const wchar_t* valueName, const std::wstring& value) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kRootKey, 0, nullptr,
                         REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
@@ -111,11 +119,11 @@ void SetSkipStickyDeleteConfirm(bool skip) {
 }
 
 std::wstring GetHttpProxy() {
-    return ReadString(kValueHttpProxy);
+    return ReadRegString(kValueHttpProxy);
 }
 
 void SetHttpProxy(const std::wstring& value) {
-    WriteString(kValueHttpProxy, value);
+    WriteRegString(kValueHttpProxy, value);
 }
 
 } // namespace stickytodo::ui
