@@ -290,6 +290,15 @@ private:
 
     std::string baseUrl_;
     std::string token_;
+    /// HTTP proxy URL ("http://host[:port]"). Empty == no proxy (use
+    /// WINHTTP_ACCESS_TYPE_DEFAULT_PROXY). Read at the start of every
+    /// DoRequest; written via SetProxy. Plain non-atomic access is fine
+    /// because the sync Login/HealthCheck/etc are only ever called from
+    /// the worker thread that owns the HttpClient instance, and the
+    /// async path uses snapshot-then-detach (each worker constructs its
+    /// own local HttpClient via ConfigureAuthedLocal, so there is no
+    /// shared mutable state across threads).
+    std::string proxy_;
     UnauthorizedCallback onUnauthorized_;
 
     // One-shot UI-thread marshal target; see SetUIThreadTarget above.
