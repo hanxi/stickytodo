@@ -28,10 +28,8 @@ services:
       TODO_CORS_ORIGINS: ${TODO_CORS_ORIGINS:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      # NOTE: the distroless runtime runs as nonroot (uid=65532). The host
-      # ./data directory must therefore be writable by uid=65532, OR you can
-      # pre-create it with `mkdir -p data && chown -R 65532:65532 data`.
-      # Leaving it owned by the current user is fine on Docker Desktop for
-      # macOS/Windows because the file sharing layer translates ownership;
-      # on native Linux hosts you must set the uid explicitly.
+      # The container process runs as root (alpine runtime), so the host
+      # ./data directory does not need any pre-flight chown — it just works
+      # whether the operator is root or a regular user. The directory is
+      # auto-created by docker on first `up` if it does not yet exist.
       - ./data:/data

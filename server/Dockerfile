@@ -7,8 +7,13 @@
 #   - We need BOTH client/web/ (to build the web UI) and server/ (to embed it)
 #     inside the build context. Hence context = repo root.
 #   - Pure-Go SQLite driver (github.com/glebarez/sqlite) removes the CGO
-#     requirement, so we can cross-compile statically and target a distroless
-#     runtime image for minimal attack surface.
+#     requirement, so we can cross-compile statically into any minimal runtime.
+#   - Runtime is alpine (not distroless): the server runs as root by default,
+#     which removes the bind-mount uid headache on native Linux hosts — the
+#     `./data` directory bind-mounted from the host is writable by the
+#     container without any pre-flight `chown 65532` step. Trade-off: the
+#     in-container process is root; acceptable for a self-hosted single-tenant
+#     todo app where the threat model is "this box only runs my own code".
 #   - Multi-arch via buildx: TARGETOS / TARGETARCH / TARGETVARIANT are provided
 #     automatically by `docker buildx build --platform`.
 
@@ -32,11 +37,14 @@ RUN npm run build
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-builder
 
 # Pure-Go SQLite (no CGO). Produces fully static binaries portable across
-# alpine / distroless / scratch runtimes.
+# alpine / scratch runtimes.
 ENV CGO_ENABLED=0 \
     GOFLAGS=-trimpath
 
-RUN apk add --no-cache git ca-certificates tzdata
+# git + ca-certificates are needed by `go mod download` (HTTPS + VCS proto).
+# tzdata lives only in the runtime stage where the server actually reads
+# /usr/share/zoneinfo for the TZ env, so it is not installed here.
+RUN apk add --no-cache git ca-certificates
 
 WORKDIR /src
 
@@ -69,16 +77,14 @@ RUN set -eu; \
         -o /out/todo-server \
         ./cmd/todo-server
 
-# Pre-create /data with uid=65532 (distroless nonroot user) so the runtime
-# image has a writable data directory even when no host volume is mounted.
-# distroless/static has no shell, so we cannot `mkdir + chown` in the final
-# stage — must prepare the directory here and COPY it across.
-RUN mkdir -p /out/data && chown -R 65532:65532 /out/data
-
 # ---------- Stage 3: runtime ----------
-# distroless/static:nonroot — minimal image, non-root (uid 65532), ships
-# ca-certificates + tzdata + /etc/passwd. No shell, no package manager.
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+# alpine:3.20 — has a real shell + apk and runs as root by default.
+# ca-certificates + tzdata are installed explicitly: the static Go binary
+# still needs the CA bundle for outbound HTTPS and a zoneinfo database for
+# the TZ env (e.g. Asia/Shanghai).
+FROM alpine:3.20 AS runtime
+
+RUN apk add --no-cache ca-certificates tzdata
 
 ENV TODO_PORT=8080 \
     TODO_DATA_DIR=/data \
@@ -86,12 +92,13 @@ ENV TODO_PORT=8080 \
 
 WORKDIR /app
 
-COPY --from=go-builder --chown=nonroot:nonroot /out/todo-server /app/todo-server
-# /data is pre-created with nonroot ownership in the builder stage.
-# Without this, the anonymous volume Docker auto-mounts on VOLUME ["/data"]
-# would be owned by root and the nonroot process would fail with
-# SQLITE_CANTOPEN (code 14).
-COPY --from=go-builder --chown=nonroot:nonroot /out/data /data
+COPY --from=go-builder /out/todo-server /app/todo-server
+
+# /data is the SQLite data directory. Created here so it exists even when
+# the operator forgets to bind-mount a host directory; when a host directory
+# IS bind-mounted, this just gets shadowed and the host's permissions take
+# effect. Running as root means we don't care about the host uid.
+RUN mkdir -p /data
 
 VOLUME ["/data"]
 

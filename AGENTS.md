@@ -32,7 +32,7 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 核心设计取舍：
 
 - **单二进制分发**：Web UI 通过 `go:embed` 打进后端，部署时不需要 nginx 做静态托管。
-- **零 CGO**：SQLite 使用 `github.com/glebarez/sqlite`（基于 `modernc.org/sqlite`，纯 Go），可以 `CGO_ENABLED=0` 交叉编译所有平台，配合 distroless 基础镜像产出极小体积容器。
+- **零 CGO**：SQLite 使用 `github.com/glebarez/sqlite`（基于 `modernc.org/sqlite`，纯 Go），可以 `CGO_ENABLED=0` 交叉编译所有平台，配合 alpine 基础镜像产出小体积容器（运行阶段只装了 `ca-certificates` + `tzdata`，无其他系统包）。
 - **JWT 密钥自管理**：server 首次启动生成 32 字节随机密钥，持久化到 SQLite 的 `app_secrets` 表，**重启不变**，所以用户不需要配环境变量，也不会因重启踢下线。
 
 ---
@@ -63,7 +63,7 @@ stickytodo 是一个 **C/S 架构** 的单账号 TODO 工具，一个后端配�
 │   ├── scripts/
 │   │   ├── smoke.sh           # 36 步端到端冒烟脚本（Step 33-36 是 WS 回归）
 │   │   └── ws-probe/main.go   # smoke.sh 启动时 go build 出来的临时 WS 探针二进制
-│   ├── Dockerfile             # 多阶段构建：web → go → distroless
+│   ├── Dockerfile             # 多阶段构建：web → go → alpine（root 跑，简化 bind-mount 权限）
 │   ├── docker-compose.yml
 │   └── .env.example
 ├── client/
@@ -658,7 +658,7 @@ cd server && go run ./cmd/todo-server
 ### 7.5 交叉编译纪律
 
 - 后端绝对不要引入需要 CGO 的依赖（例如原 `mattn/go-sqlite3`），`go.mod` review 时要看一眼
-- Dockerfile 必须保持 `CGO_ENABLED=0`（静态链接）+ `FROM gcr.io/distroless/static-debian12:nonroot`（当前运行阶段基础镜像，见 Dockerfile 中唯一一个非 `--platform=$BUILDPLATFORM` 的 `FROM ... AS runtime` 行），实测本地 amd64 镜像约 40MB；换成 alpine/ubuntu 基础镜像会显著变大且拖慢冷启动
+- Dockerfile 必须保持 `CGO_ENABLED=0`（静态链接）。运行阶段当前用 `FROM alpine:3.20`（见 Dockerfile 中唯一一个非 `--platform=$BUILDPLATFORM` 的 `FROM ... AS runtime` 行），容器内默认 root 跑——刻意选择，目的是让宿主机 bind-mount 的 `./data/` 不需要 `chown` 预处理即可写入（distroless+nonroot uid=65532 的方案在原生 Linux 主机上会出现 `attempt to write a readonly database` 错误）。运行阶段只装 `ca-certificates` + `tzdata`，不装其他系统包。如果未来要切回非 root 运行，需要在 entrypoint 里加 `chown` 兜底脚本，并同步更新 `docker-compose.yml` 中关于权限的注释和 `server/README.md` 的"镜像特性"章节
 - Mac 客户端打 DMG 必须 universal——`package-mac-client.sh` 里同时传 `ARCHS="arm64 x86_64"` **和** `ONLY_ACTIVE_ARCH=NO`（两者必须成对，只传 ARCHS 不够；脚本最后还会 `lipo -archs` 核对产物确为 `arm64 + x86_64` fat binary），否则 Intel Mac 用户会拿不到可执行的 App
 - Windows 客户端**同时打 x64（amd64）+ arm64**，两份独立产物。`CMakePresets.json` 里两架构各有一对 configure preset：`release` + `debug`（x64，绑 `x64-windows` triplet）/ `release-arm64` + `debug-arm64`（arm64，绑 `arm64-windows` triplet）。CI `build-win-client` job 用 `strategy.matrix.arch: [x64, arm64]` 并行两份，`ilammy/msvc-dev-cmd@v1` 的 arch 参数表达式 `matrix.arch == 'arm64' && 'amd64_arm64' || 'amd64'` 切换交叉工具集。**arm64 是 x64 runner 上的交叉编译**——binary 能构建、但不能在 x64 host 上执行，所以 `package-win-client.sh` 在 `ARCH=arm64` 时**无条件跳过 ctest**（codec / models 测试是纯 C++ 逻辑，x64 leg 已覆盖）。产物命名 `stickytodo-<ver>-windows-<x64|arm64>.zip` + `stickytodo-setup-<ver>-<x64|arm64>.exe`，**不能**把两架构塞进同一 installer 混合分发——Inno Setup 的 `ArchitecturesAllowed` 按架构 gating（x64 用 `x64compatible`、arm64 用 `arm64`），AppId GUID 共用以维持单一升级通道。未来若 GitHub Actions 提供原生 Windows arm64 runner（如 `windows-2022-arm64`），可把 arm64 leg 迁到原生 runner + `arch: arm64`，ctest 就能跑起来，删掉 `package-win-client.sh` 里 "arm64 跳过 ctest" 的分支
 - Windows 客户端**严禁**引入需要 MinGW 工具链的依赖——CI 和本机都走 MSVC（MSBuild / cl.exe），vcpkg 默认 triplet 是 `x64-windows`（dynamic CRT）。如果某个库只在 `x64-mingw-dynamic` 有，第一反应应是找 MSVC 替代，而不是切 triplet（会连锁触发所有其它 vcpkg 依赖的重建）

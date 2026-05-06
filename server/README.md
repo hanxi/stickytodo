@@ -141,8 +141,8 @@ docker compose logs -f
 
 ### 镜像特性
 
-- **基础镜像**：`gcr.io/distroless/static-debian12:nonroot`（无 shell、无包管理器、仅 `/app/todo-server` 一个二进制 + 必要 CA 证书）
-- **非 root 运行**：uid=65532；宿主机 bind-mount 的 `./data/` 必须对 uid=65532 可写（Docker Desktop for macOS/Windows 通过文件共享层自动转换，Linux 原生需 `chown -R 65532:65532 data`）
+- **基础镜像**：`alpine:3.20`（自带 shell + apk，安装了 `ca-certificates` 与 `tzdata`）
+- **root 运行**：容器进程默认以 root 启动，宿主机 bind-mount 的 `./data/` 不需要任何 `chown` 预处理即可写入；威胁模型按"自托管单租户、宿主只跑自己的代码"假设
 - **架构覆盖**：`linux/amd64`、`linux/arm64`、`linux/arm/v7`（由 `docker/build-push-action` 在 GitHub Actions 里跨架构构建）
 
 官方镜像：`docker.io/hanxi/stickytodo:<tag>` 与 `docker.io/hanxi/stickytodo:latest`。
