@@ -1,5 +1,6 @@
 #include "ui/Preferences.h"
 
+#include <string>
 #include <windows.h>
 
 namespace stickytodo::ui {

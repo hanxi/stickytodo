@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // User preference storage backed by HKCU\Software\stickytodo. Mirrors the
 // macOS client's @AppStorage-driven preferences 1:1:
 //
