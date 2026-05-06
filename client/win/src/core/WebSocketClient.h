@@ -107,6 +107,11 @@ private:
 
     std::string baseUrl_;
     std::string token_;
+    /// HTTP proxy URL ("http://host[:port]"). Empty == no proxy (use
+    /// WINHTTP_ACCESS_TYPE_DEFAULT_PROXY). Read inside ConnectOnce
+    /// under `mutex_` (snapshotted into a local before WinHttpOpen);
+    /// written by SetProxy on the UI thread, also under `mutex_`.
+    std::string proxy_;
     SignalCallback onSignal_;
     EventCallback onEvent_;
 
