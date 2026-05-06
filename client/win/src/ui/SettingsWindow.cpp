@@ -44,16 +44,25 @@ SettingsWindow::SettingsWindow(HINSTANCE hInstance)
     usernameInput_.placeholder = L"Username";
     passwordInput_.placeholder = L"Password";
     passwordInput_.isPassword = true;
+    // Empty proxy = direct connection. Placeholder hints both the
+    // expected scheme and the empty-means-direct convention.
+    proxyInput_.placeholder = L"http://host:port (\u7559\u7A7A=\u76F4\u8FDE)";
 
     testButton_.text = L"Test Connection";
     loginButton_.text = L"Login";
     logoutButton_.text = L"Logout";
+    saveProxyButton_.text = L"\u4FDD\u5B58\u4EE3\u7406"; // 保存代理
 
     // Pre-fill URL from stored state
     auto* app = GetApp();
     if (app && app->GetState()) {
         std::string url = app->GetState()->GetBaseUrl();
         urlInput_.text = std::wstring(url.begin(), url.end());
+        // Pre-fill proxy from AppState (loaded from registry in
+        // AppState::Initialize). Keeps the input in sync with the
+        // currently-effective proxy across Settings show/hide cycles.
+        std::string proxy = app->GetState()->GetHttpProxy();
+        proxyInput_.text = std::wstring(proxy.begin(), proxy.end());
     }
 }
 
@@ -207,6 +216,9 @@ void SettingsWindow::OnMouseMove(int x, int y) {
     urlInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
     usernameInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
     passwordInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
+    proxyInput_.HandleMouse(WM_MOUSEMOVE, fx, fy, dpi, dw);
+    // saveProxyButton_ hover repaint (matches testButton_/loginButton_ above).
+    saveProxyButton_.HandleMouse(WM_MOUSEMOVE, fx, fy);
     // CheckBox hover repaint (fills `hovered` flag — currently only used by
     // the checkbox's own render, but keeping the dispatch consistent with the
     // other controls makes future visual feedback trivial to add).
@@ -252,13 +264,15 @@ void SettingsWindow::OnLButtonDown(int x, int y) {
     bool gotTextHit =
         urlInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
         usernameInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
-        passwordInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw);
+        passwordInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw) ||
+        proxyInput_.HandleMouse(WM_LBUTTONDOWN, fx, fy, dpi, dw);
     if (gotTextHit) {
         SetCapture(hwnd_);
     }
     testButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     loginButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     logoutButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
+    saveProxyButton_.HandleMouse(WM_LBUTTONDOWN, fx, fy);
     // CheckBox toggles on LBUTTONUP (see CheckBox::HandleMouse) so down does
     // nothing meaningful here, but forward the event for symmetry with the
     // other controls and to keep the hover state machine consistent.
@@ -280,10 +294,15 @@ void SettingsWindow::OnLButtonUp(int x, int y) {
     urlInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
     usernameInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
     passwordInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
+    proxyInput_.HandleMouse(WM_LBUTTONUP, fx, fy, dpi, dw);
     if (GetCapture() == hwnd_) ReleaseCapture();
     testButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     loginButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     logoutButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
+    // saveProxyButton_ click is dispatched here (Button::HandleMouse fires
+    // onClick on the LBUTTONUP edge inside its own rect) — same pattern as
+    // testButton_/loginButton_ above.
+    saveProxyButton_.HandleMouse(WM_LBUTTONUP, fx, fy);
     // CheckBox actually flips `checked` on LBUTTONUP and calls onToggle — the
     // persistence of the flipped value is driven by the onToggle callback set
     // each frame in DrawSettingsTab (the callback writes to Preferences).
@@ -296,6 +315,7 @@ void SettingsWindow::OnChar(wchar_t ch) {
     urlInput_.HandleChar(ch);
     usernameInput_.HandleChar(ch);
     passwordInput_.HandleChar(ch);
+    proxyInput_.HandleChar(ch);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -303,6 +323,7 @@ void SettingsWindow::OnKeyDown(WPARAM vk, LPARAM lParam) {
     urlInput_.HandleKey(WM_KEYDOWN, vk, lParam);
     usernameInput_.HandleKey(WM_KEYDOWN, vk, lParam);
     passwordInput_.HandleKey(WM_KEYDOWN, vk, lParam);
+    proxyInput_.HandleKey(WM_KEYDOWN, vk, lParam);
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -427,6 +448,39 @@ void SettingsWindow::DrawSettingsTab(ID2D1RenderTarget* rt, IDWriteFactory* dw, 
         statusLbl.color = Theme::TextSecondary();
         statusLbl.Draw(rt, dw, dpi);
     }
+    y += (Theme::kButtonHeight + Theme::kPaddingLarge) * dpi;
+
+    // ---------- HTTP Proxy block ----------
+    //
+    // Sits between Server URL + Test and the auth block so it stays
+    // visible regardless of authentication state. Mirrors the macOS
+    // SettingsView's "HTTP Proxy" row inside the "服务器" section.
+    //
+    // Layout: Label (label height 20) + TextBox (kInputHeight) + Save
+    // button (kButtonHeight). Empty proxy field == direct connection;
+    // see DoSaveProxy for validation.
+    Label proxyLabel;
+    proxyLabel.rect = {x, y, w, 20.0f * dpi};
+    proxyLabel.text = L"HTTP Proxy";
+    proxyLabel.fontSize = Theme::kFontSizeSmall;
+    proxyLabel.color = Theme::TextSecondary();
+    proxyLabel.Draw(rt, dw, dpi);
+    y += 22.0f * dpi;
+
+    proxyInput_.rect = {x, y, w, Theme::kInputHeight * dpi};
+    // Always editable — proxy applies pre-/post-login alike, unlike the
+    // server URL which we lock once authenticated to avoid splitting a
+    // session across hosts.
+    proxyInput_.enabled = true;
+    proxyInput_.Draw(rt, dw, dpi);
+    y += (Theme::kInputHeight + Theme::kPadding) * dpi;
+
+    // Save proxy button — synchronous (registry write + WS reconnect
+    // kick), no in-flight gating needed.
+    saveProxyButton_.rect = {x, y, 140.0f * dpi, Theme::kButtonHeight * dpi};
+    saveProxyButton_.enabled = true;
+    saveProxyButton_.onClick = [this]() { DoSaveProxy(); };
+    saveProxyButton_.Draw(rt, dw, dpi);
     y += (Theme::kButtonHeight + Theme::kPaddingLarge) * dpi;
 
     if (!authenticated) {
@@ -796,6 +850,59 @@ void SettingsWindow::DoLogin() {
             }
             if (self->hwnd_) InvalidateRect(self->hwnd_, nullptr, FALSE);
         });
+}
+
+void SettingsWindow::DoSaveProxy() {
+    // Synchronous: registry write + WS reconnect kick (handled inside
+    // AppState::SetHttpProxy). No in-flight gating needed.
+    std::string proxy = WideToUtf8(proxyInput_.text);
+
+    // Trim leading / trailing whitespace — users frequently paste URLs
+    // with surrounding spaces from chat clients.
+    size_t b = proxy.find_first_not_of(" \t\r\n");
+    size_t e = proxy.find_last_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        proxy.clear();
+    } else {
+        proxy = proxy.substr(b, e - b + 1);
+    }
+
+    // Validation: empty (= direct connection) or `http://host[:port]`.
+    // Rejecting https:// / socks:// here matches the macOS commitProxy
+    // contract — both clients keep the same single-scheme convention.
+    if (!proxy.empty()) {
+        const std::string scheme = "http://";
+        bool ok = (proxy.size() > scheme.size())
+                  && (proxy.compare(0, scheme.size(), scheme) == 0)
+                  && (proxy.find('/', scheme.size()) == std::string::npos
+                      || proxy.find('/', scheme.size()) == proxy.size() - 1);
+        // Also ensure host part is non-empty (something past "http://").
+        if (ok) {
+            std::string host = proxy.substr(scheme.size());
+            // Strip trailing slash if any
+            if (!host.empty() && host.back() == '/') host.pop_back();
+            ok = !host.empty();
+        }
+        if (!ok) {
+            connectionStatus_ = L"Invalid proxy: only http://host[:port] is supported";
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+    }
+
+    auto* app = GetApp();
+    if (!app || !app->GetState()) return;
+
+    app->GetState()->SetHttpProxy(proxy);
+
+    // Echo back the trimmed value so the input matches the persisted state.
+    proxyInput_.text = std::wstring(proxy.begin(), proxy.end());
+    if (proxy.empty()) {
+        connectionStatus_ = L"Proxy cleared (direct connection)";
+    } else {
+        connectionStatus_ = L"Proxy saved";
+    }
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void SettingsWindow::DoLogout() {

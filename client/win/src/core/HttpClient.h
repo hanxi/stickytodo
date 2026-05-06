@@ -115,6 +115,16 @@ public:
     void SetToken(const std::string& token);
     std::string GetToken() const { return token_; }
 
+    /// Set the HTTP proxy URL (e.g. "http://127.0.0.1:7890"). Empty
+    /// string disables the proxy and uses WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
+    /// (i.e. honour system / IE proxy settings) on subsequent requests.
+    /// Picked up at the start of every DoRequest — no need to teardown
+    /// in-flight WinHTTP handles. Mirrors macOS `URLSession` rebuild on
+    /// proxy change but cheaper because WinHTTP creates a fresh session
+    /// per request anyway.
+    void SetProxy(const std::string& proxy);
+    std::string GetProxy() const { return proxy_; }
+
     /// Set callback invoked when a 401 response is received. The callback
     /// is fired on whichever thread observed the 401 — which for async
     /// paths is the worker thread. Downstream consumers that touch UI

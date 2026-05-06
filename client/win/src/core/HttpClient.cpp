@@ -145,6 +145,7 @@ HttpClient::~HttpClient() = default;
 
 void HttpClient::SetBaseUrl(const std::string& url) { baseUrl_ = url; }
 void HttpClient::SetToken(const std::string& token) { token_ = token; }
+void HttpClient::SetProxy(const std::string& proxy) { proxy_ = proxy; }
 void HttpClient::SetOnUnauthorized(UnauthorizedCallback cb) { onUnauthorized_ = std::move(cb); }
 
 HttpResponse HttpClient::DoRequest(const std::string& method, const std::string& path,
@@ -157,10 +158,28 @@ HttpResponse HttpClient::DoRequest(const std::string& method, const std::string&
 
     auto parsed = ParseUrl(baseUrl_, path, queryString);
 
-    HINTERNET hSession = WinHttpOpen(L"StickyTodo/1.0",
-                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                      WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    // Honour user-configured HTTP proxy if non-empty; otherwise fall back to
+    // the system / IE default. WinHTTP's NAMED_PROXY mode rejects empty
+    // proxy strings, so the empty check is mandatory.
+    //
+    // proxyW must outlive WinHttpOpen — the API only stores a pointer into
+    // its session struct during the call (it copies the C string), but
+    // keeping the wstring alive on stack until WinHttpOpen returns is the
+    // safe convention.
+    HINTERNET hSession;
+    std::wstring proxyW;
+    if (!proxy_.empty()) {
+        proxyW = Utf8ToWide(proxy_);
+        hSession = WinHttpOpen(L"StickyTodo/1.0",
+                               WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                               proxyW.c_str(),
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    } else {
+        hSession = WinHttpOpen(L"StickyTodo/1.0",
+                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME,
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    }
     if (!hSession) return response;
 
     // Apply short, interactive-grade timeouts to the whole session. This

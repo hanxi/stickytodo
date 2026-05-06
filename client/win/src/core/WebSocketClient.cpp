@@ -40,6 +40,17 @@ void WebSocketClient::SetToken(const std::string& token) {
     token_ = token;
 }
 
+void WebSocketClient::SetProxy(const std::string& proxy) {
+    // Lock to publish to the worker thread (which reads proxy_ inside
+    // ConnectOnce under the same mutex). Note: this only takes effect on
+    // the NEXT ConnectOnce — currently-live sessions stay on the old
+    // proxy until they reconnect. AppState::SetHttpProxy is responsible
+    // for forcing a Disconnect() so the auto-reconnect path picks up the
+    // new value within seconds.
+    std::lock_guard<std::mutex> lock(mutex_);
+    proxy_ = proxy;
+}
+
 void WebSocketClient::SetOnSignal(SignalCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     onSignal_ = std::move(cb);
@@ -135,10 +146,12 @@ void WebSocketClient::WorkerLoop() {
 bool WebSocketClient::ConnectOnce() {
     std::string wsUrl;
     std::string token;
+    std::string proxy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         wsUrl = BuildWsUrl();
         token = token_;
+        proxy = proxy_;
     }
 
     if (token.empty() || wsUrl.empty()) {
@@ -166,11 +179,23 @@ bool WebSocketClient::ConnectOnce() {
         host = host.substr(0, colonPos);
     }
 
-    // Open WinHTTP session
-    HINTERNET hSession = WinHttpOpen(L"StickyTodo-WS/1.0",
-                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                      WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    // Open WinHTTP session — honour user-configured HTTP proxy if any.
+    // Same pattern as HttpClient::DoRequest. Empty `proxy` falls back to
+    // the system / IE default. proxyW must outlive WinHttpOpen.
+    HINTERNET hSession;
+    std::wstring proxyW;
+    if (!proxy.empty()) {
+        proxyW = Utf8ToWide(proxy);
+        hSession = WinHttpOpen(L"StickyTodo-WS/1.0",
+                               WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                               proxyW.c_str(),
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    } else {
+        hSession = WinHttpOpen(L"StickyTodo-WS/1.0",
+                               WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME,
+                               WINHTTP_NO_PROXY_BYPASS, 0);
+    }
     if (!hSession) return false;
 
     HINTERNET hConnect = WinHttpConnect(hSession, Utf8ToWide(host).c_str(), port, 0);

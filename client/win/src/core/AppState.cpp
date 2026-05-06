@@ -1,6 +1,7 @@
 #include "core/AppState.h"
 #include "App.h"
 #include "codec/JsonHelper.h"
+#include "ui/Preferences.h"
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -16,6 +17,28 @@ AppState::AppState() = default;
 AppState::~AppState() { Shutdown(); }
 
 void AppState::Initialize() {
+    // Load HTTP proxy preference first so it applies to BOTH the credential
+    // restore path's WS connect AND any subsequent Login attempt. Stored as
+    // wide string in registry; convert to UTF-8 for the WinHTTP-facing
+    // string we keep in memory (HttpClient/WebSocketClient consume UTF-8).
+    {
+        std::wstring wproxy = ui::GetHttpProxy();
+        if (!wproxy.empty()) {
+            int sz = WideCharToMultiByte(CP_UTF8, 0, wproxy.c_str(),
+                                         static_cast<int>(wproxy.size()),
+                                         nullptr, 0, nullptr, nullptr);
+            std::string utf8(sz, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, wproxy.c_str(),
+                                static_cast<int>(wproxy.size()),
+                                utf8.data(), sz, nullptr, nullptr);
+            httpProxy_ = std::move(utf8);
+        }
+    }
+    // Inject proxy into both clients up-front; safe to call with an empty
+    // string (falls through to WINHTTP_ACCESS_TYPE_DEFAULT_PROXY).
+    http_.SetProxy(httpProxy_);
+    ws_.SetProxy(httpProxy_);
+
     // Try to restore session from Credential Manager. If any stored
     // credential is present we set the HTTP client up and open the WS
     // connection. Token validity is NOT probed here via /health (that
@@ -37,6 +60,40 @@ void AppState::Initialize() {
         http_.SetToken(token_);
         http_.SetOnUnauthorized([this]() { HandleUnauthorized(); });
 
+        ConnectWebSocket();
+    }
+}
+
+void AppState::SetHttpProxy(const std::string& proxy) {
+    if (proxy == httpProxy_) return;
+    httpProxy_ = proxy;
+
+    // Persist to registry as wide string. Convert utf-8 → utf-16 inline
+    // (small string; no need to factor a helper).
+    std::wstring wproxy;
+    if (!proxy.empty()) {
+        int sz = MultiByteToWideChar(CP_UTF8, 0, proxy.c_str(),
+                                     static_cast<int>(proxy.size()),
+                                     nullptr, 0);
+        wproxy.assign(sz, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, proxy.c_str(),
+                            static_cast<int>(proxy.size()),
+                            wproxy.data(), sz);
+    }
+    ui::SetHttpProxy(wproxy);
+
+    // Inject into both clients. http_ picks up the new value on the next
+    // DoRequest. ws_ stores the value but won't migrate the live session
+    // until reconnect — force a Disconnect so the auto-reconnect path
+    // (WorkerLoop's exponential backoff) brings us back on the new proxy
+    // within seconds. Only kick the WS if we are authenticated; for the
+    // logged-out case there is no live session anyway.
+    http_.SetProxy(httpProxy_);
+    ws_.SetProxy(httpProxy_);
+    if (IsAuthenticated()) {
+        // Disconnect tears down the worker thread + WinHTTP handle.
+        // ConnectWebSocket spawns a fresh worker that picks up the new proxy.
+        DisconnectWebSocket();
         ConnectWebSocket();
     }
 }

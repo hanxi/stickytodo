@@ -60,6 +60,14 @@ public:
     /// Set the JWT token for authentication.
     void SetToken(const std::string& token);
 
+    /// Set the HTTP proxy URL (e.g. "http://127.0.0.1:7890"). Empty
+    /// string disables the proxy and falls back to system / IE default.
+    /// Picked up at the start of the next ConnectOnce() — already-live
+    /// connections are NOT re-routed; callers that want immediate effect
+    /// should follow up with Disconnect()+Connect() or rely on the
+    /// auto-reconnect path. Mirrors HttpClient::SetProxy.
+    void SetProxy(const std::string& proxy);
+
     /// Set callback for connection state signals.
     void SetOnSignal(SignalCallback cb);
 

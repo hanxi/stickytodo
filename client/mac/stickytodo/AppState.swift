@@ -57,6 +57,8 @@ final class AppState: ObservableObject {
     static let defaultsKeyServerBaseURL = "stickytodo.serverBaseURL"
     /// UserDefaults key：上次登录的用户名（仅用于 UI 回填，不含密码/token）。
     static let defaultsKeyUsername = "stickytodo.username"
+    /// UserDefaults key：HTTP Proxy 地址（形如 `http://host:port`，空串=直连）。
+    static let defaultsKeyHttpProxy = "stickytodo.httpProxy"
 
     /// 默认的本地开发后端地址。
     static let defaultServerBaseURL = "http://127.0.0.1:8080"
@@ -66,6 +68,14 @@ final class AppState: ObservableObject {
     /// 服务器地址。修改后会被持久化到 UserDefaults。
     /// 仅允许通过 `updateServerBaseURL` 修改，确保 trim + 持久化原子完成。
     @Published private(set) var serverBaseURL: String
+
+    /// HTTP 代理地址（形如 `http://host:port`）。空串表示直连。
+    /// 仅允许通过 `updateHttpProxy` 修改，确保 trim + 持久化 + URLSession 重建原子完成。
+    ///
+    /// 注意：proxy 是 `URLSessionConfiguration.connectionProxyDictionary` 的 init-time
+    /// 配置——session 创建后修改不会生效，因此 proxy 变更时 `apiClient` 与 `realtime`
+    /// 都必须销毁并用新 session 重建（见 `rebuildClients(session:)`）。
+    @Published private(set) var httpProxy: String
 
     /// 当前登录用户名；nil 表示未登录。
     @Published private(set) var username: String?
@@ -99,7 +109,12 @@ final class AppState: ObservableObject {
     ///
     /// 所有 provider 闭包只在 MainActor 上下文中被调用（API 请求入口都在
     /// `@MainActor AppState` 的方法内 `await`），满足 Swift 并发模型。
-    let apiClient: APIClient
+    ///
+    /// 不再是 `let`：HTTP proxy 变更时必须用新的 `URLSession` 重建 APIClient
+    /// （`URLSessionConfiguration.connectionProxyDictionary` 是 init-time 的，
+    /// session 创建后改不动），因此 `apiClient` 与 `realtime` 都需可重建。
+    /// 通过 `_MutableBox` 共享 baseURL/token，保证重建后行为一致。
+    private(set) var apiClient: APIClient
 
     /// 本机窗口位置存储。便签 id → CGRect 的映射；与服务端无关。
     /// 暴露给 `StickyWindowManager` / `StickyWindowController` 使用。
@@ -129,6 +144,10 @@ final class AppState: ObservableObject {
         let initialURL = rawURL.isEmpty ? Self.defaultServerBaseURL : rawURL
         self.serverBaseURL = initialURL
 
+        let rawProxy = userDefaults.string(forKey: Self.defaultsKeyHttpProxy)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.httpProxy = rawProxy
+
         let rawName = userDefaults.string(forKey: Self.defaultsKeyUsername)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let effectiveName: String? = rawName.isEmpty ? nil : rawName
@@ -157,11 +176,20 @@ final class AppState: ObservableObject {
         self.tokenBox = tokenBox
         self.unauthorizedBox = unauthorizedBox
 
+        // 如果调用方显式传入了 session（如测试注入），就直接用；
+        // 否则按 proxy 配置构造一个带 connectionProxyDictionary 的 session。
+        // 注意：proxy 是 init-time 的，后续变更必须经由 `rebuildClients(session:)` 重建。
+        let effectiveSession: URLSession
+        if session !== URLSession.shared {
+            effectiveSession = session
+        } else {
+            effectiveSession = Self.makeSession(proxy: rawProxy)
+        }
         self.apiClient = APIClient(
             baseURLProvider: { urlBox.value },
             tokenProvider: { tokenBox.value },
             onUnauthorized: { unauthorizedBox.value() },
-            session: session
+            session: effectiveSession
         )
 
         // init 结束后绑定 onUnauthorized 到 self 的 logout（MainActor 里执行）。
@@ -207,6 +235,71 @@ final class AppState: ObservableObject {
         // 服务器地址变化必然意味着原连接作废；断掉旧 WS，下次 bootstrap 会重建。
         realtime?.disconnect()
         realtime = nil
+    }
+
+    /// 更新 HTTP Proxy 地址。空串 = 直连。
+    ///
+    /// 由于 `URLSessionConfiguration.connectionProxyDictionary` 是 init-time 配置，
+    /// 此处必须重建 `apiClient`（用新 session）和 `realtime`（用新的 session 也会
+    /// 由内部按 URLRequest 走 URLSession，故重建以拾取新 proxy）。
+    /// 重连交由 `bootstrapAfterAuth` / `startRealtime` 在已登录态下处理。
+    func updateHttpProxy(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != httpProxy else { return }
+        httpProxy = trimmed
+        userDefaults.set(trimmed, forKey: Self.defaultsKeyHttpProxy)
+
+        // 用新 proxy 重建 URLSession + APIClient；销毁旧的 RealtimeClient，
+        // 已登录态下让上层（startRealtime）按需重建。
+        rebuildClients(session: Self.makeSession(proxy: trimmed))
+    }
+
+    /// 用给定 session 重建 APIClient + 销毁旧 realtime。
+    /// init 与 `updateHttpProxy` 复用此入口，保证 box/provider 关联始终一致。
+    private func rebuildClients(session: URLSession) {
+        // 拆掉旧 WS，避免残留连接继续走旧 session/proxy
+        realtime?.disconnect()
+        realtime = nil
+
+        // 同 box 复用：APIClient 通过闭包读 box.value，无需再次重置 box。
+        let urlBox = serverBaseURLBox
+        let tokenBox = tokenBox
+        let unauthorizedBox = unauthorizedBox
+        self.apiClient = APIClient(
+            baseURLProvider: { urlBox.value },
+            tokenProvider: { tokenBox.value },
+            onUnauthorized: { unauthorizedBox.value() },
+            session: session
+        )
+
+        // 已登录态下，proxy 切换后立刻重建 WS 连接；未登录则等 login 触发。
+        if isAuthenticated {
+            startRealtime()
+        }
+    }
+
+    /// 根据 proxy 字符串构造 URLSession。
+    /// 空串 / 解析失败 → 返回 `URLSession.shared`，等价于不走代理。
+    /// 仅支持 `http://host[:port]`；同时把 HTTPS 流量也指到同一代理（mitm 场景常见）。
+    private static func makeSession(proxy: String) -> URLSession {
+        let trimmed = proxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              let host = url.host, !host.isEmpty
+        else {
+            return .shared
+        }
+        let port = url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)
+        let cfg = URLSessionConfiguration.default
+        cfg.connectionProxyDictionary = [
+            kCFNetworkProxiesHTTPEnable as String: 1,
+            kCFNetworkProxiesHTTPProxy  as String: host,
+            kCFNetworkProxiesHTTPPort   as String: port,
+            kCFNetworkProxiesHTTPSEnable as String: 1,
+            kCFNetworkProxiesHTTPSProxy  as String: host,
+            kCFNetworkProxiesHTTPSPort   as String: port,
+        ]
+        return URLSession(configuration: cfg)
     }
 
     /// 登录：调用 `POST /api/login`，成功则把 token 存到内存 + Keychain，

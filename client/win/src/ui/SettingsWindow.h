@@ -52,6 +52,7 @@ private:
     void DoLogin();
     void DoLogout();
     void DoTestConnection();
+    void DoSaveProxy();
     void LoadAuditLogs();
 
     HINSTANCE hInstance_;
@@ -66,9 +67,17 @@ private:
     TextBox urlInput_;
     TextBox usernameInput_;
     TextBox passwordInput_;
+    // HTTP proxy URL input. Empty == direct connection. Layout sits
+    // between the Server URL block and the Login block in
+    // DrawSettingsTab so it stays visible regardless of auth state.
+    TextBox proxyInput_;
     Button testButton_;
     Button loginButton_;
     Button logoutButton_;
+    // "保存代理" button — flushes proxyInput_ → AppState::SetHttpProxy.
+    // Always enabled (no in-flight network call here, just registry
+    // write + WS reconnect kick).
+    Button saveProxyButton_;
     Label statusLabel_;
     std::wstring connectionStatus_;
 

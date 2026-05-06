@@ -108,6 +108,23 @@ public:
     /// TestConnectionAsync from UI code.
     std::string TestConnection(const std::string& baseUrl);
 
+    // ---------- HTTP Proxy ----------
+
+    /// Returns the currently configured HTTP proxy URL (e.g. "http://127.0.0.1:7890").
+    /// Empty string means "direct connection / no proxy". Mirrors the macOS
+    /// `AppState.httpProxy` field. Persisted in registry under
+    /// HKCU\Software\stickytodo\httpProxy.
+    std::string GetHttpProxy() const { return httpProxy_; }
+
+    /// Update the HTTP proxy URL. Empty string disables the proxy. Side effects:
+    ///   • persist to registry via Preferences::SetHttpProxy
+    ///   • inject into http_ (next request picks it up)
+    ///   • inject into ws_ + force a reconnect so the live WS session
+    ///     migrates onto the new proxy within the auto-reconnect window
+    /// Must be called from the UI thread (touches WS state and the
+    /// SettingsWindow status text).
+    void SetHttpProxy(const std::string& proxy);
+
     // ---------- Auth (asynchronous; callback fires on UI thread) ----------
     //
     // These are the UI-safe counterparts of Login / TestConnection /
@@ -252,6 +269,12 @@ private:
     std::string baseUrl_;
     std::string username_;
     std::string token_;
+
+    /// HTTP proxy URL ("http://host:port"). Empty == direct connection.
+    /// Loaded once from registry in Initialize() and kept in sync with
+    /// http_/ws_ via SetHttpProxy. Persistent storage lives in
+    /// HKCU\Software\stickytodo\httpProxy (REG_SZ).
+    std::string httpProxy_;
 
     std::vector<models::StickyNote> stickies_;
     mutable std::mutex dataMutex_;

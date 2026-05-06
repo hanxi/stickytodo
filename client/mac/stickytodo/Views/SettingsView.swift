@@ -20,6 +20,10 @@ struct SettingsView: View {
     @State private var urlDraft: String = ""
     @State private var urlValidation: URLValidationState = .valid
 
+    // HTTP 代理草稿与校验
+    @State private var proxyDraft: String = ""
+    @State private var proxyValidation: URLValidationState = .valid
+
     // 登录表单
     @State private var usernameDraft: String = ""
     @State private var passwordDraft: String = ""
@@ -63,6 +67,7 @@ struct SettingsView: View {
         .frame(width: 520, height: 420)
         .onAppear {
             urlDraft = appState.serverBaseURL
+            proxyDraft = appState.httpProxy
             if let name = appState.username { usernameDraft = name }
         }
     }
@@ -126,6 +131,39 @@ struct SettingsView: View {
                             .foregroundStyle(.red)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                }
+
+                // HTTP Proxy 配置：留空表示直连。
+                // 仅支持 `http://host[:port]`，HTTPS 流量会被指向同一代理（mitm 场景）。
+                Divider()
+                TextField(
+                    "HTTP Proxy",
+                    text: $proxyDraft,
+                    prompt: Text("例如 http://127.0.0.1:7890；留空表示直连")
+                )
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { commitProxy() }
+
+                if case .invalid(let reason) = proxyValidation {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+
+                HStack {
+                    Button("保存代理") { commitProxy() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!isProxyDirty)
+                    Button("恢复") {
+                        proxyDraft = appState.httpProxy
+                        proxyValidation = .valid
+                    }
+                    .disabled(!isProxyDirty)
+                    Spacer()
+                    Text(appState.httpProxy.isEmpty ? "当前：直连" : "当前：\(appState.httpProxy)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
 
@@ -360,6 +398,11 @@ struct SettingsView: View {
         normalizedURLDraft() != appState.serverBaseURL
     }
 
+    /// 代理草稿是否与已生效值不同（trim 后比较）。
+    private var isProxyDirty: Bool {
+        proxyDraft.trimmingCharacters(in: .whitespacesAndNewlines) != appState.httpProxy
+    }
+
     private var canSubmitLogin: Bool {
         !usernameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !passwordDraft.isEmpty
@@ -393,6 +436,33 @@ struct SettingsView: View {
         urlValidation = .valid
         urlDraft = normalized // 把 http:// 补上的值回填到输入框
         appState.updateServerBaseURL(normalized)
+    }
+
+    /// 提交 Proxy 草稿。规则：
+    ///   - trim 后空串：直接接受（直连）
+    ///   - 非空：必须能解析为 URL，scheme=http，host 非空
+    /// 校验通过后调用 `appState.updateHttpProxy`，失败则把原因落到 `proxyValidation`。
+    private func commitProxy() {
+        let trimmed = proxyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            proxyValidation = .valid
+            proxyDraft = ""
+            appState.updateHttpProxy("")
+            return
+        }
+        guard let comps = URLComponents(string: trimmed),
+              let scheme = comps.scheme?.lowercased(), scheme == "http",
+              let host = comps.host, !host.isEmpty
+        else {
+            proxyValidation = .invalid(
+                reason: "代理格式不合法：仅支持 http://host[:port]"
+            )
+            return
+        }
+        _ = host
+        proxyValidation = .valid
+        proxyDraft = trimmed
+        appState.updateHttpProxy(trimmed)
     }
 
     private func submitLogin() async {

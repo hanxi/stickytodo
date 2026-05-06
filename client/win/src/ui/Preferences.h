@@ -41,4 +41,19 @@ bool ShouldSkipStickyDeleteConfirm();
 /// Persist the sticky-note delete confirmation preference.
 void SetSkipStickyDeleteConfirm(bool skip);
 
+/// Returns the persisted HTTP proxy URL (e.g. `http://127.0.0.1:7890`).
+/// Empty string means "direct connection / no proxy" — callers must treat
+/// the empty case explicitly because WinHTTP's NAMED_PROXY mode rejects
+/// empty proxy strings.
+///
+/// Stored in registry as REG_SZ under HKCU\Software\stickytodo\httpProxy
+/// to mirror macOS UserDefaults `stickytodo.httpProxy`.
+std::wstring GetHttpProxy();
+
+/// Persist the HTTP proxy URL. Pass empty string to clear (direct connection).
+/// HttpClient/WebSocketClient pick up the new value on their next request /
+/// reconnect cycle — caller is responsible for triggering a reconnect via
+/// AppState::SetHttpProxy.
+void SetHttpProxy(const std::wstring& value);
+
 } // namespace stickytodo::ui
