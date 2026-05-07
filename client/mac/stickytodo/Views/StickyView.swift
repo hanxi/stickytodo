@@ -237,14 +237,23 @@ struct StickyView: View {
                 // 注意：最初错误地尝试"统一走 sendAction 路径"，实测在 macOS 14+ 下该 selector
                 // 已完全失效（只打印 "Please use SettingsLink..." 警告，不打开窗口）；必须走
                 // SettingsLink 分支。
+                // 「窗口已打开却被遮挡」的兜底：SettingsLink / showSettingsWindow: 都不会
+                // 主动把已存在的 Settings 窗口拉到最前，用户会感觉"按了没反应"。
+                // 这里通过 NSApplication.bringSettingsWindowToFrontIfNeeded() 兜底：
+                // 窗口未打开时 no-op（由系统 API 负责创建），已打开时强制 makeKey/orderFront。
+                // macOS 14+ 用 `.simultaneousGesture` 与 SettingsLink 自身动作并行触发。
                 if #available(macOS 14.0, *) {
                     SettingsLink {
                         Label("打开设置", systemImage: "gearshape")
                     }
+                    .simultaneousGesture(TapGesture().onEnded {
+                        NSApplication.shared.bringSettingsWindowToFrontIfNeeded()
+                    })
                 } else {
                     Button {
                         NSApplication.shared.activate(ignoringOtherApps: true)
                         NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                        NSApplication.shared.bringSettingsWindowToFrontIfNeeded()
                     } label: {
                         Label("打开设置", systemImage: "gearshape")
                     }

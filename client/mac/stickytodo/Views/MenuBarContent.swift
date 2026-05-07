@@ -206,6 +206,16 @@ struct MenuBarContent: View {
     /// - macOS 13：`SettingsLink` 不可用，回退到 `NSApp.sendAction` +
     ///   `showSettingsWindow:` selector。MenuBarExtra 触发按钮不会让进程
     ///   变为 active，故先 `activate` 再 `sendAction`。
+    ///
+    /// ## 「窗口已打开却被遮挡」的兜底
+    /// `SettingsLink` 与 `showSettingsWindow:` 都只负责"打开"——窗口已存在
+    /// 但被其他窗口/Space 遮挡时不会主动 makeKey/orderFront，对用户呈现为
+    /// "按了没反应、以为没打开"。这里在两种实现路径上都额外调用
+    /// `bringSettingsWindowToFrontIfNeeded()`：窗口未打开时它 no-op，由
+    /// 系统 API 负责创建；窗口已存在时它把窗口提到最前。
+    /// macOS 14+ 路径上 `SettingsLink` 没有 action 闭包，用
+    /// `.simultaneousGesture` 在点击同时执行该兜底，不影响 `SettingsLink`
+    /// 自身的打开行为。
     @ViewBuilder
     private func settingsButton(
         title: String,
@@ -217,10 +227,14 @@ struct MenuBarContent: View {
                 Label(title, systemImage: systemImage)
             }
             .buttonStyle(prominent ? AnyButtonStyle(.borderedProminent) : AnyButtonStyle(.bordered))
+            .simultaneousGesture(TapGesture().onEnded {
+                NSApplication.shared.bringSettingsWindowToFrontIfNeeded()
+            })
         } else {
             Button {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                NSApplication.shared.bringSettingsWindowToFrontIfNeeded()
             } label: {
                 Label(title, systemImage: systemImage)
             }
@@ -245,5 +259,87 @@ private struct AnyButtonStyle: PrimitiveButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         _make(configuration)
+    }
+}
+
+// MARK: - Settings 窗口前置工具
+
+/// 「打开设置」入口的辅助工具：把已存在的 SwiftUI Settings 窗口拉到最前。
+///
+/// ## 解决的问题
+/// SwiftUI 的 `SettingsLink`（macOS 14+）和 `NSApp.sendAction(showSettingsWindow:)`
+/// （macOS 13）只负责"打开"Settings Scene——若窗口尚未创建则创建并显示，
+/// 但若窗口**已经打开却被其他窗口/Space 遮挡**，再次点击不会主动 makeKey/orderFront，
+/// 对用户表现为"按了没反应、以为没打开"。
+///
+/// 本工具扫描 `NSApp.windows`，识别出 Settings Scene 关联的 NSWindow，
+/// 显式 `activate` + `makeKeyAndOrderFront`，弥补这个空窗。
+///
+/// ## 使用方式
+/// - macOS 14+：在 `SettingsLink` 上叠 `.simultaneousGesture(TapGesture().onEnded {
+///     NSApplication.shared.bringSettingsWindowToFrontIfNeeded()
+///   })`，与 `SettingsLink` 自身的"打开 Scene"动作并行——窗口未打开时本函数找不到窗口
+///   自然 no-op，由 `SettingsLink` 负责打开；窗口已存在时本函数把它拉到最前。
+/// - macOS 13：在 `Button` action 里 `sendAction` 之后直接调用一次即可。
+///
+/// ## 识别策略（按优先级，命中任一即视为 Settings 窗口）
+///   1. `identifier?.rawValue` 包含子串 `"Settings"`（macOS 14+ 通常为
+///      `com_apple_SwiftUI_Settings_window`）
+///   2. `frameAutosaveName` 包含 `"Settings"`（部分版本会落在这里）
+///   3. window 的 `contentViewController` 类型名包含 `"Settings"`
+/// 三条都不命中视为非 Settings 窗口（避免误把便签窗口拉到最前）。
+///
+/// ## 放置位置
+/// 这段 extension 原本想放独立文件，但 Xcode project 的 build target 不会
+/// 自动扫描目录，新增 .swift 必须改 `project.pbxproj` 才能参与编译。
+/// 三处「打开设置」入口里 `MenuBarContent.settingsButton` 是最早也是主要的
+/// 消费方，把工具直接放在这里既能保持单文件可读、又能避开 pbxproj 改动。
+extension NSApplication {
+
+    /// 若已存在 Settings 窗口，则把它拉到最前并激活 App。
+    /// 没有命中的 Settings 窗口时直接返回（本函数对"窗口未打开"场景安全 no-op）。
+    @MainActor
+    func bringSettingsWindowToFrontIfNeeded() {
+        guard let settingsWindow = findSettingsWindow() else {
+            // 窗口未打开：留给 SettingsLink / showSettingsWindow: 负责打开。
+            return
+        }
+
+        // 1) 让 App 进入 active（菜单栏 App / LSUIElement 触发的点击不会自动激活进程）。
+        // 2) 解最小化 → makeKey + orderFront 把窗口提到最顶层。
+        // 三步顺序：activate → deminiaturize → makeKeyAndOrderFront
+        // 避免在最小化状态下 makeKeyAndOrderFront 的视觉跳变。
+        activate(ignoringOtherApps: true)
+        if settingsWindow.isMiniaturized {
+            settingsWindow.deminiaturize(nil)
+        }
+        settingsWindow.makeKeyAndOrderFront(nil)
+    }
+
+    /// 在当前进程的所有 NSWindow 中查找 Settings Scene 关联的窗口。
+    /// 命中策略见 `bringSettingsWindowToFrontIfNeeded` 文档注释。
+    private func findSettingsWindow() -> NSWindow? {
+        for window in windows where Self.isLikelySettingsWindow(window) {
+            return window
+        }
+        return nil
+    }
+
+    /// 单个窗口是否疑似 Settings Scene 创建的窗口。
+    private static func isLikelySettingsWindow(_ window: NSWindow) -> Bool {
+        if let identifier = window.identifier?.rawValue,
+           identifier.localizedCaseInsensitiveContains("Settings") {
+            return true
+        }
+        if window.frameAutosaveName.localizedCaseInsensitiveContains("Settings") {
+            return true
+        }
+        if let controller = window.contentViewController {
+            let typeName = String(describing: type(of: controller))
+            if typeName.localizedCaseInsensitiveContains("Settings") {
+                return true
+            }
+        }
+        return false
     }
 }
