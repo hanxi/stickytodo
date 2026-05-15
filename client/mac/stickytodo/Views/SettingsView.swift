@@ -11,6 +11,7 @@
 //    - URL(string:) 解析通过视为合法；否则标红提示
 //
 
+import ServiceManagement
 import SwiftUI
 
 struct SettingsView: View {
@@ -53,6 +54,13 @@ struct SettingsView: View {
     // 真值消费点在 TodoRow（同名 @AppStorage），两处视图自动同步。
     @AppStorage("todo.skipDeleteConfirm") private var skipTodoDeleteConfirm = false
 
+    // 「开机自动启动」UI 态。真值在系统（SMAppService.mainApp.status），这里只缓存
+    // 给 Toggle 用；onAppear 时拉一次最新值，Toggle 切换时调用 LaunchAtLogin.setEnabled。
+    @State private var launchAtLoginOn: Bool = LaunchAtLogin.isEnabled
+    /// 设置 LaunchAtLogin 失败时的错误文案（可空 = 无错误）；典型场景是用户在
+    /// 「系统设置 → 通用 → 登录项」里硬禁用了，register() 抛出 NSError。
+    @State private var launchAtLoginError: String?
+
     var body: some View {
         TabView {
             generalTab
@@ -68,7 +76,18 @@ struct SettingsView: View {
         .onAppear {
             urlDraft = appState.serverBaseURL
             proxyDraft = appState.httpProxy
-            if let name = appState.username { usernameDraft = name }
+            if let name = appState.username {
+                usernameDraft = name
+                // 未登录时把 Keychain 里保存的密码回填到密码框，让用户「打开设置就能直接登录」。
+                // 已登录时不动 passwordDraft——它本来就是隐藏的，无需赋值。
+                if !appState.isAuthenticated, passwordDraft.isEmpty,
+                   let saved = appState.savedPassword(for: name) {
+                    passwordDraft = saved
+                }
+            }
+            // 重新拉一次系统的 LoginItem 状态，避免用户在「系统设置」里改过后这边显示陈旧值。
+            launchAtLoginOn = LaunchAtLogin.isEnabled
+            launchAtLoginError = nil
         }
     }
 
@@ -176,6 +195,22 @@ struct SettingsView: View {
             }
 
             Section("通用") {
+                Toggle(isOn: launchAtLoginBinding) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("开机自动启动")
+                        Text("登录系统时自动打开 StickyTodo 并常驻菜单栏。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let err = launchAtLoginError {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 Toggle(isOn: showStickyDeleteConfirmBinding) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("删除便签前弹出确认")
@@ -219,6 +254,41 @@ struct SettingsView: View {
         Binding(
             get: { !skipTodoDeleteConfirm },
             set: { skipTodoDeleteConfirm = !$0 }
+        )
+    }
+
+    /// 「开机自动启动」绑定。Toggle 设值时立刻调 SMAppService 注册/反注册；
+    /// 失败把 UI 状态回滚到旧值并把错误文案落到 `launchAtLoginError`，避免 UI
+    /// 与系统真实状态不一致。
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { launchAtLoginOn },
+            set: { newValue in
+                let previous = launchAtLoginOn
+                launchAtLoginOn = newValue
+                launchAtLoginError = nil
+                do {
+                    try LaunchAtLogin.setEnabled(newValue)
+                    // 写完后再以系统真实状态对齐，处理 .requiresApproval 这种「用户在系统
+                    // 设置里硬禁用过」的情况——register() 不抛错但 status 不会变成 .enabled。
+                    let resolved = LaunchAtLogin.isEnabled
+                    launchAtLoginOn = resolved
+                    if newValue && !resolved {
+                        launchAtLoginError = "已请求启用，但系统当前不允许；请在「系统设置 → 通用 → 登录项」中允许 StickyTodo。"
+                    }
+                } catch {
+                    launchAtLoginOn = previous
+                    launchAtLoginError = "设置失败：\(error.localizedDescription)"
+                }
+            }
+        )
+    }
+
+    /// 「记住密码」绑定。直接把开关持久化到 AppState（同时会处理 Keychain 里残留密码的清理）。
+    private var rememberPasswordBinding: Binding<Bool> {
+        Binding(
+            get: { appState.rememberPassword },
+            set: { appState.updateRememberPassword($0) }
         )
     }
 
@@ -307,6 +377,12 @@ struct SettingsView: View {
             .onSubmit {
                 Task { await submitLogin() }
             }
+
+        Toggle(isOn: rememberPasswordBinding) {
+            Text("记住密码")
+        }
+        .toggleStyle(.checkbox)
+        .disabled(loginSubmitting)
 
         if let err = loginError {
             Text(err)

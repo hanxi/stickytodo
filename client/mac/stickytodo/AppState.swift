@@ -59,6 +59,9 @@ final class AppState: ObservableObject {
     static let defaultsKeyUsername = "stickytodo.username"
     /// UserDefaults key：HTTP Proxy 地址（形如 `http://host:port`，空串=直连）。
     static let defaultsKeyHttpProxy = "stickytodo.httpProxy"
+    /// UserDefaults key：是否「记住密码」（Bool）。
+    /// 仅作偏好开关，真实密码存在 Keychain；该 key 缺省时按 `true` 处理（首次启动即默认勾选）。
+    static let defaultsKeyRememberPassword = "stickytodo.rememberPassword"
 
     /// 默认的本地开发后端地址。
     static let defaultServerBaseURL = "http://127.0.0.1:8080"
@@ -83,6 +86,11 @@ final class AppState: ObservableObject {
     /// 当前 access token。内存 + Keychain 双写；启动时优先从 Keychain 恢复。
     /// `private(set)` 防止外部 UI 绕过 login/logout 流程直接写入。
     @Published private(set) var authToken: String?
+
+    /// 「记住密码」偏好。值为 `true` 时：登录成功会把密码写到 Keychain，下次启动可
+    /// 自动后台登录；值为 `false` 时：登录不写密码，并主动清掉 Keychain 里残留的
+    /// 旧密码。仅控制「是否持久化」，不影响当前会话本身。
+    @Published private(set) var rememberPassword: Bool
 
     /// 当前云端便签列表的视图层快照。
     ///
@@ -153,6 +161,14 @@ final class AppState: ObservableObject {
         let effectiveName: String? = rawName.isEmpty ? nil : rawName
         self.username = effectiveName
 
+        // rememberPassword 偏好：缺省（用户从未设过）按 true 处理，让首次安装的用户
+        // 默认享受「保存密码」体验；明确设过 false 才不保存。
+        if let stored = userDefaults.object(forKey: Self.defaultsKeyRememberPassword) as? Bool {
+            self.rememberPassword = stored
+        } else {
+            self.rememberPassword = true
+        }
+
         // 尝试从 Keychain 恢复 token：仅在 username 非空时才有意义。
         // 失败时静默当作未登录，避免启动就弹窗打扰用户。
         var initialToken: String? = nil
@@ -201,12 +217,19 @@ final class AppState: ObservableObject {
             }
         }
 
-        // 如果启动时已有有效 token，立即进入"登录后状态"：拉 sticky 列表 + 建 WS。
-        // 用 Task 异步执行，不阻塞 UI 首帧；失败会通过 lastStickiesError 展示。
+        // 启动时的认证恢复路径（按优先级三选一）：
+        //   1. 有 token  → 直接进入 bootstrapAfterAuth（拉 stickies + 建 WS）
+        //   2. 无 token 但 username + 已保存密码 → 后台静默 login 一次（自动登录）
+        //   3. 否则停在未登录态，等用户进设置面板手动登录
+        // 全部 Task 化避免阻塞 UI 首帧；自动登录失败只记日志、不弹窗。
+        let self_ = self
         if initialToken != nil {
-            let self_ = self
             Task { @MainActor in
                 await self_.bootstrapAfterAuth()
+            }
+        } else if let name = effectiveName {
+            Task { @MainActor in
+                await self_.attemptAutoLogin(username: name)
             }
         }
     }
@@ -305,6 +328,11 @@ final class AppState: ObservableObject {
     /// 登录：调用 `POST /api/login`，成功则把 token 存到内存 + Keychain，
     /// username 落到 UserDefaults；随后启动 stickies 全量拉取 + WS 连接。
     /// 失败向调用方抛 APIError（bootstrap 阶段的错误不再抛出，而是 UI 级降级展示）。
+    ///
+    /// 当 `rememberPassword` 偏好为 true 时，登录成功后把**用户输入的明文密码**
+    /// 写入 Keychain（与 token 用不同的 service 隔离，见 KeychainStore）；为 false
+    /// 时主动删除 Keychain 中可能残留的旧密码，避免「关掉记住密码后旧密码仍能
+    /// 自动登录」的违反直觉表现。
     func login(username: String, password: String) async throws {
         let trimmedName = username.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedPass = password // 不 trim 密码，保留前后空格
@@ -321,6 +349,22 @@ final class AppState: ObservableObject {
             Self.log.error("save token to keychain failed: \(String(describing: error), privacy: .public)")
         }
 
+        // 处理「记住密码」偏好：勾选 → 写 Keychain；未勾选 → 删除可能残留的旧密码。
+        // 这两个分支都不应让登录流程失败，仅记日志。
+        if rememberPassword {
+            do {
+                try keychainStore.savePassword(username: resp.username, password: trimmedPass)
+            } catch {
+                Self.log.error("save password to keychain failed: \(String(describing: error), privacy: .public)")
+            }
+        } else {
+            do {
+                try keychainStore.deletePassword(username: resp.username)
+            } catch {
+                Self.log.error("delete saved password failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+
         self.username = resp.username
         self.authToken = resp.token
         self.tokenBox.value = resp.token
@@ -329,8 +373,42 @@ final class AppState: ObservableObject {
         await bootstrapAfterAuth()
     }
 
-    /// 登出：清空内存 token + Keychain 记录 + 断开 WS + 清空便签。
+    /// 切换「记住密码」偏好。
+    ///   - 关闭：删除当前 username 在 Keychain 里的保存密码（用户的一次性反悔操作
+    ///     应该立刻生效，否则 App 重启又会自动登录，违反直觉）；偏好落 UserDefaults。
+    ///   - 开启：仅落 UserDefaults；密码会在下一次成功登录时被写入 Keychain。
+    func updateRememberPassword(_ enabled: Bool) {
+        guard enabled != rememberPassword else { return }
+        rememberPassword = enabled
+        userDefaults.set(enabled, forKey: Self.defaultsKeyRememberPassword)
+
+        if !enabled, let name = username {
+            do {
+                try keychainStore.deletePassword(username: name)
+            } catch {
+                Self.log.error("delete saved password failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    /// 读取已保存的登录密码（供 SettingsView 在登录表单回显使用）。
+    /// 任意失败（Keychain OSStatus / 账号未保存）一律返回 nil；调用方按"无"处理。
+    func savedPassword(for username: String) -> String? {
+        do {
+            return try keychainStore.readPassword(username: username)
+        } catch {
+            Self.log.error("read saved password failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+    }
+
+    /// 登出：清空内存 token + Keychain 记录（含保存的密码）+ 断开 WS + 清空便签。
     /// 用户名保留在 UserDefaults 以便下次登录 UI 回填。
+    ///
+    /// 为什么 logout 也要清掉「保存的密码」：
+    ///   logout 是用户主动表达「别让我自动登录回来」。如果只清 token 而留下密码，
+    ///   下次启动时 attemptAutoLogin 会用残留密码重新登回去，违反用户预期。
+    ///   `rememberPassword` 偏好本身保留，下次手动登录时会按偏好重新保存。
     ///
     /// 窗口位置（FrameStore）**不**清理——用户重新登录后能恢复之前的窗口布局。
     func logout() {
@@ -339,6 +417,11 @@ final class AppState: ObservableObject {
                 try keychainStore.deleteToken(username: name)
             } catch {
                 Self.log.error("delete token from keychain failed: \(String(describing: error), privacy: .public)")
+            }
+            do {
+                try keychainStore.deletePassword(username: name)
+            } catch {
+                Self.log.error("delete saved password (logout) failed: \(String(describing: error), privacy: .public)")
             }
         }
         authToken = nil
@@ -474,6 +557,28 @@ final class AppState: ObservableObject {
     private func bootstrapAfterAuth() async {
         await loadStickies()
         startRealtime()
+    }
+
+    /// 启动时尝试自动后台登录：仅在「无 token 但有 username + 保存密码」时触发。
+    ///
+    /// 失败处理：通常意味着保存的密码已过期/被服务端改了，继续保留只会让下次启动
+    /// 又来一遍。所以失败时主动删除 Keychain 里的保存密码，等用户手动登录刷新；
+    /// `lastStickiesError` 只承载 stickies 加载错误，这里失败不污染它（避免登录
+    /// 错误以"加载便签失败"的形式误导用户）。
+    private func attemptAutoLogin(username: String) async {
+        guard !isAuthenticated else { return }
+        guard let pwd = savedPassword(for: username), !pwd.isEmpty else { return }
+        do {
+            try await login(username: username, password: pwd)
+            Self.log.info("auto login succeeded for \(username, privacy: .public)")
+        } catch {
+            Self.log.warning("auto login failed: \(String(describing: error), privacy: .public)")
+            do {
+                try keychainStore.deletePassword(username: username)
+            } catch {
+                Self.log.error("delete stale password failed: \(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     /// 创建并启动 RealtimeClient。幂等：已有活着的实例时不重建。

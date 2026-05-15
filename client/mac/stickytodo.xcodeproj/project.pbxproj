@@ -30,6 +30,7 @@
 		A1010101010101010101011D /* DraftTodoRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011D /* DraftTodoRow.swift */; };
 		A1010101010101010101011E /* WindowDragHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1010101010101010101011E /* WindowDragHandle.swift */; };
 		A10101010101010101010121 /* SponsorPopover.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010121 /* SponsorPopover.swift */; };
+		A10101010101010101010122 /* LaunchAtLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10101010101010101010122 /* LaunchAtLogin.swift */; };
 		A20202020202020202020201 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B20202020202020202020201 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -57,6 +58,7 @@
 		B1010101010101010101011D /* DraftTodoRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftTodoRow.swift; sourceTree = "<group>"; };
 		B1010101010101010101011E /* WindowDragHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WindowDragHandle.swift; sourceTree = "<group>"; };
 		B10101010101010101010121 /* SponsorPopover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SponsorPopover.swift; sourceTree = "<group>"; };
+		B10101010101010101010122 /* LaunchAtLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLogin.swift; sourceTree = "<group>"; };
 		B2020202020202020202020A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B2020202020202020202020B /* stickytodo.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = stickytodo.entitlements; sourceTree = "<group>"; };
 		B20202020202020202020201 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -133,6 +135,7 @@
 			children = (
 				B10101010101010101010113 /* KeychainStore.swift */,
 				B1010101010101010101011F /* FrameStore.swift */,
+				B10101010101010101010122 /* LaunchAtLogin.swift */,
 			);
 			path = Storage;
 			sourceTree = "<group>";
@@ -255,6 +258,7 @@
 				A1010101010101010101011D /* DraftTodoRow.swift in Sources */,
 				A1010101010101010101011E /* WindowDragHandle.swift in Sources */,
 				A10101010101010101010121 /* SponsorPopover.swift in Sources */,
+				A10101010101010101010122 /* LaunchAtLogin.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

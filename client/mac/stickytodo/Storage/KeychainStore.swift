@@ -3,10 +3,15 @@
 //  stickytodo
 //
 //  使用 Security.framework 原生 SecItemAdd / SecItemCopyMatching / SecItemUpdate /
-//  SecItemDelete 管理登录 token。不引入 KeychainAccess 等第三方库。
+//  SecItemDelete 管理登录 token 与（可选保存的）登录密码。不引入 KeychainAccess
+//  等第三方库。
 //
 //  设计：
-//    - service = Bundle ID（与 App 绑定，避免与其他 App 冲突）
+//    - service：
+//        · token   → "com.hanxi.stickytodo"          (Self.tokenService)
+//        · password→ "com.hanxi.stickytodo.password" (Self.passwordService)
+//      用两个 service 把 token 和 password 物理隔离，避免一个 SecItem 既被当 token
+//      又被当 password 读取（同 account 时会撞）。
 //    - account = username（多账号维度；同一 App 不同账号隔离）
 //    - accessible = kSecAttrAccessibleAfterFirstUnlock
 //      （系统首次解锁后可读；StickyTodo 菜单栏常驻，需要开机自动拉起时也能取到）
@@ -43,29 +48,74 @@ enum KeychainError: Error, Equatable {
 /// 不持有状态，因此不需要 actor 约束。
 struct KeychainStore {
 
-    /// Keychain service 标识。固定为 App Bundle ID。
-    static let service = "com.hanxi.stickytodo"
+    /// Keychain service 标识：JWT token 专用。固定为 App Bundle ID。
+    static let tokenService = "com.hanxi.stickytodo"
+    /// Keychain service 标识：登录密码专用。和 token 物理隔离，避免同 account
+    /// 把两类敏感数据写到同一条 SecItem 上互相覆盖。
+    static let passwordService = "com.hanxi.stickytodo.password"
 
-    /// 允许自定义 service，用于单测；生产代码默认 `Self.service`。
-    private let service: String
+    /// 旧名兼容：早期代码引用 `KeychainStore.service`。保留为 token service 别名。
+    static let service = tokenService
 
-    init(service: String = KeychainStore.service) {
-        self.service = service
+    /// 允许自定义 token service，用于单测；生产代码默认 `Self.tokenService`。
+    private let tokenService: String
+    /// 允许自定义 password service，用于单测；生产代码默认 `Self.passwordService`。
+    private let passwordService: String
+
+    init(
+        tokenService: String = KeychainStore.tokenService,
+        passwordService: String = KeychainStore.passwordService
+    ) {
+        self.tokenService = tokenService
+        self.passwordService = passwordService
     }
 
-    // MARK: - 公共 API
+    // MARK: - Token 公共 API
 
     /// 保存 token。若同 account 已有记录，则原子地更新（SecItemUpdate）。
     func saveToken(username: String, token: String) throws {
+        try saveSecret(token, username: username, service: tokenService)
+    }
+
+    /// 读取 token。
+    /// - 返回 `nil` 表示该账号在 Keychain 中没有记录（errSecItemNotFound）。
+    /// - 抛错仅在遇到其它 OSStatus 或账号为空时发生，调用方据此决定是否降级。
+    func readToken(username: String) throws -> String? {
+        try readSecret(username: username, service: tokenService)
+    }
+
+    /// 删除 token。已不存在时视为成功（幂等）。
+    func deleteToken(username: String) throws {
+        try deleteSecret(username: username, service: tokenService)
+    }
+
+    // MARK: - Password 公共 API
+
+    /// 保存登录密码。仅在用户勾选「记住密码」时由 AppState 调用。
+    /// 与 token 完全独立——同 username 写 token 不影响 password，反之亦然。
+    func savePassword(username: String, password: String) throws {
+        try saveSecret(password, username: username, service: passwordService)
+    }
+
+    /// 读取保存的登录密码；返回 `nil` 表示未保存。
+    func readPassword(username: String) throws -> String? {
+        try readSecret(username: username, service: passwordService)
+    }
+
+    /// 删除已保存的登录密码（幂等）。
+    func deletePassword(username: String) throws {
+        try deleteSecret(username: username, service: passwordService)
+    }
+
+    // MARK: - Private helpers
+
+    /// 通用 SecItem 写入：先尝试 SecItemUpdate；errSecItemNotFound 时降级到 SecItemAdd。
+    private func saveSecret(_ secret: String, username: String, service: String) throws {
         let account = try Self.normalize(username)
-        guard let data = token.data(using: .utf8) else {
+        guard let data = secret.data(using: .utf8) else {
             throw KeychainError.encoding
         }
 
-        // 先尝试更新：
-        //   - errSecSuccess      → 已更新，结束
-        //   - errSecItemNotFound → 不存在，降级为 add
-        //   - 其他               → 抛错
         let updateAttrs: [String: Any] = [
             kSecValueData as String: data
         ]
@@ -92,10 +142,8 @@ struct KeychainStore {
         }
     }
 
-    /// 读取 token。
-    /// - 返回 `nil` 表示该账号在 Keychain 中没有记录（errSecItemNotFound）。
-    /// - 抛错仅在遇到其它 OSStatus 或账号为空时发生，调用方据此决定是否降级。
-    func readToken(username: String) throws -> String? {
+    /// 通用 SecItem 读取：errSecItemNotFound → nil；其余 OSStatus → 抛错。
+    private func readSecret(username: String, service: String) throws -> String? {
         let account = try Self.normalize(username)
         var query = Self.baseQuery(service: service, account: account)
         query[kSecReturnData as String] = kCFBooleanTrue
@@ -106,11 +154,11 @@ struct KeychainStore {
         switch status {
         case errSecSuccess:
             guard let data = item as? Data,
-                  let token = String(data: data, encoding: .utf8),
-                  !token.isEmpty else {
+                  let secret = String(data: data, encoding: .utf8),
+                  !secret.isEmpty else {
                 throw KeychainError.encoding
             }
-            return token
+            return secret
         case errSecItemNotFound:
             return nil
         default:
@@ -118,8 +166,8 @@ struct KeychainStore {
         }
     }
 
-    /// 删除 token。已不存在时视为成功（幂等）。
-    func deleteToken(username: String) throws {
+    /// 通用 SecItem 删除：已不存在视为成功。
+    private func deleteSecret(username: String, service: String) throws {
         let account = try Self.normalize(username)
         let status = SecItemDelete(Self.baseQuery(service: service, account: account) as CFDictionary)
         switch status {
@@ -129,8 +177,6 @@ struct KeychainStore {
             throw KeychainError.unexpectedStatus(status)
         }
     }
-
-    // MARK: - Private helpers
 
     /// 构造 SecItem 操作的基础 query：class + service + account。
     /// kSecAttrAccessible 不放在 baseQuery 里，因为 SecItemUpdate 的 query 部分
