@@ -211,9 +211,12 @@ final class AppState: ObservableObject {
         // init 结束后绑定 onUnauthorized 到 self 的 logout（MainActor 里执行）。
         // 用 [weak self] 避免保留环。URLSession 的回调可能不在 MainActor，
         // 用 Task { @MainActor } 切回。
+        //
+        // 注意：这是 API 收到 401 触发的被动注销路径——token 过期/被服务端踢下线，
+        // 不是用户主动行为，所以保留 Keychain 中的密码以便下次自动登录恢复。
         unauthorizedBox.value = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.logout()
+                self?.logout(clearSavedPassword: false)
             }
         }
 
@@ -402,26 +405,33 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 登出：清空内存 token + Keychain 记录（含保存的密码）+ 断开 WS + 清空便签。
+    /// 登出：清空内存 token + Keychain token + 断开 WS + 清空便签。
     /// 用户名保留在 UserDefaults 以便下次登录 UI 回填。
     ///
-    /// 为什么 logout 也要清掉「保存的密码」：
-    ///   logout 是用户主动表达「别让我自动登录回来」。如果只清 token 而留下密码，
-    ///   下次启动时 attemptAutoLogin 会用残留密码重新登回去，违反用户预期。
-    ///   `rememberPassword` 偏好本身保留，下次手动登录时会按偏好重新保存。
+    /// - Parameter clearSavedPassword: 是否一并删除 Keychain 中保存的密码。
+    ///     - `true`（默认）：**用户主动**点「登出」按钮时使用。用户明确表达
+    ///       「别让我自动登录回来」，留着密码会让 attemptAutoLogin 重新登回去，
+    ///       违反预期。
+    ///     - `false`：token 过期/服务端 401 触发的**被动**注销时使用。密码本身
+    ///       很可能仍是对的，只是 server 端 JWT TTL 到了。如果连密码也清掉，
+    ///       下次启动就只能让用户重新手填——这正是「自动登录总是失效」bug 的
+    ///       根因。保留密码可让 init() 路径走 attemptAutoLogin 恢复会话。
     ///
+    /// 注意：`rememberPassword` 偏好本身始终保留，下次手动登录时仍按偏好生效。
     /// 窗口位置（FrameStore）**不**清理——用户重新登录后能恢复之前的窗口布局。
-    func logout() {
+    func logout(clearSavedPassword: Bool = true) {
         if let name = username {
             do {
                 try keychainStore.deleteToken(username: name)
             } catch {
                 Self.log.error("delete token from keychain failed: \(String(describing: error), privacy: .public)")
             }
-            do {
-                try keychainStore.deletePassword(username: name)
-            } catch {
-                Self.log.error("delete saved password (logout) failed: \(String(describing: error), privacy: .public)")
+            if clearSavedPassword {
+                do {
+                    try keychainStore.deletePassword(username: name)
+                } catch {
+                    Self.log.error("delete saved password (logout) failed: \(String(describing: error), privacy: .public)")
+                }
             }
         }
         authToken = nil
@@ -561,8 +571,16 @@ final class AppState: ObservableObject {
 
     /// 启动时尝试自动后台登录：仅在「无 token 但有 username + 保存密码」时触发。
     ///
-    /// 失败处理：通常意味着保存的密码已过期/被服务端改了，继续保留只会让下次启动
-    /// 又来一遍。所以失败时主动删除 Keychain 里的保存密码，等用户手动登录刷新；
+    /// 失败处理按错误类型分两支：
+    ///   - `.unauthorized`（401）：密码确实被服务端改了 / 账号被禁用，继续保留
+    ///     只会让每次启动都重复失败一次。删掉 Keychain 里的密码，让用户手动登录
+    ///     刷新；rememberPassword 偏好保留，下次成功登录会自动重新写入。
+    ///   - 其他错误（`.transport` 网络断、`.http` 5xx、`.invalidResponse` 等）：
+    ///     密码本身很可能仍然有效，只是这一次没连上。**必须保留密码**，否则
+    ///     Mac 开机网络没就绪、服务器临时不可达、用户在公司 VPN 外等场景，都会
+    ///     让密码被错杀，下次启动又要手填——这就是原版「自动登录总是失效」的
+    ///     第二个 bug 源头。
+    ///
     /// `lastStickiesError` 只承载 stickies 加载错误，这里失败不污染它（避免登录
     /// 错误以"加载便签失败"的形式误导用户）。
     private func attemptAutoLogin(username: String) async {
@@ -571,13 +589,18 @@ final class AppState: ObservableObject {
         do {
             try await login(username: username, password: pwd)
             Self.log.info("auto login succeeded for \(username, privacy: .public)")
-        } catch {
-            Self.log.warning("auto login failed: \(String(describing: error), privacy: .public)")
-            do {
-                try keychainStore.deletePassword(username: username)
-            } catch {
-                Self.log.error("delete stale password failed: \(String(describing: error), privacy: .public)")
+        } catch let apiError as APIError {
+            Self.log.warning("auto login failed: \(String(describing: apiError), privacy: .public)")
+            if case .unauthorized = apiError {
+                do {
+                    try keychainStore.deletePassword(username: username)
+                } catch {
+                    Self.log.error("delete stale password failed: \(String(describing: error), privacy: .public)")
+                }
             }
+        } catch {
+            // 非 APIError 都按"瞬时错误"处理，保留密码
+            Self.log.warning("auto login failed (non-API): \(String(describing: error), privacy: .public)")
         }
     }
 
@@ -646,8 +669,10 @@ final class AppState: ObservableObject {
     private func handleRealtimeSignal(_ signal: RealtimeSignal) {
         switch signal {
         case .unauthorized:
-            Self.log.info("realtime unauthorized; logging out")
-            logout()
+            // WS 服务端踢下线（close code 4401）= token 失效 / 过期，不是用户意图。
+            // 保留 Keychain 中保存的密码，下次启动通过 attemptAutoLogin 恢复会话。
+            Self.log.info("realtime unauthorized; clearing session (keep saved password)")
+            logout(clearSavedPassword: false)
         case .reconnected:
             Self.log.info("realtime reconnected; re-syncing stickies")
             Task { @MainActor [weak self] in
